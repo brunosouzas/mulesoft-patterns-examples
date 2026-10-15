@@ -11,7 +11,7 @@
 	<!--
 		ISP AFTER: each consumer gets an interface shaped for its need (experience APIs in API-led
 		terms). Mobile sees tracking data only; finance sees billing only. Internal cost data is not
-		exposed at all, and each contract can evolve independently (see docs/contracts/).
+		exposed at all, and each contract can evolve independently (see docs/contracts/solid/).
 	-->
 	<flow name="isp-after-get-mobile-order">
 		<http:listener doc:name="Listener" config-ref="http-listener-config" path="/isp/after/mobile/orders/{orderId}" allowedMethods="GET">

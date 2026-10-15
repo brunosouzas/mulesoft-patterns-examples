@@ -13,7 +13,7 @@
 		LSP AFTER: both adapters honour the whole contract - the shape, the value vocabulary (upper-case
 		statuses, numeric price) and the behaviour for unknown orders (APP:NOT_FOUND). The consumer gets the
 		same answer from either provider, so one can replace the other without the consumer noticing.
-		The contract is in docs/contracts/lsp-order-after.raml.
+		The contract is in docs/contracts/solid/lsp-order-after.raml.
 	-->
 	<flow name="lsp-after-get-order">
 		<http:listener doc:name="Listener" config-ref="http-listener-config" path="/lsp/after/orders/{orderId}" allowedMethods="GET">

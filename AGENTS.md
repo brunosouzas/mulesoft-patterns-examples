@@ -1,8 +1,15 @@
-# mulesoft-solid-examples: project context
+# mulesoft-patterns-examples: project context
+
+Stack: Mule 4, MUnit, Maven
 
 ## Purpose
 
-Before-and-after examples of the five SOLID principles applied to Mule 4 flows. Each principle has a **before** endpoint that breaks the principle and an **after** endpoint that follows it, and MUnit tests show where the two behave the same and where the "before" version causes problems.
+A catalogue of runnable Mule 4 examples of design and integration patterns, one series per folder, each with MUnit tests and an accompanying article series.
+
+- **SOLID** (`solid/`, complete): before-and-after examples of the five SOLID principles. Each principle has a **before** endpoint that breaks the principle and an **after** endpoint that follows it, and MUnit tests show where the two behave the same and where the "before" version causes problems.
+- **Enterprise Integration Patterns** (`eip/`, in progress): one Mule XML and one MUnit suite per pattern, using VM queues instead of Anypoint MQ so the app runs with no external systems.
+
+HTTP endpoint paths are referenced by published articles; do not change them when moving files.
 
 ## Technology declarations
 
@@ -18,6 +25,8 @@ These are source declarations, not evidence of installed runtimes. Maven propert
 
 Top-level source/documentation directories: `docs`, `src`.
 
+- `src/main/mule/global.xml`: shared global configuration (HTTP listener, properties, error handler) for every series.
+- `src/main/mule/<series>/`, `src/test/munit/<series>/`, `docs/contracts/<series>/`: flows, MUnit suites and contracts of one series (`solid`, later `eip`).
 - [README.md](README.md).
 - [mule-artifact.json](mule-artifact.json).
 - [pom.xml](pom.xml).
