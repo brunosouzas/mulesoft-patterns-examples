@@ -61,10 +61,10 @@ Content-Type: application/json
 ### Charges and rejected duplicates for one order
 GET {{base}}/eip/payments/ORD-2001/charges
 
-### EIP correlation identifier — status after the provider called back (PAID)
+### EIP correlation identifier — status after the provider called back (PAID; PAYMENT_DECLINED or PAYMENT_REVIEW when the callback says so)
 GET {{base}}/eip/payments/ORD-2001/status
 
-### A callback nobody is waiting for: 404
+### A callback nobody is waiting for (unknown, expired, or a repeat of one already matched): 404
 POST {{base}}/eip/payments/callback
 Content-Type: application/json
 
