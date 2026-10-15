@@ -1,0 +1,63 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<mule xmlns="http://www.mulesoft.org/schema/mule/core"
+	xmlns:http="http://www.mulesoft.org/schema/mule/http"
+	xmlns:ee="http://www.mulesoft.org/schema/mule/ee/core"
+	xmlns:doc="http://www.mulesoft.org/schema/mule/documentation"
+	xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+	xsi:schemaLocation="http://www.mulesoft.org/schema/mule/core http://www.mulesoft.org/schema/mule/core/current/mule.xsd
+		http://www.mulesoft.org/schema/mule/http http://www.mulesoft.org/schema/mule/http/current/mule-http.xsd
+		http://www.mulesoft.org/schema/mule/ee/core http://www.mulesoft.org/schema/mule/ee/core/current/mule-ee.xsd">
+
+	<!--
+		CORRELATION ID, MULE MEANING: not the book's Correlation Identifier pattern (correlation-identifier.xml).
+
+		Mule gives every event a correlationId, used to follow one call through logs and systems. The HTTP
+		requester sends it in the X-CORRELATION-ID header (sendCorrelationId AUTO, the default), and an HTTP
+		listener that receives that header adopts it as its own correlationId. So a call chain shares one ID.
+		sendCorrelationId="NEVER" stops the header; the called flow then starts a new correlationId.
+
+		This propagation is also why the default idempotent validator (which uses correlationId) sees every
+		call made from one flow as the same message.
+	-->
+
+	<!-- Callee: reports the header it received and the correlationId its own event got. -->
+	<flow name="mule-correlation-id-echo">
+		<http:listener doc:name="GET /eip/correlation-id/echo" config-ref="http-listener-config" path="/eip/correlation-id/echo" allowedMethods="GET" />
+		<ee:transform doc:name="What arrived">
+			<ee:message>
+				<ee:set-payload><![CDATA[%dw 2.0
+output application/json
+---
+{ receivedHeader: attributes.headers["x-correlation-id"], calleeCorrelationId: correlationId }]]></ee:set-payload>
+			</ee:message>
+		</ee:transform>
+	</flow>
+
+	<!-- Caller with the default (sendCorrelationId AUTO): the callee receives this flow's correlationId. -->
+	<flow name="mule-correlation-id-call-default">
+		<http:listener doc:name="GET /eip/correlation-id/call/default" config-ref="http-listener-config" path="/eip/correlation-id/call/default" allowedMethods="GET" />
+		<http:request doc:name="Call echo (default)" config-ref="eip-self-http-request-config" method="GET" path="/eip/correlation-id/echo" />
+		<ee:transform doc:name="Compare IDs">
+			<ee:message>
+				<ee:set-payload><![CDATA[%dw 2.0
+output application/json
+---
+{ callerCorrelationId: correlationId, callee: payload }]]></ee:set-payload>
+			</ee:message>
+		</ee:transform>
+	</flow>
+
+	<!-- Caller with sendCorrelationId="NEVER": no header, so the callee gets a new correlationId. -->
+	<flow name="mule-correlation-id-call-never">
+		<http:listener doc:name="GET /eip/correlation-id/call/never" config-ref="http-listener-config" path="/eip/correlation-id/call/never" allowedMethods="GET" />
+		<http:request doc:name="Call echo (NEVER)" config-ref="eip-self-http-request-config" method="GET" path="/eip/correlation-id/echo" sendCorrelationId="NEVER" />
+		<ee:transform doc:name="Compare IDs">
+			<ee:message>
+				<ee:set-payload><![CDATA[%dw 2.0
+output application/json
+---
+{ callerCorrelationId: correlationId, callee: payload }]]></ee:set-payload>
+			</ee:message>
+		</ee:transform>
+	</flow>
+</mule>

@@ -1,0 +1,19 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<mule xmlns="http://www.mulesoft.org/schema/mule/core"
+	xmlns:http="http://www.mulesoft.org/schema/mule/http"
+	xmlns:doc="http://www.mulesoft.org/schema/mule/documentation"
+	xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+	xsi:schemaLocation="http://www.mulesoft.org/schema/mule/core http://www.mulesoft.org/schema/mule/core/current/mule.xsd
+		http://www.mulesoft.org/schema/mule/http http://www.mulesoft.org/schema/mule/http/current/mule-http.xsd">
+
+	<!--
+		EIP GLOBAL: configuration shared by the Enterprise Integration Pattern examples.
+
+		Requester that calls this same application over HTTP. Used by the idempotent receiver's batch client,
+		by the correlation identifier's payment provider simulator (request and callback) and by the Mule
+		correlation ID demo. It shares http.port with the listener, so MUnit's dynamic port works.
+	-->
+	<http:request-config name="eip-self-http-request-config" doc:name="HTTP requester to this app">
+		<http:request-connection host="${eip.selfCall.host}" port="${http.port}" />
+	</http:request-config>
+</mule>

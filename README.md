@@ -5,7 +5,7 @@ A catalogue of design and integration patterns applied to Mule 4, one series at 
 | Series | Status | Code |
 |---|---|---|
 | [SOLID in MuleSoft](#solid-in-mulesoft) | Complete | [`src/main/mule/solid/`](src/main/mule/solid) |
-| [Enterprise Integration Patterns](#enterprise-integration-patterns) | In progress | `src/main/mule/eip/` (planned) |
+| [Enterprise Integration Patterns](#enterprise-integration-patterns) | In progress | [`src/main/mule/eip/`](src/main/mule/eip) |
 
 Everything runs in one Mule application and needs no external systems: ERPs, databases and payment providers are simulated with synthetic data, so it runs anywhere.
 
@@ -26,7 +26,7 @@ curl -s 'localhost:8081/lsp/before/orders/ORD-1001?provider=new'
 mvn clean test
 ```
 
-MUnit runs on the Mule Enterprise runtime, so Maven needs access to the MuleSoft Enterprise repository (credentials in `~/.m2/settings.xml`, as in any MuleSoft project). The build fails below 80% application coverage; the current suites cover 36 cases at about 95%.
+MUnit runs on the Mule Enterprise runtime, so Maven needs access to the MuleSoft Enterprise repository (credentials in `~/.m2/settings.xml`, as in any MuleSoft project). The build fails below 80% application coverage; the current suites cover 55 cases at about 99%.
 
 ## SOLID in MuleSoft
 
@@ -51,14 +51,27 @@ Notes:
 
 ## Enterprise Integration Patterns
 
-In progress. Patterns from Hohpe and Woolf's *Enterprise Integration Patterns*, implemented in Mule 4. Each pattern will get one Mule XML under `src/main/mule/eip/<pattern>/` and one MUnit suite under `src/test/munit/eip/`. Messaging uses VM queues instead of Anypoint MQ, so the examples run with no external systems.
+In progress. Patterns from Hohpe and Woolf's *Enterprise Integration Patterns*, implemented in Mule 4 around one scenario: an order is charged and then paid by a payment provider. Every runnable example uses HTTP and object stores only, so it needs no broker and no external system.
 
-Planned first wave:
+| Pattern | Scenario | Code | Endpoints |
+|---|---|---|---|
+| Idempotent receiver | Charge an order once, however many times it is sent. **Before:** `<idempotent-message-validator/>` with no configuration uses the `correlationId` as the message ID, so a retrying client is charged twice and different orders sent from one For Each are rejected as duplicates. **After:** `idExpression="#[payload.orderId]"` with an explicit object store (24-hour TTL) | [`eip/idempotent-receiver/`](src/main/mule/eip/idempotent-receiver) | `POST /eip/payments/before/charges`, `POST /eip/payments/after/charges`, `POST /eip/payments/{before\|after}/charges/batch`, `GET /eip/payments/{orderId}/charges` |
+| Correlation identifier | **Book meaning:** after a charge, a payment request goes to a simulated provider carrying its own ID; the provider answers 202 and later calls back with that ID as `correlationId`, which is the only link back to the order. Callbacks can arrive in any order. The callback's `status` decides the outcome: `APPROVED` for the requested amount marks the order `PAID`, `DECLINED` marks it `PAYMENT_DECLINED`, and an `APPROVED` for another amount or any other status marks it `PAYMENT_REVIEW` (with `reviewReason` `AMOUNT_MISMATCH` or `UNKNOWN_STATUS`); all three answer 200. A callback with no pending request (unknown, expired, or a repeat of one already matched) gets 404. **Mule meaning** (kept separate): the HTTP requester sends the event's `correlationId` in `X-CORRELATION-ID`, unless `sendCorrelationId="NEVER"` | [`eip/correlation-identifier/`](src/main/mule/eip/correlation-identifier) | `POST /eip/provider/payments` (provider), `POST /eip/payments/callback`, `GET /eip/payments/{orderId}/status`, `GET /eip/correlation-id/call/{default\|never}`, `GET /eip/correlation-id/echo` |
+| Publish-subscribe channel | Documented with Anypoint MQ configuration in the wiki, not runnable here: it needs an Anypoint MQ broker (exchange and bound queues) | — | — |
+| Dead letter channel | Documented with Anypoint MQ configuration in the wiki, not runnable here: it needs an Anypoint MQ broker (queue with a dead-letter queue and a maximum delivery count) | — | — |
 
-- Publish-subscribe channel
-- Idempotent receiver
-- Dead letter channel
-- Correlation identifier
+The MUnit suites are in [`src/test/munit/eip/`](src/test/munit/eip). What they show, observed on Mule 4.9.17 with MUnit 3.7.1:
+
+- With no `objectStore`, the idempotent validator keeps IDs in memory for 5 minutes (the defaults in the 4.9.17 runtime's `IdempotentMessageValidator`). Three different orders posted over HTTP from one For Each give `accepted,duplicate,duplicate`; with `idExpression="#[payload.orderId]"` they give `accepted,accepted,accepted`.
+- The validator stores the ID when it accepts the message and does not remove it when the flow fails afterwards: a retry of an order whose charge failed is rejected as a duplicate and never charged (`idempotent-after-failed-charge-keeps-the-id-so-the-retry-is-a-duplicate`).
+- The out-of-order test sends the provider callbacks itself (B before A), so the order is deterministic; the end-to-end test lets the simulated provider call back on its own, from an `async` scope.
+- The simulated provider always approves. The DECLINED, amount-mismatch, unknown-status and repeated-callback tests send the callback themselves.
+- The callback flow removes (claims) the pending request before it updates the order. A repeated or late callback, sent after the first one was matched, finds no pending request and gets 404 (`cid-repeated-callback-returns-404-and-keeps-the-first-outcome`). The flow also turns `OS:KEY_NOT_FOUND` from the remove into 404, so a concurrent copy that read the pending request but loses the claim to another copy gets 404 instead of 500, and is logged as a lost claim (`cid-callback-that-loses-the-claim-returns-404-and-changes-nothing`). This is not a lock. With the in-memory stores used here, outside a Mule cluster each worker has its own store, so a callback that reaches a worker that did not store the request gets 404. When the stores are persistent (Object Store v2 on CloudHub), two copies handled at the same moment by two workers can still both update the order: Object Store v2 has no distributed lock to prevent it.
+
+Notes:
+
+- Object stores are in memory so every run starts clean. In production use a persistent, shared store (Object Store v2 on CloudHub): an in-memory store is lost on restart and is not shared between replicas.
+- VM queues are not used to stand in for a broker: the VM connector is an in-application queue, not a message broker.
 
 ## Layout
 
@@ -69,10 +82,19 @@ src/main/mule/
     srp/ ocp/ lsp/ isp/ dip/
       <principle>-before.xml
       <principle>-after.xml
-  eip/<pattern>/             Enterprise Integration Patterns (planned)
-src/main/resources/config/app.yaml   port, OCP payment routing, DIP repository choice
+  eip/                       Enterprise Integration Patterns
+    eip-global.xml           HTTP requester the examples use to call this same app
+    idempotent-receiver/
+      idempotent-receiver-before.xml
+      idempotent-receiver-after.xml
+      payment-common.xml     simulated charge, ledger, batch client
+    correlation-identifier/
+      correlation-identifier.xml   book meaning: provider request, callback, status
+      mule-correlation-id.xml      Mule meaning: X-CORRELATION-ID propagation
+src/main/resources/config/app.yaml   port, OCP payment routing, DIP repository choice, EIP self-call host and callback path
 src/test/munit/
   solid/<principle>-test-suite.xml
+  eip/<pattern>-test-suite.xml
 docs/contracts/
   solid/                     RAML types for the LSP and ISP contracts
 requests.http                sample requests for every endpoint
