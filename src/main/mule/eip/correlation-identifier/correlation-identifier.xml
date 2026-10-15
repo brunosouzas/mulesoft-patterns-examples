@@ -18,8 +18,9 @@
 		to a simulated provider over HTTP. The request carries its own ID (requestId) and NOT the orderId: the
 		provider has no reason to know our orders. The provider answers 202 Accepted at once and, later, calls
 		our callback endpoint with correlationId = that requestId. The callback flow uses the correlationId to
-		find the pending request, and through it the order, and marks the order paid. Callbacks can arrive in
-		any order; each one finds its own request.
+		find the pending request, and through it the order, and records the provider's answer on the order
+		(PAID, PAYMENT_DECLINED or PAYMENT_REVIEW). Callbacks can arrive in any order; each one finds its own
+		request.
 
 		Both sides run in this app, so Mule's X-CORRELATION-ID header happens to travel with the callback too.
 		A real provider does not echo it back; the match relies only on the correlationId in the callback body.
@@ -97,9 +98,25 @@ output application/java
 
 	<!--
 		Callback: POST /eip/payments/callback { correlationId, status, approvedAmount, providerReference }.
-		Matches the callback to its pending request by correlationId and marks the order paid. A callback
-		nobody waits for (unknown, expired, or a repeat that arrives after the first was matched) gets 404
-		and changes nothing. Two copies arriving at the same moment can both match; both write the same PAID.
+		Matches the callback to its pending request by correlationId, then routes on the provider's status:
+		- APPROVED for exactly the amount that was requested: order PAID.
+		- DECLINED: order PAYMENT_DECLINED.
+		- APPROVED for another amount (AMOUNT_MISMATCH), or any other status (UNKNOWN_STATUS): order
+		  PAYMENT_REVIEW, with the reason, for a person to check. The callback is still answered 200: the
+		  provider has given its final answer, and rejecting it would only make it send the same one again.
+		Each of these answers 200 { result: MATCHED, orderStatus }.
+
+		The flow claims the pending request (removes it) before it updates the order. A callback nobody
+		waits for (unknown, expired, or a repeat of one already matched) finds no pending request and gets
+		404, changing nothing. os:retrieve and os:remove raise OS:KEY_NOT_FOUND when the key is gone; the
+		try scope turns that into the same 404, so a copy that loses the claim between its retrieve and its
+		remove also gets 404, not 500.
+		This narrows the race; it does not close it. Retrieve and remove are two calls, not a lock: whether a
+		second concurrent copy fails its remove depends on the store, and Object Store v2 on CloudHub has no
+		distributed lock, so two copies handled at the same moment (by two workers, say) can still both
+		update the order. Fully preventing that needs an atomic claim or a lock outside this flow.
+		The cost of claiming first: if updating the order fails after the claim, the provider's retry gets
+		404 and the order stays PAYMENT_REQUESTED until someone checks it.
 	-->
 	<flow name="payment-confirm-from-provider-callback">
 		<http:listener doc:name="POST /eip/payments/callback" config-ref="http-listener-config" path="/eip/payments/callback" allowedMethods="POST">
@@ -112,29 +129,54 @@ output application/java
 			</when>
 		</choice>
 		<set-variable doc:name="Callback" variableName="callback" value="#[payload]" />
-		<os:contains doc:name="Is a request waiting for it?" key="#[vars.callback.correlationId]" objectStore="eip-pending-payment-requests-store" target="matched" />
+		<set-variable doc:name="Not matched yet" variableName="unmatched" value="#[false]" />
+		<try doc:name="Match and claim the pending request">
+			<os:retrieve doc:name="Find pending request" key="#[vars.callback.correlationId]" objectStore="eip-pending-payment-requests-store" target="pendingRequest" />
+			<os:remove doc:name="Claim the pending request" key="#[vars.callback.correlationId]" objectStore="eip-pending-payment-requests-store" />
+			<error-handler>
+				<!-- Unknown, expired, already matched, or claimed by another copy in between: all the same 404. -->
+				<on-error-continue doc:name="No pending request" type="OS:KEY_NOT_FOUND" logException="false">
+					<set-variable doc:name="Not matched" variableName="unmatched" value="#[true]" />
+				</on-error-continue>
+			</error-handler>
+		</try>
 		<choice doc:name="Matched?">
-			<when expression="#[not vars.matched]">
-				<logger doc:name="Log unmatched callback" level="WARN" message="#['Unmatched provider callback, correlationId in body=' ++ vars.callback.correlationId]" />
+			<when expression="#[vars.unmatched default false]">
+				<logger doc:name="Log unmatched callback" level="WARN" message="#['Unmatched provider callback, correlationId in body=' ++ vars.callback.correlationId ++ ', correlationId=' ++ correlationId]" />
 				<raise-error doc:name="Unknown correlationId" type="APP:NOT_FOUND" description="No pending payment request for this correlationId" />
 			</when>
 		</choice>
-		<os:retrieve doc:name="Find pending request" key="#[vars.callback.correlationId]" objectStore="eip-pending-payment-requests-store" target="pendingRequest" />
-		<os:store doc:name="Mark order paid" key="#[vars.pendingRequest.orderId]" objectStore="eip-order-payment-status-store">
+		<choice doc:name="Route on callback status">
+			<when expression="#[vars.callback.status == 'APPROVED' and vars.callback.approvedAmount == vars.pendingRequest.amount]">
+				<set-variable doc:name="Paid" variableName="outcome" value="#[{ status: 'PAID' }]" />
+			</when>
+			<when expression="#[vars.callback.status == 'DECLINED']">
+				<set-variable doc:name="Declined" variableName="outcome" value="#[{ status: 'PAYMENT_DECLINED' }]" />
+			</when>
+			<when expression="#[vars.callback.status == 'APPROVED']">
+				<set-variable doc:name="Review: amount mismatch" variableName="outcome" value="#[{ status: 'PAYMENT_REVIEW', reviewReason: 'AMOUNT_MISMATCH' }]" />
+			</when>
+			<otherwise>
+				<set-variable doc:name="Review: unknown status" variableName="outcome" value="#[{ status: 'PAYMENT_REVIEW', reviewReason: 'UNKNOWN_STATUS' }]" />
+			</otherwise>
+		</choice>
+		<os:store doc:name="Record payment outcome" key="#[vars.pendingRequest.orderId]" objectStore="eip-order-payment-status-store">
 			<os:value><![CDATA[#[output application/java --- {
 	orderId: vars.pendingRequest.orderId,
-	status: "PAID",
+	status: vars.outcome.status,
+	(reviewReason: vars.outcome.reviewReason) if (vars.outcome.reviewReason != null),
 	requestId: vars.pendingRequest.requestId,
-	approvedAmount: vars.callback.approvedAmount,
-	providerReference: vars.callback.providerReference
+	requestedAmount: vars.pendingRequest.amount,
+	providerStatus: vars.callback.status default null,
+	approvedAmount: vars.callback.approvedAmount default null,
+	providerReference: vars.callback.providerReference default null
 }]]]></os:value>
 		</os:store>
-		<os:remove doc:name="Request is no longer pending" key="#[vars.callback.correlationId]" objectStore="eip-pending-payment-requests-store" />
-		<logger doc:name="Log order paid" level="INFO" message="#['Order paid, orderId=' ++ vars.pendingRequest.orderId ++ ', requestId=' ++ vars.callback.correlationId]" />
-		<set-payload doc:name="Matched" value="#[output application/json --- { result: 'MATCHED' }]" />
+		<logger doc:name="Log payment outcome" level="INFO" message="#['Payment outcome ' ++ vars.outcome.status ++ ', orderId=' ++ vars.pendingRequest.orderId ++ ', requestId=' ++ vars.callback.correlationId ++ ', correlationId=' ++ correlationId]" />
+		<set-payload doc:name="Matched" value="#[output application/json --- { result: 'MATCHED', orderStatus: vars.outcome.status }]" />
 	</flow>
 
-	<!-- GET /eip/payments/{orderId}/status: PAYMENT_REQUESTED or PAID, 404 when no payment was requested. -->
+	<!-- GET /eip/payments/{orderId}/status: PAYMENT_REQUESTED, PAID, PAYMENT_DECLINED or PAYMENT_REVIEW; 404 when no payment was requested. -->
 	<flow name="payment-get-status">
 		<http:listener doc:name="GET /eip/payments/{orderId}/status" config-ref="http-listener-config" path="/eip/payments/{orderId}/status" allowedMethods="GET">
 			<http:response statusCode="#[vars.httpStatus default 200]" />
