@@ -118,6 +118,7 @@
 			<os:retrieve doc:name="Status A" key="ORD-CID-A" objectStore="eip-order-payment-status-store" target="statusA" />
 			<os:retrieve doc:name="Status B" key="ORD-CID-B" objectStore="eip-order-payment-status-store" target="statusB" />
 			<os:contains doc:name="A still pending?" key="#[vars.requestA.requestId]" objectStore="eip-pending-payment-requests-store" target="aStillPending" />
+			<os:contains doc:name="B still pending?" key="#[vars.requestB.requestId]" objectStore="eip-pending-payment-requests-store" target="bStillPending" />
 		</munit:execution>
 		<munit:validation>
 			<munit-tools:assert-that doc:name="Callback matched" expression="#[vars.callbackB.result]" is="#[MunitTools::equalTo('MATCHED')]" />
@@ -129,7 +130,8 @@
 			<munit-tools:assert-that doc:name="B paid by B's callback" expression="#[vars.statusB.providerReference]" is="#[MunitTools::equalTo('PRV-TEST-B')]" />
 			<munit-tools:assert-that doc:name="B amount" expression="#[vars.statusB.approvedAmount]" is="#[MunitTools::equalTo(250)]" />
 			<munit-tools:assert-that doc:name="B request" expression="#[vars.statusB.requestId]" is="#[MunitTools::equalTo(vars.requestB.requestId)]" />
-			<munit-tools:assert-that doc:name="Matched requests are no longer pending" expression="#[vars.aStillPending]" is="#[MunitTools::equalTo(false)]" />
+			<munit-tools:assert-that doc:name="A is no longer pending" expression="#[vars.aStillPending]" is="#[MunitTools::equalTo(false)]" />
+			<munit-tools:assert-that doc:name="B is no longer pending" expression="#[vars.bStillPending]" is="#[MunitTools::equalTo(false)]" />
 		</munit:validation>
 	</munit:test>
 

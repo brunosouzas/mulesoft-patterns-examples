@@ -62,7 +62,7 @@ In progress. Patterns from Hohpe and Woolf's *Enterprise Integration Patterns*, 
 
 The MUnit suites are in [`src/test/munit/eip/`](src/test/munit/eip). What they show, observed on Mule 4.9.17 with MUnit 3.7.1:
 
-- The default idempotent validator keeps IDs in memory for 5 minutes. Three different orders posted over HTTP from one For Each give `accepted,duplicate,duplicate`; with `idExpression="#[payload.orderId]"` they give `accepted,accepted,accepted`.
+- With no `objectStore`, the idempotent validator keeps IDs in memory for 5 minutes (the defaults in the 4.9.17 runtime's `IdempotentMessageValidator`). Three different orders posted over HTTP from one For Each give `accepted,duplicate,duplicate`; with `idExpression="#[payload.orderId]"` they give `accepted,accepted,accepted`.
 - The validator stores the ID when it accepts the message and does not remove it when the flow fails afterwards: a retry of an order whose charge failed is rejected as a duplicate and never charged (`idempotent-after-failed-charge-keeps-the-id-so-the-retry-is-a-duplicate`).
 - The out-of-order test sends the provider callbacks itself (B before A), so the order is deterministic; the end-to-end test lets the simulated provider call back on its own, from an `async` scope.
 

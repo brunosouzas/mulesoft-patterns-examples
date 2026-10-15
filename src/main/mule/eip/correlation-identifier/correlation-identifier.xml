@@ -98,7 +98,8 @@ output application/java
 	<!--
 		Callback: POST /eip/payments/callback { correlationId, status, approvedAmount, providerReference }.
 		Matches the callback to its pending request by correlationId and marks the order paid. A callback
-		nobody waits for (unknown, repeated or expired) gets 404 and changes nothing.
+		nobody waits for (unknown, expired, or a repeat that arrives after the first was matched) gets 404
+		and changes nothing. Two copies arriving at the same moment can both match; both write the same PAID.
 	-->
 	<flow name="payment-confirm-from-provider-callback">
 		<http:listener doc:name="POST /eip/payments/callback" config-ref="http-listener-config" path="/eip/payments/callback" allowedMethods="POST">

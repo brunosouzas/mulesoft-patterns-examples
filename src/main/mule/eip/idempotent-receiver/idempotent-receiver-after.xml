@@ -21,8 +21,10 @@
 
 		The validator stores the ID when it accepts the request, before the charge runs, and does not remove
 		it if the charge fails (observed on Mule 4.9.17; see the MUnit suite). A retry of a failed charge is
-		then rejected as a duplicate. Where a failed charge must be retryable, remove the ID in the error
-		handler (os:remove) or record the ID only after the charge succeeds.
+		then rejected as a duplicate. The same holds when the charge succeeds but the payment request to the
+		provider fails: the client gets 500, the order stays PAYMENT_REQUESTED and a retry gets 409. Where a
+		failed request must be retryable, remove the ID in the error handler (os:remove) or record the ID only
+		after every step succeeded.
 
 		The store is in memory here so every run starts clean. In production use a persistent, shared store
 		(Object Store v2 on CloudHub): an in-memory store is lost on restart and is not shared between replicas,
