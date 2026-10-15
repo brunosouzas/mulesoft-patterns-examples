@@ -1,0 +1,50 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<mule xmlns="http://www.mulesoft.org/schema/mule/core"
+	xmlns:http="http://www.mulesoft.org/schema/mule/http"
+	xmlns:ee="http://www.mulesoft.org/schema/mule/ee/core"
+	xmlns:doc="http://www.mulesoft.org/schema/mule/documentation"
+	xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+	xsi:schemaLocation="http://www.mulesoft.org/schema/mule/core http://www.mulesoft.org/schema/mule/core/current/mule.xsd
+		http://www.mulesoft.org/schema/mule/http http://www.mulesoft.org/schema/mule/http/current/mule-http.xsd
+		http://www.mulesoft.org/schema/mule/ee/core http://www.mulesoft.org/schema/mule/ee/core/current/mule-ee.xsd">
+
+	<!--
+		IDEMPOTENT RECEIVER, BEFORE: the idempotent message validator with no configuration.
+		POST /eip/payments/before/charges { orderId, amount }
+
+		With no idExpression the validator uses #[correlationId] as the message ID, and an in-memory store
+		that keeps IDs for 5 minutes (Mule 4.9.17 defaults). The correlation ID identifies a conversation, not
+		a business message, so this goes wrong both ways:
+		- The same order sent twice by a client that retried (two requests, two correlation IDs) is charged twice.
+		- Different orders sent by one flow in a loop (one correlation ID, propagated in X-CORRELATION-ID)
+		  are rejected as duplicates.
+	-->
+	<flow name="payment-before-charge-endpoint">
+		<http:listener doc:name="POST /eip/payments/before/charges" config-ref="http-listener-config" path="/eip/payments/before/charges" allowedMethods="POST">
+			<http:response statusCode="#[vars.httpStatus default 200]" />
+		</http:listener>
+		<logger doc:name="Log charge request" level="INFO" message="#['Charge request (before), correlationId=' ++ correlationId]" />
+		<flow-ref doc:name="Validate request" name="payment-validate-charge-request" />
+		<try doc:name="Charge once">
+			<idempotent-message-validator doc:name="Reject duplicates (default: by correlation ID)" />
+			<flow-ref doc:name="Charge" name="payment-charge-order" />
+			<set-variable doc:name="Accepted" variableName="chargeResult" value="accepted" />
+			<error-handler>
+				<on-error-continue doc:name="Duplicate: 409" type="MULE:DUPLICATE_MESSAGE" logException="false">
+					<flow-ref doc:name="Record duplicate" name="payment-record-duplicate" />
+					<set-variable doc:name="Duplicate" variableName="chargeResult" value="duplicate" />
+					<set-variable doc:name="409" variableName="httpStatus" value="409" />
+				</on-error-continue>
+			</error-handler>
+		</try>
+		<ee:transform doc:name="Charge response">
+			<ee:message>
+				<ee:set-payload><![CDATA[%dw 2.0
+output application/json
+---
+{ orderId: payload.orderId, result: vars.chargeResult }]]></ee:set-payload>
+			</ee:message>
+		</ee:transform>
+		<logger doc:name="Log charge result" level="INFO" message="#['Charge (before) ' ++ vars.chargeResult ++ ', orderId=' ++ payload.orderId ++ ', correlationId=' ++ correlationId]" />
+	</flow>
+</mule>

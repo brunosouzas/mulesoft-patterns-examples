@@ -1,0 +1,412 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<mule xmlns="http://www.mulesoft.org/schema/mule/core"
+	xmlns:munit="http://www.mulesoft.org/schema/mule/munit"
+	xmlns:munit-tools="http://www.mulesoft.org/schema/mule/munit-tools"
+	xmlns:http="http://www.mulesoft.org/schema/mule/http"
+	xmlns:os="http://www.mulesoft.org/schema/mule/os"
+	xmlns:doc="http://www.mulesoft.org/schema/mule/documentation"
+	xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+	xsi:schemaLocation="http://www.mulesoft.org/schema/mule/core http://www.mulesoft.org/schema/mule/core/current/mule.xsd
+		http://www.mulesoft.org/schema/mule/munit http://www.mulesoft.org/schema/mule/munit/current/mule-munit.xsd
+		http://www.mulesoft.org/schema/mule/munit-tools http://www.mulesoft.org/schema/mule/munit-tools/current/mule-munit-tools.xsd
+		http://www.mulesoft.org/schema/mule/http http://www.mulesoft.org/schema/mule/http/current/mule-http.xsd
+		http://www.mulesoft.org/schema/mule/os http://www.mulesoft.org/schema/mule/os/current/mule-os.xsd">
+
+	<!--
+		Correlation identifier, two meanings kept apart:
+		- cid-*: the book's pattern. A payment request carries its own ID; the provider's callback carries it
+		  back as correlationId, and that is the only link between the callback and the order.
+		- mule-cid-*: Mule's correlationId, propagated by the HTTP requester in the X-CORRELATION-ID header.
+	-->
+	<munit:config name="correlation-identifier-test-suite.xml" />
+
+	<munit:test name="cid-order-is-paid-by-the-provider-callback" description="Correlation identifier: a charged order is sent to the provider, which answers 202 and later calls back; the callback marks the order paid">
+		<munit:enable-flow-sources>
+			<munit:enable-flow-source value="payment-provider-simulator" />
+			<munit:enable-flow-source value="payment-confirm-from-provider-callback" />
+		</munit:enable-flow-sources>
+		<munit:execution>
+			<munit:set-event doc:name="Charge">
+				<munit:payload value="#[output application/json --- {orderId: 'ORD-CID-E2E', amount: 42}]" mediaType="application/json" />
+			</munit:set-event>
+			<flow-ref doc:name="POST /eip/payments/after/charges" name="payment-after-charge-endpoint" />
+			<set-variable doc:name="Charge response" variableName="chargeResponse" value="#[payload]" />
+			<until-successful doc:name="Wait until ORD-CID-E2E is paid" maxRetries="50" millisBetweenRetries="100">
+				<os:retrieve doc:name="Status of ORD-CID-E2E" key="ORD-CID-E2E" objectStore="eip-order-payment-status-store" />
+				<choice doc:name="Paid?">
+					<when expression="#[payload.status != 'PAID']">
+						<raise-error doc:name="Not yet" type="TEST:NOT_YET" description="Waiting for the provider callback" />
+					</when>
+				</choice>
+			</until-successful>
+		</munit:execution>
+		<munit:validation>
+			<munit-tools:assert-that doc:name="Charge accepted" expression="#[vars.chargeResponse.result]" is="#[MunitTools::equalTo('accepted')]" />
+			<munit-tools:assert-that doc:name="Charge response names the order" expression="#[vars.chargeResponse.orderId]" is="#[MunitTools::equalTo('ORD-CID-E2E')]" />
+			<munit-tools:assert-that doc:name="Paid" expression="#[payload.status]" is="#[MunitTools::equalTo('PAID')]" />
+			<munit-tools:assert-that doc:name="Provider reference" expression="#[payload.providerReference]" is="#[MunitTools::startsWith('PRV-')]" />
+			<munit-tools:assert-that doc:name="Approved amount" expression="#[payload.approvedAmount]" is="#[MunitTools::equalTo(42)]" />
+			<munit-tools:assert-that doc:name="Paid through a request ID" expression="#[payload.requestId]" is="#[MunitTools::startsWith('PRQ-')]" />
+		</munit:validation>
+	</munit:test>
+
+	<munit:test name="cid-request-carries-its-id-and-not-the-order" description="Correlation identifier: the payment request sent to the provider carries a requestId, not the orderId, and the order waits for it">
+		<munit:behavior>
+			<munit-tools:mock-when doc:name="Provider accepts" processor="http:request">
+				<munit-tools:with-attributes>
+					<munit-tools:with-attribute attributeName="doc:name" whereValue="Send payment request to provider" />
+				</munit-tools:with-attributes>
+				<munit-tools:then-return>
+					<munit-tools:payload value="#[output application/java --- { requestId: vars.paymentRequest.requestId, status: 'ACCEPTED' }]" />
+				</munit-tools:then-return>
+			</munit-tools:mock-when>
+		</munit:behavior>
+		<munit:execution>
+			<munit:set-event doc:name="Charged order">
+				<munit:payload value="#[output application/json --- {orderId: 'ORD-CID-100', amount: 100}]" mediaType="application/json" />
+			</munit:set-event>
+			<flow-ref doc:name="Request payment" name="payment-request-from-provider" />
+			<set-variable doc:name="Request" variableName="request" value="#[vars.paymentRequest]" />
+			<os:retrieve doc:name="Pending request" key="#[vars.request.requestId]" objectStore="eip-pending-payment-requests-store" target="pending" />
+			<munit:set-event doc:name="GET status" cloneOriginalEvent="true">
+				<munit:attributes value="#[{ uriParams: { orderId: 'ORD-CID-100' } }]" />
+			</munit:set-event>
+			<flow-ref doc:name="GET /eip/payments/ORD-CID-100/status" name="payment-get-status" />
+		</munit:execution>
+		<munit:validation>
+			<munit-tools:verify-call doc:name="Provider called once" processor="http:request" times="1">
+				<munit-tools:with-attributes>
+					<munit-tools:with-attribute attributeName="doc:name" whereValue="Send payment request to provider" />
+				</munit-tools:with-attributes>
+			</munit-tools:verify-call>
+			<munit-tools:assert-that doc:name="Request has an ID" expression="#[vars.request.requestId]" is="#[MunitTools::startsWith('PRQ-')]" />
+			<munit-tools:assert-that doc:name="Body sent: requestId and amount, no orderId" expression="#[keysOf(vars.providerRequestBody) map ($ as String)]" is="#[MunitTools::equalTo(['requestId', 'amount'])]" />
+			<munit-tools:assert-that doc:name="Body carries the request ID" expression="#[vars.providerRequestBody.requestId]" is="#[MunitTools::equalTo(vars.request.requestId)]" />
+			<munit-tools:assert-that doc:name="Pending request knows the order" expression="#[vars.pending.orderId]" is="#[MunitTools::equalTo('ORD-CID-100')]" />
+			<munit-tools:assert-that doc:name="Status" expression="#[payload.status]" is="#[MunitTools::equalTo('PAYMENT_REQUESTED')]" />
+			<munit-tools:assert-that doc:name="Status points at the request" expression="#[payload.requestId]" is="#[MunitTools::equalTo(vars.request.requestId)]" />
+		</munit:validation>
+	</munit:test>
+
+	<munit:test name="cid-out-of-order-callbacks-are-matched-to-their-orders" description="Correlation identifier: callbacks arriving in the opposite order of the requests each mark the right order paid">
+		<munit:behavior>
+			<!-- The provider accepts but never calls back: the test sends the callbacks itself, in the order it chooses. -->
+			<munit-tools:mock-when doc:name="Provider accepts" processor="http:request">
+				<munit-tools:with-attributes>
+					<munit-tools:with-attribute attributeName="doc:name" whereValue="Send payment request to provider" />
+				</munit-tools:with-attributes>
+				<munit-tools:then-return>
+					<munit-tools:payload value="#[output application/java --- { requestId: vars.paymentRequest.requestId, status: 'ACCEPTED' }]" />
+				</munit-tools:then-return>
+			</munit-tools:mock-when>
+		</munit:behavior>
+		<munit:execution>
+			<munit:set-event doc:name="Order A">
+				<munit:payload value="#[output application/json --- {orderId: 'ORD-CID-A', amount: 100}]" mediaType="application/json" />
+			</munit:set-event>
+			<flow-ref doc:name="Request payment for A" name="payment-request-from-provider" />
+			<set-variable doc:name="Request A" variableName="requestA" value="#[vars.paymentRequest]" />
+			<set-payload doc:name="Order B" value="#[output application/json --- {orderId: 'ORD-CID-B', amount: 250}]" />
+			<flow-ref doc:name="Request payment for B" name="payment-request-from-provider" />
+			<set-variable doc:name="Request B" variableName="requestB" value="#[vars.paymentRequest]" />
+			<!-- The provider answers B first, then A. The callbacks carry only the correlationId, never the orderId. -->
+			<set-payload doc:name="Callback for PRV-TEST-B" value="#[output application/json --- {correlationId: vars.requestB.requestId, status: 'APPROVED', approvedAmount: vars.requestB.amount, providerReference: 'PRV-TEST-B'}]" />
+			<flow-ref doc:name="POST /eip/payments/callback (PRV-TEST-B)" name="payment-confirm-from-provider-callback" />
+			<set-variable doc:name="Callback B response" variableName="callbackB" value="#[payload]" />
+			<set-payload doc:name="Callback for PRV-TEST-A" value="#[output application/json --- {correlationId: vars.requestA.requestId, status: 'APPROVED', approvedAmount: vars.requestA.amount, providerReference: 'PRV-TEST-A'}]" />
+			<flow-ref doc:name="POST /eip/payments/callback (PRV-TEST-A)" name="payment-confirm-from-provider-callback" />
+			<os:retrieve doc:name="Status A" key="ORD-CID-A" objectStore="eip-order-payment-status-store" target="statusA" />
+			<os:retrieve doc:name="Status B" key="ORD-CID-B" objectStore="eip-order-payment-status-store" target="statusB" />
+			<os:contains doc:name="A still pending?" key="#[vars.requestA.requestId]" objectStore="eip-pending-payment-requests-store" target="aStillPending" />
+			<os:contains doc:name="B still pending?" key="#[vars.requestB.requestId]" objectStore="eip-pending-payment-requests-store" target="bStillPending" />
+		</munit:execution>
+		<munit:validation>
+			<munit-tools:assert-that doc:name="Callback matched" expression="#[vars.callbackB.result]" is="#[MunitTools::equalTo('MATCHED')]" />
+			<munit-tools:assert-that doc:name="A paid" expression="#[vars.statusA.status]" is="#[MunitTools::equalTo('PAID')]" />
+			<munit-tools:assert-that doc:name="A paid by A's callback" expression="#[vars.statusA.providerReference]" is="#[MunitTools::equalTo('PRV-TEST-A')]" />
+			<munit-tools:assert-that doc:name="A amount" expression="#[vars.statusA.approvedAmount]" is="#[MunitTools::equalTo(100)]" />
+			<munit-tools:assert-that doc:name="A request" expression="#[vars.statusA.requestId]" is="#[MunitTools::equalTo(vars.requestA.requestId)]" />
+			<munit-tools:assert-that doc:name="B paid" expression="#[vars.statusB.status]" is="#[MunitTools::equalTo('PAID')]" />
+			<munit-tools:assert-that doc:name="B paid by B's callback" expression="#[vars.statusB.providerReference]" is="#[MunitTools::equalTo('PRV-TEST-B')]" />
+			<munit-tools:assert-that doc:name="B amount" expression="#[vars.statusB.approvedAmount]" is="#[MunitTools::equalTo(250)]" />
+			<munit-tools:assert-that doc:name="B request" expression="#[vars.statusB.requestId]" is="#[MunitTools::equalTo(vars.requestB.requestId)]" />
+			<munit-tools:assert-that doc:name="A is no longer pending" expression="#[vars.aStillPending]" is="#[MunitTools::equalTo(false)]" />
+			<munit-tools:assert-that doc:name="B is no longer pending" expression="#[vars.bStillPending]" is="#[MunitTools::equalTo(false)]" />
+		</munit:validation>
+	</munit:test>
+
+	<munit:test name="cid-declined-callback-marks-the-order-payment-declined" description="Correlation identifier: a DECLINED callback matches its request and marks the order PAYMENT_DECLINED, never PAID">
+		<munit:behavior>
+			<!-- The provider accepts but never calls back: the test sends the DECLINED callback itself. -->
+			<munit-tools:mock-when doc:name="Provider accepts" processor="http:request">
+				<munit-tools:with-attributes>
+					<munit-tools:with-attribute attributeName="doc:name" whereValue="Send payment request to provider" />
+				</munit-tools:with-attributes>
+				<munit-tools:then-return>
+					<munit-tools:payload value="#[output application/java --- { requestId: vars.paymentRequest.requestId, status: 'ACCEPTED' }]" />
+				</munit-tools:then-return>
+			</munit-tools:mock-when>
+		</munit:behavior>
+		<munit:execution>
+			<munit:set-event doc:name="Charged order">
+				<munit:payload value="#[output application/json --- {orderId: 'ORD-CID-DECLINED', amount: 80}]" mediaType="application/json" />
+			</munit:set-event>
+			<flow-ref doc:name="Request payment" name="payment-request-from-provider" />
+			<set-variable doc:name="Request" variableName="request" value="#[vars.paymentRequest]" />
+			<set-payload doc:name="DECLINED callback" value="#[output application/json --- {correlationId: vars.request.requestId, status: 'DECLINED', providerReference: 'PRV-TEST-DECLINED'}]" />
+			<flow-ref doc:name="POST /eip/payments/callback" name="payment-confirm-from-provider-callback" />
+			<set-variable doc:name="Callback response" variableName="callbackResponse" value="#[payload]" />
+			<os:retrieve doc:name="Order status" key="ORD-CID-DECLINED" objectStore="eip-order-payment-status-store" target="orderStatus" />
+			<os:contains doc:name="Still pending?" key="#[vars.request.requestId]" objectStore="eip-pending-payment-requests-store" target="stillPending" />
+		</munit:execution>
+		<munit:validation>
+			<munit-tools:assert-that doc:name="200" expression="#[vars.httpStatus default 200]" is="#[MunitTools::equalTo(200)]" />
+			<munit-tools:assert-that doc:name="Callback matched" expression="#[vars.callbackResponse.result]" is="#[MunitTools::equalTo('MATCHED')]" />
+			<munit-tools:assert-that doc:name="Response names the outcome" expression="#[vars.callbackResponse.orderStatus]" is="#[MunitTools::equalTo('PAYMENT_DECLINED')]" />
+			<munit-tools:assert-that doc:name="Order declined" expression="#[vars.orderStatus.status]" is="#[MunitTools::equalTo('PAYMENT_DECLINED')]" />
+			<munit-tools:assert-that doc:name="Provider status kept" expression="#[vars.orderStatus.providerStatus]" is="#[MunitTools::equalTo('DECLINED')]" />
+			<munit-tools:assert-that doc:name="Provider reference" expression="#[vars.orderStatus.providerReference]" is="#[MunitTools::equalTo('PRV-TEST-DECLINED')]" />
+			<munit-tools:assert-that doc:name="No longer pending" expression="#[vars.stillPending]" is="#[MunitTools::equalTo(false)]" />
+		</munit:validation>
+	</munit:test>
+
+	<munit:test name="cid-approved-callback-for-another-amount-goes-to-payment-review" description="Correlation identifier: an APPROVED callback whose approvedAmount differs from the requested amount marks the order PAYMENT_REVIEW (AMOUNT_MISMATCH), not PAID">
+		<munit:behavior>
+			<munit-tools:mock-when doc:name="Provider accepts" processor="http:request">
+				<munit-tools:with-attributes>
+					<munit-tools:with-attribute attributeName="doc:name" whereValue="Send payment request to provider" />
+				</munit-tools:with-attributes>
+				<munit-tools:then-return>
+					<munit-tools:payload value="#[output application/java --- { requestId: vars.paymentRequest.requestId, status: 'ACCEPTED' }]" />
+				</munit-tools:then-return>
+			</munit-tools:mock-when>
+		</munit:behavior>
+		<munit:execution>
+			<munit:set-event doc:name="Charged order">
+				<munit:payload value="#[output application/json --- {orderId: 'ORD-CID-MISMATCH', amount: 100}]" mediaType="application/json" />
+			</munit:set-event>
+			<flow-ref doc:name="Request payment" name="payment-request-from-provider" />
+			<set-variable doc:name="Request" variableName="request" value="#[vars.paymentRequest]" />
+			<set-payload doc:name="APPROVED callback for 90 instead of 100" value="#[output application/json --- {correlationId: vars.request.requestId, status: 'APPROVED', approvedAmount: 90, providerReference: 'PRV-TEST-MISMATCH'}]" />
+			<flow-ref doc:name="POST /eip/payments/callback" name="payment-confirm-from-provider-callback" />
+			<set-variable doc:name="Callback response" variableName="callbackResponse" value="#[payload]" />
+			<os:retrieve doc:name="Order status" key="ORD-CID-MISMATCH" objectStore="eip-order-payment-status-store" target="orderStatus" />
+		</munit:execution>
+		<munit:validation>
+			<munit-tools:assert-that doc:name="200" expression="#[vars.httpStatus default 200]" is="#[MunitTools::equalTo(200)]" />
+			<munit-tools:assert-that doc:name="Response names the outcome" expression="#[vars.callbackResponse.orderStatus]" is="#[MunitTools::equalTo('PAYMENT_REVIEW')]" />
+			<munit-tools:assert-that doc:name="Order in review" expression="#[vars.orderStatus.status]" is="#[MunitTools::equalTo('PAYMENT_REVIEW')]" />
+			<munit-tools:assert-that doc:name="Reason" expression="#[vars.orderStatus.reviewReason]" is="#[MunitTools::equalTo('AMOUNT_MISMATCH')]" />
+			<munit-tools:assert-that doc:name="Approved amount kept" expression="#[vars.orderStatus.approvedAmount]" is="#[MunitTools::equalTo(90)]" />
+			<munit-tools:assert-that doc:name="Requested amount kept" expression="#[vars.orderStatus.requestedAmount]" is="#[MunitTools::equalTo(100)]" />
+		</munit:validation>
+	</munit:test>
+
+	<munit:test name="cid-callback-with-unknown-status-goes-to-payment-review" description="Correlation identifier: a callback whose status is neither APPROVED nor DECLINED marks the order PAYMENT_REVIEW (UNKNOWN_STATUS)">
+		<munit:behavior>
+			<munit-tools:mock-when doc:name="Provider accepts" processor="http:request">
+				<munit-tools:with-attributes>
+					<munit-tools:with-attribute attributeName="doc:name" whereValue="Send payment request to provider" />
+				</munit-tools:with-attributes>
+				<munit-tools:then-return>
+					<munit-tools:payload value="#[output application/java --- { requestId: vars.paymentRequest.requestId, status: 'ACCEPTED' }]" />
+				</munit-tools:then-return>
+			</munit-tools:mock-when>
+		</munit:behavior>
+		<munit:execution>
+			<munit:set-event doc:name="Charged order">
+				<munit:payload value="#[output application/json --- {orderId: 'ORD-CID-UNKNOWN-STATUS', amount: 15}]" mediaType="application/json" />
+			</munit:set-event>
+			<flow-ref doc:name="Request payment" name="payment-request-from-provider" />
+			<set-variable doc:name="Request" variableName="request" value="#[vars.paymentRequest]" />
+			<set-payload doc:name="Callback with status CHARGEBACK" value="#[output application/json --- {correlationId: vars.request.requestId, status: 'CHARGEBACK', approvedAmount: 15, providerReference: 'PRV-TEST-UNKNOWN'}]" />
+			<flow-ref doc:name="POST /eip/payments/callback" name="payment-confirm-from-provider-callback" />
+			<set-variable doc:name="Callback response" variableName="callbackResponse" value="#[payload]" />
+			<os:retrieve doc:name="Order status" key="ORD-CID-UNKNOWN-STATUS" objectStore="eip-order-payment-status-store" target="orderStatus" />
+			<os:contains doc:name="Still pending?" key="#[vars.request.requestId]" objectStore="eip-pending-payment-requests-store" target="stillPending" />
+		</munit:execution>
+		<munit:validation>
+			<munit-tools:assert-that doc:name="200" expression="#[vars.httpStatus default 200]" is="#[MunitTools::equalTo(200)]" />
+			<munit-tools:assert-that doc:name="Response names the outcome" expression="#[vars.callbackResponse.orderStatus]" is="#[MunitTools::equalTo('PAYMENT_REVIEW')]" />
+			<munit-tools:assert-that doc:name="Order in review" expression="#[vars.orderStatus.status]" is="#[MunitTools::equalTo('PAYMENT_REVIEW')]" />
+			<munit-tools:assert-that doc:name="Reason" expression="#[vars.orderStatus.reviewReason]" is="#[MunitTools::equalTo('UNKNOWN_STATUS')]" />
+			<munit-tools:assert-that doc:name="Provider status kept" expression="#[vars.orderStatus.providerStatus]" is="#[MunitTools::equalTo('CHARGEBACK')]" />
+			<munit-tools:assert-that doc:name="No longer pending" expression="#[vars.stillPending]" is="#[MunitTools::equalTo(false)]" />
+		</munit:validation>
+	</munit:test>
+
+	<munit:test name="cid-repeated-callback-returns-404-and-keeps-the-first-outcome" description="Correlation identifier: once a callback has matched its request, a repeat of it (or a late callback with another status) gets 404 and does not change the order">
+		<munit:behavior>
+			<munit-tools:mock-when doc:name="Provider accepts" processor="http:request">
+				<munit-tools:with-attributes>
+					<munit-tools:with-attribute attributeName="doc:name" whereValue="Send payment request to provider" />
+				</munit-tools:with-attributes>
+				<munit-tools:then-return>
+					<munit-tools:payload value="#[output application/java --- { requestId: vars.paymentRequest.requestId, status: 'ACCEPTED' }]" />
+				</munit-tools:then-return>
+			</munit-tools:mock-when>
+		</munit:behavior>
+		<munit:execution>
+			<munit:set-event doc:name="Charged order">
+				<munit:payload value="#[output application/json --- {orderId: 'ORD-CID-REPEAT', amount: 60}]" mediaType="application/json" />
+			</munit:set-event>
+			<flow-ref doc:name="Request payment" name="payment-request-from-provider" />
+			<set-variable doc:name="Request" variableName="request" value="#[vars.paymentRequest]" />
+			<set-variable doc:name="APPROVED callback" variableName="approvedCallback" value="#[output application/json --- {correlationId: vars.request.requestId, status: 'APPROVED', approvedAmount: 60, providerReference: 'PRV-TEST-REPEAT'}]" />
+			<set-payload doc:name="Send it" value="#[vars.approvedCallback]" />
+			<flow-ref doc:name="POST /eip/payments/callback (first)" name="payment-confirm-from-provider-callback" />
+			<set-variable doc:name="First response" variableName="firstResponse" value="#[payload]" />
+			<set-variable doc:name="First status code" variableName="firstHttpStatus" value="#[vars.httpStatus default 200]" />
+			<set-payload doc:name="Send the same callback again" value="#[vars.approvedCallback]" />
+			<flow-ref doc:name="POST /eip/payments/callback (repeat)" name="payment-confirm-from-provider-callback" />
+			<set-variable doc:name="Repeat status code" variableName="repeatHttpStatus" value="#[vars.httpStatus as Number]" />
+			<set-variable doc:name="Repeat response" variableName="repeatResponse" value="#[payload]" />
+			<remove-variable doc:name="Reset status code" variableName="httpStatus" />
+			<set-payload doc:name="Late DECLINED callback" value="#[output application/json --- {correlationId: vars.request.requestId, status: 'DECLINED', providerReference: 'PRV-TEST-LATE'}]" />
+			<flow-ref doc:name="POST /eip/payments/callback (late, other status)" name="payment-confirm-from-provider-callback" />
+			<set-variable doc:name="Late status code" variableName="lateHttpStatus" value="#[vars.httpStatus as Number]" />
+			<os:retrieve doc:name="Order status" key="ORD-CID-REPEAT" objectStore="eip-order-payment-status-store" target="orderStatus" />
+		</munit:execution>
+		<munit:validation>
+			<munit-tools:assert-that doc:name="First: 200" expression="#[vars.firstHttpStatus]" is="#[MunitTools::equalTo(200)]" />
+			<munit-tools:assert-that doc:name="First: PAID" expression="#[vars.firstResponse.orderStatus]" is="#[MunitTools::equalTo('PAID')]" />
+			<munit-tools:assert-that doc:name="Repeat: 404" expression="#[vars.repeatHttpStatus]" is="#[MunitTools::equalTo(404)]" />
+			<munit-tools:assert-that doc:name="Repeat: says why" expression="#[vars.repeatResponse.error]" is="#[MunitTools::equalTo('No pending payment request for this correlationId')]" />
+			<munit-tools:assert-that doc:name="Late: 404" expression="#[vars.lateHttpStatus]" is="#[MunitTools::equalTo(404)]" />
+			<munit-tools:assert-that doc:name="Still PAID" expression="#[vars.orderStatus.status]" is="#[MunitTools::equalTo('PAID')]" />
+			<munit-tools:assert-that doc:name="Paid by the first callback" expression="#[vars.orderStatus.providerReference]" is="#[MunitTools::equalTo('PRV-TEST-REPEAT')]" />
+			<munit-tools:verify-call doc:name="Log unmatched callback logged 2x" processor="logger" times="2">
+				<munit-tools:with-attributes>
+					<munit-tools:with-attribute attributeName="doc:name" whereValue="Log unmatched callback" />
+				</munit-tools:with-attributes>
+			</munit-tools:verify-call>
+			<munit-tools:verify-call doc:name="Log lost claim logged 0x" processor="logger" times="0">
+				<munit-tools:with-attributes>
+					<munit-tools:with-attribute attributeName="doc:name" whereValue="Log lost claim" />
+				</munit-tools:with-attributes>
+			</munit-tools:verify-call>
+		</munit:validation>
+	</munit:test>
+
+	<munit:test name="cid-callback-that-loses-the-claim-returns-404-and-changes-nothing" description="Correlation identifier: a copy that reads the pending request but finds it gone when it removes it (another copy claimed it first) gets 404, not 500, and does not update the order">
+		<munit:behavior>
+			<munit-tools:mock-when doc:name="Provider accepts" processor="http:request">
+				<munit-tools:with-attributes>
+					<munit-tools:with-attribute attributeName="doc:name" whereValue="Send payment request to provider" />
+				</munit-tools:with-attributes>
+				<munit-tools:then-return>
+					<munit-tools:payload value="#[output application/java --- { requestId: vars.paymentRequest.requestId, status: 'ACCEPTED' }]" />
+				</munit-tools:then-return>
+			</munit-tools:mock-when>
+			<!-- Simulates the race: between this copy's retrieve and its remove, another copy removed the key. -->
+			<munit-tools:mock-when doc:name="Another copy claimed it first" processor="os:remove">
+				<munit-tools:with-attributes>
+					<munit-tools:with-attribute attributeName="doc:name" whereValue="Claim the pending request" />
+				</munit-tools:with-attributes>
+				<munit-tools:then-return>
+					<munit-tools:error typeId="OS:KEY_NOT_FOUND" />
+				</munit-tools:then-return>
+			</munit-tools:mock-when>
+		</munit:behavior>
+		<munit:execution>
+			<munit:set-event doc:name="Charged order">
+				<munit:payload value="#[output application/json --- {orderId: 'ORD-CID-RACE', amount: 30}]" mediaType="application/json" />
+			</munit:set-event>
+			<flow-ref doc:name="Request payment" name="payment-request-from-provider" />
+			<set-variable doc:name="Request" variableName="request" value="#[vars.paymentRequest]" />
+			<set-payload doc:name="APPROVED callback" value="#[output application/json --- {correlationId: vars.request.requestId, status: 'APPROVED', approvedAmount: 30, providerReference: 'PRV-TEST-RACE'}]" />
+			<flow-ref doc:name="POST /eip/payments/callback" name="payment-confirm-from-provider-callback" />
+			<os:retrieve doc:name="Order status" key="ORD-CID-RACE" objectStore="eip-order-payment-status-store" target="orderStatus" />
+		</munit:execution>
+		<munit:validation>
+			<munit-tools:assert-that doc:name="404, not 500" expression="#[vars.httpStatus as Number]" is="#[MunitTools::equalTo(404)]" />
+			<munit-tools:assert-that doc:name="Says why" expression="#[payload.error]" is="#[MunitTools::equalTo('No pending payment request for this correlationId')]" />
+			<munit-tools:assert-that doc:name="Order not updated by this copy" expression="#[vars.orderStatus.status]" is="#[MunitTools::equalTo('PAYMENT_REQUESTED')]" />
+			<munit-tools:verify-call doc:name="Log lost claim logged 1x" processor="logger" times="1">
+				<munit-tools:with-attributes>
+					<munit-tools:with-attribute attributeName="doc:name" whereValue="Log lost claim" />
+				</munit-tools:with-attributes>
+			</munit-tools:verify-call>
+			<munit-tools:verify-call doc:name="Log unmatched callback logged 0x" processor="logger" times="0">
+				<munit-tools:with-attributes>
+					<munit-tools:with-attribute attributeName="doc:name" whereValue="Log unmatched callback" />
+				</munit-tools:with-attributes>
+			</munit-tools:verify-call>
+		</munit:validation>
+	</munit:test>
+
+	<munit:test name="cid-unmatched-callback-returns-404" description="Correlation identifier: a callback whose correlationId matches no pending request gets 404 and changes nothing">
+		<munit:execution>
+			<munit:set-event doc:name="Callback nobody waits for">
+				<munit:payload value="#[output application/json --- {correlationId: 'PRQ-UNKNOWN', status: 'APPROVED', approvedAmount: 1, providerReference: 'PRV-X'}]" mediaType="application/json" />
+			</munit:set-event>
+			<flow-ref doc:name="POST /eip/payments/callback" name="payment-confirm-from-provider-callback" />
+		</munit:execution>
+		<munit:validation>
+			<munit-tools:assert-that doc:name="404" expression="#[vars.httpStatus as Number]" is="#[MunitTools::equalTo(404)]" />
+		</munit:validation>
+	</munit:test>
+
+	<munit:test name="cid-callback-without-correlation-id-returns-400" description="Correlation identifier: a callback without correlationId is rejected with 400">
+		<munit:execution>
+			<munit:set-event doc:name="Callback without correlationId">
+				<munit:payload value="#[output application/json --- {status: 'APPROVED'}]" mediaType="application/json" />
+			</munit:set-event>
+			<flow-ref doc:name="POST /eip/payments/callback" name="payment-confirm-from-provider-callback" />
+		</munit:execution>
+		<munit:validation>
+			<munit-tools:assert-that doc:name="400" expression="#[vars.httpStatus as Number]" is="#[MunitTools::equalTo(400)]" />
+		</munit:validation>
+	</munit:test>
+
+	<munit:test name="cid-provider-rejects-request-without-id" description="Correlation identifier: the simulated provider answers 400 to a request without requestId">
+		<munit:execution>
+			<munit:set-event doc:name="Request without requestId">
+				<munit:payload value="#[output application/json --- {amount: 10}]" mediaType="application/json" />
+			</munit:set-event>
+			<flow-ref doc:name="POST /eip/provider/payments" name="payment-provider-simulator" />
+		</munit:execution>
+		<munit:validation>
+			<munit-tools:assert-that doc:name="400" expression="#[vars.httpStatus as Number]" is="#[MunitTools::equalTo(400)]" />
+		</munit:validation>
+	</munit:test>
+
+	<munit:test name="cid-status-of-unknown-order-returns-404" description="Correlation identifier: GET /eip/payments/{orderId}/status answers 404 for an order with no payment request">
+		<munit:execution>
+			<munit:set-event doc:name="GET status">
+				<munit:attributes value="#[{ uriParams: { orderId: 'ORD-CID-NONE' } }]" />
+			</munit:set-event>
+			<flow-ref doc:name="GET /eip/payments/ORD-CID-NONE/status" name="payment-get-status" />
+		</munit:execution>
+		<munit:validation>
+			<munit-tools:assert-that doc:name="404" expression="#[vars.httpStatus as Number]" is="#[MunitTools::equalTo(404)]" />
+		</munit:validation>
+	</munit:test>
+
+	<munit:test name="mule-cid-http-request-sends-the-caller-correlation-id" description="Mule correlationId: the HTTP requester (default sendCorrelationId) sends the caller's correlationId in X-CORRELATION-ID and the callee adopts it">
+		<munit:enable-flow-sources>
+			<munit:enable-flow-source value="mule-correlation-id-echo" />
+		</munit:enable-flow-sources>
+		<munit:execution>
+			<flow-ref doc:name="GET /eip/correlation-id/call/default" name="mule-correlation-id-call-default" />
+		</munit:execution>
+		<munit:validation>
+			<munit-tools:assert-that doc:name="Header received" expression="#[payload.callee.receivedHeader]" is="#[MunitTools::equalTo(payload.callerCorrelationId)]" />
+			<munit-tools:assert-that doc:name="Callee adopted it" expression="#[payload.callee.calleeCorrelationId]" is="#[MunitTools::equalTo(payload.callerCorrelationId)]" />
+		</munit:validation>
+	</munit:test>
+
+	<munit:test name="mule-cid-send-correlation-id-never-does-not-send-it" description="Mule correlationId: with sendCorrelationId NEVER no X-CORRELATION-ID is sent and the callee gets a new correlationId">
+		<munit:enable-flow-sources>
+			<munit:enable-flow-source value="mule-correlation-id-echo" />
+		</munit:enable-flow-sources>
+		<munit:execution>
+			<flow-ref doc:name="GET /eip/correlation-id/call/never" name="mule-correlation-id-call-never" />
+		</munit:execution>
+		<munit:validation>
+			<munit-tools:assert-that doc:name="No header" expression="#[payload.callee.receivedHeader]" is="#[MunitTools::nullValue()]" />
+			<munit-tools:assert-that doc:name="Callee has an ID" expression="#[payload.callee.calleeCorrelationId]" is="#[MunitTools::notNullValue()]" />
+			<munit-tools:assert-that doc:name="Callee has its own ID" expression="#[payload.callee.calleeCorrelationId]" is="#[MunitTools::not(MunitTools::equalTo(payload.callerCorrelationId))]" />
+		</munit:validation>
+	</munit:test>
+</mule>

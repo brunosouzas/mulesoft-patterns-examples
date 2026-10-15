@@ -1,0 +1,67 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<mule xmlns="http://www.mulesoft.org/schema/mule/core"
+	xmlns:http="http://www.mulesoft.org/schema/mule/http"
+	xmlns:os="http://www.mulesoft.org/schema/mule/os"
+	xmlns:ee="http://www.mulesoft.org/schema/mule/ee/core"
+	xmlns:doc="http://www.mulesoft.org/schema/mule/documentation"
+	xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+	xsi:schemaLocation="http://www.mulesoft.org/schema/mule/core http://www.mulesoft.org/schema/mule/core/current/mule.xsd
+		http://www.mulesoft.org/schema/mule/http http://www.mulesoft.org/schema/mule/http/current/mule-http.xsd
+		http://www.mulesoft.org/schema/mule/os http://www.mulesoft.org/schema/mule/os/current/mule-os.xsd
+		http://www.mulesoft.org/schema/mule/ee/core http://www.mulesoft.org/schema/mule/ee/core/current/mule-ee.xsd">
+
+	<!--
+		IDEMPOTENT RECEIVER, AFTER: the message ID is the business key, and the store is explicit.
+		POST /eip/payments/after/charges { orderId, amount }
+
+		idExpression="#[payload.orderId]": a duplicate is "the same order", whatever request carried it.
+		The store keeps processed order IDs for 24 hours. The TTL must outlive the window in which a duplicate
+		can still arrive (client and gateway retries take minutes; replays after an incident can take hours).
+		After it expires, the same orderId is accepted again. The default store keeps IDs for only 5 minutes.
+
+		The validator stores the ID when it accepts the request, before the charge runs, and does not remove
+		it if the charge fails (observed on Mule 4.9.17; see the MUnit suite). A retry of a failed charge is
+		then rejected as a duplicate. The same holds when the charge succeeds but the payment request to the
+		provider fails: the client gets 500, the order stays PAYMENT_REQUESTED and a retry gets 409. Where a
+		failed request must be retryable, remove the ID in the error handler (os:remove) or record the ID only
+		after every step succeeded.
+
+		The store is in memory here so every run starts clean. In production use a persistent, shared store
+		(Object Store v2 on CloudHub): an in-memory store is lost on restart and is not shared between replicas,
+		so two replicas would each accept the same order once.
+
+		After a successful charge the order is sent to the payment provider: see correlation-identifier.xml.
+	-->
+	<os:object-store name="eip-processed-orders-store" doc:name="Processed order IDs"
+		persistent="false" entryTtl="24" entryTtlUnit="HOURS" expirationInterval="10" expirationIntervalUnit="MINUTES" />
+
+	<flow name="payment-after-charge-endpoint">
+		<http:listener doc:name="POST /eip/payments/after/charges" config-ref="http-listener-config" path="/eip/payments/after/charges" allowedMethods="POST">
+			<http:response statusCode="#[vars.httpStatus default 200]" />
+		</http:listener>
+		<logger doc:name="Log charge request" level="INFO" message="#['Charge request (after), correlationId=' ++ correlationId]" />
+		<flow-ref doc:name="Validate request" name="payment-validate-charge-request" />
+		<try doc:name="Charge once">
+			<idempotent-message-validator doc:name="Reject duplicates by orderId" idExpression="#[payload.orderId]" objectStore="eip-processed-orders-store" />
+			<flow-ref doc:name="Charge" name="payment-charge-order" />
+			<flow-ref doc:name="Request payment from provider" name="payment-request-from-provider" />
+			<set-variable doc:name="Accepted" variableName="chargeResult" value="accepted" />
+			<error-handler>
+				<on-error-continue doc:name="Duplicate: 409" type="MULE:DUPLICATE_MESSAGE" logException="false">
+					<flow-ref doc:name="Record duplicate" name="payment-record-duplicate" />
+					<set-variable doc:name="Duplicate" variableName="chargeResult" value="duplicate" />
+					<set-variable doc:name="409" variableName="httpStatus" value="409" />
+				</on-error-continue>
+			</error-handler>
+		</try>
+		<ee:transform doc:name="Charge response">
+			<ee:message>
+				<ee:set-payload><![CDATA[%dw 2.0
+output application/json
+---
+{ orderId: payload.orderId, result: vars.chargeResult }]]></ee:set-payload>
+			</ee:message>
+		</ee:transform>
+		<logger doc:name="Log charge result" level="INFO" message="#['Charge (after) ' ++ vars.chargeResult ++ ', orderId=' ++ payload.orderId ++ ', correlationId=' ++ correlationId]" />
+	</flow>
+</mule>
