@@ -61,7 +61,7 @@ Content-Type: application/json
 ### Charges and rejected duplicates for one order
 GET {{base}}/eip/payments/ORD-2001/charges
 
-### EIP correlation identifier — status after the provider called back (PAID; PAYMENT_DECLINED or PAYMENT_REVIEW when the callback says so)
+### EIP correlation identifier — status after the provider called back (PAID: the simulated provider always approves; PAYMENT_DECLINED and PAYMENT_REVIEW are produced only by the MUnit tests)
 GET {{base}}/eip/payments/ORD-2001/status
 
 ### A callback nobody is waiting for (unknown, expired, or a repeat of one already matched): 404

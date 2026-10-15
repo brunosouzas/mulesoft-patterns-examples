@@ -29,7 +29,7 @@
 	<!-- Pending requests by requestId. TTL 1 hour: a callback later than that is treated as unknown. -->
 	<os:object-store name="eip-pending-payment-requests-store" doc:name="Pending payment requests"
 		persistent="false" entryTtl="1" entryTtlUnit="HOURS" expirationInterval="5" expirationIntervalUnit="MINUTES" />
-	<!-- Payment status by orderId: PAYMENT_REQUESTED, then PAID. -->
+	<!-- Payment status by orderId: PAYMENT_REQUESTED, then PAID, PAYMENT_DECLINED or PAYMENT_REVIEW. -->
 	<os:object-store name="eip-order-payment-status-store" doc:name="Order payment status" persistent="false" />
 
 	<!-- Requestor: called by the payment flow after a successful charge. Expects the order as payload and leaves it there. -->
@@ -112,9 +112,12 @@ output application/java
 		try scope turns that into the same 404, so a copy that loses the claim between its retrieve and its
 		remove also gets 404, not 500.
 		This narrows the race; it does not close it. Retrieve and remove are two calls, not a lock: whether a
-		second concurrent copy fails its remove depends on the store, and Object Store v2 on CloudHub has no
-		distributed lock, so two copies handled at the same moment (by two workers, say) can still both
-		update the order. Fully preventing that needs an atomic claim or a lock outside this flow.
+		second concurrent copy fails its remove depends on the store.
+		The stores here are in memory (persistent="false"). Outside a Mule cluster each worker has its own
+		store, so a callback that reaches a worker that did not store the request gets 404. The race between
+		workers applies when the stores are persistent (Object Store v2 on CloudHub): Object Store v2 has no
+		distributed lock, so two copies handled at the same moment by two workers can still both update the
+		order. Fully preventing that needs an atomic claim or a lock outside this flow.
 		The cost of claiming first: if updating the order fails after the claim, the provider's retry gets
 		404 and the order stays PAYMENT_REQUESTED until someone checks it.
 	-->
@@ -130,6 +133,8 @@ output application/java
 		</choice>
 		<set-variable doc:name="Callback" variableName="callback" value="#[payload]" />
 		<set-variable doc:name="Not matched yet" variableName="unmatched" value="#[false]" />
+		<!-- Set only by a successful retrieve below; tells a lost claim apart from an unknown correlationId. -->
+		<remove-variable doc:name="No pending request read yet" variableName="pendingRequest" />
 		<try doc:name="Match and claim the pending request">
 			<os:retrieve doc:name="Find pending request" key="#[vars.callback.correlationId]" objectStore="eip-pending-payment-requests-store" target="pendingRequest" />
 			<os:remove doc:name="Claim the pending request" key="#[vars.callback.correlationId]" objectStore="eip-pending-payment-requests-store" />
@@ -141,6 +146,11 @@ output application/java
 			</error-handler>
 		</try>
 		<choice doc:name="Matched?">
+			<when expression="#[(vars.unmatched default false) and vars.pendingRequest != null]">
+				<!-- The retrieve found the request but the remove did not: another copy claimed it in between. -->
+				<logger doc:name="Log lost claim" level="WARN" message="#['Provider callback lost the claim (concurrent duplicate), correlationId in body=' ++ vars.callback.correlationId ++ ', correlationId=' ++ correlationId]" />
+				<raise-error doc:name="Claimed by another copy" type="APP:NOT_FOUND" description="No pending payment request for this correlationId" />
+			</when>
 			<when expression="#[vars.unmatched default false]">
 				<logger doc:name="Log unmatched callback" level="WARN" message="#['Unmatched provider callback, correlationId in body=' ++ vars.callback.correlationId ++ ', correlationId=' ++ correlationId]" />
 				<raise-error doc:name="Unknown correlationId" type="APP:NOT_FOUND" description="No pending payment request for this correlationId" />

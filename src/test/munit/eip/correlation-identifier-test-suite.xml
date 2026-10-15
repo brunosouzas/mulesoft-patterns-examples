@@ -223,12 +223,15 @@
 			<flow-ref doc:name="POST /eip/payments/callback" name="payment-confirm-from-provider-callback" />
 			<set-variable doc:name="Callback response" variableName="callbackResponse" value="#[payload]" />
 			<os:retrieve doc:name="Order status" key="ORD-CID-UNKNOWN-STATUS" objectStore="eip-order-payment-status-store" target="orderStatus" />
+			<os:contains doc:name="Still pending?" key="#[vars.request.requestId]" objectStore="eip-pending-payment-requests-store" target="stillPending" />
 		</munit:execution>
 		<munit:validation>
+			<munit-tools:assert-that doc:name="200" expression="#[vars.httpStatus default 200]" is="#[MunitTools::equalTo(200)]" />
 			<munit-tools:assert-that doc:name="Response names the outcome" expression="#[vars.callbackResponse.orderStatus]" is="#[MunitTools::equalTo('PAYMENT_REVIEW')]" />
 			<munit-tools:assert-that doc:name="Order in review" expression="#[vars.orderStatus.status]" is="#[MunitTools::equalTo('PAYMENT_REVIEW')]" />
 			<munit-tools:assert-that doc:name="Reason" expression="#[vars.orderStatus.reviewReason]" is="#[MunitTools::equalTo('UNKNOWN_STATUS')]" />
 			<munit-tools:assert-that doc:name="Provider status kept" expression="#[vars.orderStatus.providerStatus]" is="#[MunitTools::equalTo('CHARGEBACK')]" />
+			<munit-tools:assert-that doc:name="No longer pending" expression="#[vars.stillPending]" is="#[MunitTools::equalTo(false)]" />
 		</munit:validation>
 	</munit:test>
 
@@ -272,6 +275,16 @@
 			<munit-tools:assert-that doc:name="Late: 404" expression="#[vars.lateHttpStatus]" is="#[MunitTools::equalTo(404)]" />
 			<munit-tools:assert-that doc:name="Still PAID" expression="#[vars.orderStatus.status]" is="#[MunitTools::equalTo('PAID')]" />
 			<munit-tools:assert-that doc:name="Paid by the first callback" expression="#[vars.orderStatus.providerReference]" is="#[MunitTools::equalTo('PRV-TEST-REPEAT')]" />
+			<munit-tools:verify-call doc:name="Log unmatched callback logged 2x" processor="logger" times="2">
+				<munit-tools:with-attributes>
+					<munit-tools:with-attribute attributeName="doc:name" whereValue="Log unmatched callback" />
+				</munit-tools:with-attributes>
+			</munit-tools:verify-call>
+			<munit-tools:verify-call doc:name="Log lost claim logged 0x" processor="logger" times="0">
+				<munit-tools:with-attributes>
+					<munit-tools:with-attribute attributeName="doc:name" whereValue="Log lost claim" />
+				</munit-tools:with-attributes>
+			</munit-tools:verify-call>
 		</munit:validation>
 	</munit:test>
 
@@ -309,6 +322,16 @@
 			<munit-tools:assert-that doc:name="404, not 500" expression="#[vars.httpStatus as Number]" is="#[MunitTools::equalTo(404)]" />
 			<munit-tools:assert-that doc:name="Says why" expression="#[payload.error]" is="#[MunitTools::equalTo('No pending payment request for this correlationId')]" />
 			<munit-tools:assert-that doc:name="Order not updated by this copy" expression="#[vars.orderStatus.status]" is="#[MunitTools::equalTo('PAYMENT_REQUESTED')]" />
+			<munit-tools:verify-call doc:name="Log lost claim logged 1x" processor="logger" times="1">
+				<munit-tools:with-attributes>
+					<munit-tools:with-attribute attributeName="doc:name" whereValue="Log lost claim" />
+				</munit-tools:with-attributes>
+			</munit-tools:verify-call>
+			<munit-tools:verify-call doc:name="Log unmatched callback logged 0x" processor="logger" times="0">
+				<munit-tools:with-attributes>
+					<munit-tools:with-attribute attributeName="doc:name" whereValue="Log unmatched callback" />
+				</munit-tools:with-attributes>
+			</munit-tools:verify-call>
 		</munit:validation>
 	</munit:test>
 
