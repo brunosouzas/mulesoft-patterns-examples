@@ -12,3 +12,13 @@ payment:
 # DIP: which implementation of the "order repository" abstraction the app uses.
 orders:
   repository: "dip-after-order-repository-in-memory"
+
+# EIP: Enterprise Integration Patterns (src/main/mule/eip/).
+eip:
+  # Host the EIP examples use to call this same application over HTTP (batch client, payment provider
+  # simulator and its callback, Mule correlation ID demo). The port is http.port.
+  selfCall:
+    host: "localhost"
+  # Correlation identifier: where the simulated payment provider sends its asynchronous callback.
+  provider:
+    callbackPath: "/eip/payments/callback"

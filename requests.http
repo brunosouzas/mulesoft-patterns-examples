@@ -33,3 +33,45 @@ GET {{base}}/isp/after/finance/orders/ORD-1001
 
 ### DIP
 GET {{base}}/dip/after/orders/ORD-1001
+
+### EIP idempotent receiver — same order twice: "before" charges it twice, "after" answers 409 the second time
+POST {{base}}/eip/payments/after/charges
+Content-Type: application/json
+
+{ "orderId": "ORD-2001", "amount": 100 }
+
+###
+POST {{base}}/eip/payments/before/charges
+Content-Type: application/json
+
+{ "orderId": "ORD-2002", "amount": 100 }
+
+### EIP idempotent receiver — three different orders from one For Each: before gives accepted,duplicate,duplicate
+POST {{base}}/eip/payments/before/charges/batch
+Content-Type: application/json
+
+[ { "orderId": "ORD-2101", "amount": 10 }, { "orderId": "ORD-2102", "amount": 20 }, { "orderId": "ORD-2103", "amount": 30 } ]
+
+### ...and after accepts all three
+POST {{base}}/eip/payments/after/charges/batch
+Content-Type: application/json
+
+[ { "orderId": "ORD-2201", "amount": 10 }, { "orderId": "ORD-2202", "amount": 20 }, { "orderId": "ORD-2203", "amount": 30 } ]
+
+### Charges and rejected duplicates for one order
+GET {{base}}/eip/payments/ORD-2001/charges
+
+### EIP correlation identifier — status after the provider called back (PAID)
+GET {{base}}/eip/payments/ORD-2001/status
+
+### A callback nobody is waiting for: 404
+POST {{base}}/eip/payments/callback
+Content-Type: application/json
+
+{ "correlationId": "PRQ-UNKNOWN", "status": "APPROVED", "approvedAmount": 1, "providerReference": "PRV-X" }
+
+### Mule correlationId — sent in X-CORRELATION-ID by default, not sent with sendCorrelationId NEVER
+GET {{base}}/eip/correlation-id/call/default
+
+###
+GET {{base}}/eip/correlation-id/call/never

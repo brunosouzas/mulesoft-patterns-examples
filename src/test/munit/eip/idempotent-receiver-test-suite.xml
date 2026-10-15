@@ -1,0 +1,277 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<mule xmlns="http://www.mulesoft.org/schema/mule/core"
+	xmlns:munit="http://www.mulesoft.org/schema/mule/munit"
+	xmlns:munit-tools="http://www.mulesoft.org/schema/mule/munit-tools"
+	xmlns:http="http://www.mulesoft.org/schema/mule/http"
+	xmlns:os="http://www.mulesoft.org/schema/mule/os"
+	xmlns:doc="http://www.mulesoft.org/schema/mule/documentation"
+	xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+	xsi:schemaLocation="http://www.mulesoft.org/schema/mule/core http://www.mulesoft.org/schema/mule/core/current/mule.xsd
+		http://www.mulesoft.org/schema/mule/munit http://www.mulesoft.org/schema/mule/munit/current/mule-munit.xsd
+		http://www.mulesoft.org/schema/mule/munit-tools http://www.mulesoft.org/schema/mule/munit-tools/current/mule-munit-tools.xsd
+		http://www.mulesoft.org/schema/mule/http http://www.mulesoft.org/schema/mule/http/current/mule-http.xsd
+		http://www.mulesoft.org/schema/mule/os http://www.mulesoft.org/schema/mule/os/current/mule-os.xsd">
+
+	<!--
+		Idempotent receiver over HTTP. Before: <idempotent-message-validator/> with no configuration, so the
+		message ID is the correlationId. After: the message ID is payload.orderId, in an explicit store.
+
+		Client requests are sent over real HTTP with an explicit X-CORRELATION-ID (correlationId on the
+		requester), so each one is a separate client request as the endpoint sees it. Every test uses its own
+		orderIds, because the stores live as long as the application, not the test.
+	-->
+	<munit:config name="idempotent-receiver-test-suite.xml" />
+
+	<munit:test name="idempotent-before-same-order-from-two-client-requests-is-charged-twice" description="Idempotent receiver before: the same order sent twice by a retrying client (two correlation IDs) is charged twice">
+		<munit:enable-flow-sources>
+			<munit:enable-flow-source value="payment-before-charge-endpoint" />
+		</munit:enable-flow-sources>
+		<munit:execution>
+			<http:request doc:name="Client request CLIENT-TRY-1" config-ref="eip-self-http-request-config" method="POST" path="/eip/payments/before/charges" sendCorrelationId="ALWAYS" correlationId="ORD-IR-B-100-CLIENT-TRY-1" target="first">
+				<http:body><![CDATA[#[output application/json --- {orderId: 'ORD-IR-B-100', amount: 100}]]]></http:body>
+				<http:response-validator>
+					<http:success-status-code-validator values="200,409" />
+				</http:response-validator>
+			</http:request>
+			<http:request doc:name="Client request CLIENT-TRY-2" config-ref="eip-self-http-request-config" method="POST" path="/eip/payments/before/charges" sendCorrelationId="ALWAYS" correlationId="ORD-IR-B-100-CLIENT-TRY-2" target="second">
+				<http:body><![CDATA[#[output application/json --- {orderId: 'ORD-IR-B-100', amount: 100}]]]></http:body>
+				<http:response-validator>
+					<http:success-status-code-validator values="200,409" />
+				</http:response-validator>
+			</http:request>
+			<set-variable doc:name="Order" variableName="ledgerOrderId" value="ORD-IR-B-100" />
+			<flow-ref doc:name="Ledger summary" name="payment-ledger-summary" />
+		</munit:execution>
+		<munit:validation>
+			<munit-tools:assert-that doc:name="Response names the order" expression="#[vars.first.orderId]" is="#[MunitTools::equalTo(payload.orderId)]" />
+			<munit-tools:assert-that doc:name="First request: accepted" expression="#[vars.first.result]" is="#[MunitTools::equalTo('accepted')]" />
+			<munit-tools:assert-that doc:name="Second request: accepted" expression="#[vars.second.result]" is="#[MunitTools::equalTo('accepted')]" />
+			<munit-tools:assert-that doc:name="Charges" expression="#[payload.charges]" is="#[MunitTools::equalTo(2)]" />
+			<munit-tools:assert-that doc:name="Duplicates rejected" expression="#[payload.duplicatesRejected]" is="#[MunitTools::equalTo(0)]" />
+		</munit:validation>
+	</munit:test>
+
+	<munit:test name="idempotent-before-same-request-repeated-is-rejected" description="Idempotent receiver before: the same request repeated with the same correlation ID is caught">
+		<munit:enable-flow-sources>
+			<munit:enable-flow-source value="payment-before-charge-endpoint" />
+		</munit:enable-flow-sources>
+		<munit:execution>
+			<http:request doc:name="Client request CLIENT-TRY-1" config-ref="eip-self-http-request-config" method="POST" path="/eip/payments/before/charges" sendCorrelationId="ALWAYS" correlationId="ORD-IR-B-101-CLIENT-TRY-1" target="first">
+				<http:body><![CDATA[#[output application/json --- {orderId: 'ORD-IR-B-101', amount: 100}]]]></http:body>
+				<http:response-validator>
+					<http:success-status-code-validator values="200,409" />
+				</http:response-validator>
+			</http:request>
+			<http:request doc:name="Client request CLIENT-TRY-1" config-ref="eip-self-http-request-config" method="POST" path="/eip/payments/before/charges" sendCorrelationId="ALWAYS" correlationId="ORD-IR-B-101-CLIENT-TRY-1" target="second">
+				<http:body><![CDATA[#[output application/json --- {orderId: 'ORD-IR-B-101', amount: 100}]]]></http:body>
+				<http:response-validator>
+					<http:success-status-code-validator values="200,409" />
+				</http:response-validator>
+			</http:request>
+			<set-variable doc:name="Order" variableName="ledgerOrderId" value="ORD-IR-B-101" />
+			<flow-ref doc:name="Ledger summary" name="payment-ledger-summary" />
+		</munit:execution>
+		<munit:validation>
+			<munit-tools:assert-that doc:name="Response names the order" expression="#[vars.first.orderId]" is="#[MunitTools::equalTo(payload.orderId)]" />
+			<munit-tools:assert-that doc:name="First request: accepted" expression="#[vars.first.result]" is="#[MunitTools::equalTo('accepted')]" />
+			<munit-tools:assert-that doc:name="Second request: duplicate" expression="#[vars.second.result]" is="#[MunitTools::equalTo('duplicate')]" />
+			<munit-tools:assert-that doc:name="Charges" expression="#[payload.charges]" is="#[MunitTools::equalTo(1)]" />
+			<munit-tools:assert-that doc:name="Duplicates rejected" expression="#[payload.duplicatesRejected]" is="#[MunitTools::equalTo(1)]" />
+		</munit:validation>
+	</munit:test>
+
+	<munit:test name="idempotent-after-same-order-from-two-client-requests-is-charged-once" description="Idempotent receiver after: the same order sent twice (two correlation IDs) is charged once">
+		<munit:enable-flow-sources>
+			<munit:enable-flow-source value="payment-after-charge-endpoint" />
+		</munit:enable-flow-sources>
+		<munit:behavior>
+			<!-- The provider leg belongs to the correlation identifier suite; here it answers 202 and does nothing. -->
+			<munit-tools:mock-when doc:name="Provider accepts" processor="http:request">
+				<munit-tools:with-attributes>
+					<munit-tools:with-attribute attributeName="doc:name" whereValue="Send payment request to provider" />
+				</munit-tools:with-attributes>
+				<munit-tools:then-return>
+					<munit-tools:payload value="#[output application/java --- { requestId: vars.paymentRequest.requestId, status: 'ACCEPTED' }]" />
+				</munit-tools:then-return>
+			</munit-tools:mock-when>
+		</munit:behavior>
+		<munit:execution>
+			<http:request doc:name="Client request CLIENT-TRY-1" config-ref="eip-self-http-request-config" method="POST" path="/eip/payments/after/charges" sendCorrelationId="ALWAYS" correlationId="ORD-IR-A-100-CLIENT-TRY-1" target="first">
+				<http:body><![CDATA[#[output application/json --- {orderId: 'ORD-IR-A-100', amount: 100}]]]></http:body>
+				<http:response-validator>
+					<http:success-status-code-validator values="200,409" />
+				</http:response-validator>
+			</http:request>
+			<http:request doc:name="Client request CLIENT-TRY-2" config-ref="eip-self-http-request-config" method="POST" path="/eip/payments/after/charges" sendCorrelationId="ALWAYS" correlationId="ORD-IR-A-100-CLIENT-TRY-2" target="second">
+				<http:body><![CDATA[#[output application/json --- {orderId: 'ORD-IR-A-100', amount: 100}]]]></http:body>
+				<http:response-validator>
+					<http:success-status-code-validator values="200,409" />
+				</http:response-validator>
+			</http:request>
+			<set-variable doc:name="Order" variableName="ledgerOrderId" value="ORD-IR-A-100" />
+			<flow-ref doc:name="Ledger summary" name="payment-ledger-summary" />
+		</munit:execution>
+		<munit:validation>
+			<munit-tools:assert-that doc:name="Response names the order" expression="#[vars.first.orderId]" is="#[MunitTools::equalTo(payload.orderId)]" />
+			<munit-tools:assert-that doc:name="First request: accepted" expression="#[vars.first.result]" is="#[MunitTools::equalTo('accepted')]" />
+			<munit-tools:assert-that doc:name="Second request: duplicate" expression="#[vars.second.result]" is="#[MunitTools::equalTo('duplicate')]" />
+			<munit-tools:assert-that doc:name="Charges" expression="#[payload.charges]" is="#[MunitTools::equalTo(1)]" />
+			<munit-tools:assert-that doc:name="Duplicates rejected" expression="#[payload.duplicatesRejected]" is="#[MunitTools::equalTo(1)]" />
+		</munit:validation>
+	</munit:test>
+
+	<munit:test name="idempotent-before-for-each-over-http-rejects-different-orders" description="Idempotent receiver before: three different orders sent over HTTP from one For Each share one correlation ID, so two are rejected as duplicates">
+		<munit:enable-flow-sources>
+			<munit:enable-flow-source value="payment-before-charge-endpoint" />
+		</munit:enable-flow-sources>
+		<munit:execution>
+			<munit:set-event doc:name="Three different orders">
+				<munit:payload value="#[output application/json --- [{orderId: 'ORD-IR-BEFORE-LOOP-1', amount: 10}, {orderId: 'ORD-IR-BEFORE-LOOP-2', amount: 20}, {orderId: 'ORD-IR-BEFORE-LOOP-3', amount: 30}]]" mediaType="application/json" />
+				<munit:attributes value="#[{ uriParams: { version: 'before' } }]" />
+			</munit:set-event>
+			<flow-ref doc:name="POST /eip/payments/before/charges/batch" name="payment-charge-batch-client" />
+		</munit:execution>
+		<munit:validation>
+			<munit-tools:assert-that doc:name="accepted,duplicate,duplicate" expression="#[payload.results joinBy ',']" is="#[MunitTools::equalTo('accepted,duplicate,duplicate')]" />
+		</munit:validation>
+	</munit:test>
+
+	<munit:test name="idempotent-after-for-each-over-http-accepts-different-orders" description="Idempotent receiver after: the same three orders are all accepted, because the ID is the orderId">
+		<munit:enable-flow-sources>
+			<munit:enable-flow-source value="payment-after-charge-endpoint" />
+		</munit:enable-flow-sources>
+		<munit:behavior>
+			<!-- The provider leg belongs to the correlation identifier suite; here it answers 202 and does nothing. -->
+			<munit-tools:mock-when doc:name="Provider accepts" processor="http:request">
+				<munit-tools:with-attributes>
+					<munit-tools:with-attribute attributeName="doc:name" whereValue="Send payment request to provider" />
+				</munit-tools:with-attributes>
+				<munit-tools:then-return>
+					<munit-tools:payload value="#[output application/java --- { requestId: vars.paymentRequest.requestId, status: 'ACCEPTED' }]" />
+				</munit-tools:then-return>
+			</munit-tools:mock-when>
+		</munit:behavior>
+		<munit:execution>
+			<munit:set-event doc:name="Three different orders">
+				<munit:payload value="#[output application/json --- [{orderId: 'ORD-IR-AFTER-LOOP-1', amount: 10}, {orderId: 'ORD-IR-AFTER-LOOP-2', amount: 20}, {orderId: 'ORD-IR-AFTER-LOOP-3', amount: 30}]]" mediaType="application/json" />
+				<munit:attributes value="#[{ uriParams: { version: 'after' } }]" />
+			</munit:set-event>
+			<flow-ref doc:name="POST /eip/payments/after/charges/batch" name="payment-charge-batch-client" />
+		</munit:execution>
+		<munit:validation>
+			<munit-tools:assert-that doc:name="accepted,accepted,accepted" expression="#[payload.results joinBy ',']" is="#[MunitTools::equalTo('accepted,accepted,accepted')]" />
+		</munit:validation>
+	</munit:test>
+
+	<!--
+		Observed behaviour (Mule 4.9.17): the validator stores the ID when it accepts the request, before the
+		rest of the flow runs, and does not remove it when the flow fails afterwards. The retry of an order
+		whose charge failed is then rejected as a duplicate and never charged. The stored key is the bare
+		orderId. This test pins all three facts.
+	-->
+	<munit:test name="idempotent-after-failed-charge-keeps-the-id-so-the-retry-is-a-duplicate" description="Idempotent receiver after: when the charge fails after the validator accepted the order, the orderId stays stored and the retry is rejected as a duplicate">
+		<munit:behavior>
+			<!-- The charge fails after the validator accepted the order: recording it raises an error. -->
+			<munit-tools:mock-when doc:name="Recording the charge fails" processor="os:store">
+				<munit-tools:with-attributes>
+					<munit-tools:with-attribute attributeName="doc:name" whereValue="Record charge" />
+				</munit-tools:with-attributes>
+				<munit-tools:then-return>
+					<munit-tools:error typeId="OS:STORE_NOT_AVAILABLE" />
+				</munit-tools:then-return>
+			</munit-tools:mock-when>
+		</munit:behavior>
+		<munit:execution>
+			<munit:set-event doc:name="Charge">
+				<munit:payload value="#[output application/json --- {orderId: 'ORD-IR-FAIL-100', amount: 50}]" mediaType="application/json" />
+			</munit:set-event>
+			<flow-ref doc:name="First attempt (charge fails)" name="payment-after-charge-endpoint" />
+			<set-variable doc:name="First status" variableName="firstStatus" value="#[vars.httpStatus]" />
+			<remove-variable doc:name="Reset status" variableName="httpStatus" />
+			<os:contains doc:name="ID stored after the failure?" key="ORD-IR-FAIL-100" objectStore="eip-processed-orders-store" target="idStoredAfterFailure" />
+			<set-payload doc:name="Same charge again" value="#[output application/json --- {orderId: 'ORD-IR-FAIL-100', amount: 50}]" />
+			<flow-ref doc:name="Retry" name="payment-after-charge-endpoint" />
+			<set-variable doc:name="Retry status" variableName="retryStatus" value="#[vars.httpStatus]" />
+			<set-variable doc:name="Retry result" variableName="retryResult" value="#[payload.result]" />
+			<set-variable doc:name="Order" variableName="ledgerOrderId" value="ORD-IR-FAIL-100" />
+			<flow-ref doc:name="Ledger summary" name="payment-ledger-summary" />
+		</munit:execution>
+		<munit:validation>
+			<munit-tools:assert-that doc:name="First attempt failed with 500" expression="#[vars.firstStatus as Number]" is="#[MunitTools::equalTo(500)]" />
+			<munit-tools:assert-that doc:name="orderId still stored" expression="#[vars.idStoredAfterFailure]" is="#[MunitTools::equalTo(true)]" />
+			<munit-tools:assert-that doc:name="Retry answered 409" expression="#[vars.retryStatus as Number]" is="#[MunitTools::equalTo(409)]" />
+			<munit-tools:assert-that doc:name="Retry is a duplicate" expression="#[vars.retryResult]" is="#[MunitTools::equalTo('duplicate')]" />
+			<munit-tools:assert-that doc:name="Charges" expression="#[payload.charges]" is="#[MunitTools::equalTo(0)]" />
+			<munit-tools:assert-that doc:name="Duplicates rejected" expression="#[payload.duplicatesRejected]" is="#[MunitTools::equalTo(1)]" />
+		</munit:validation>
+	</munit:test>
+
+	<munit:test name="idempotent-charge-without-order-id-returns-400" description="Idempotent receiver: a charge without orderId is rejected with 400 before the validator">
+		<munit:execution>
+			<munit:set-event doc:name="Charge without orderId">
+				<munit:payload value="#[output application/json --- {amount: 50}]" mediaType="application/json" />
+			</munit:set-event>
+			<flow-ref doc:name="POST /eip/payments/before/charges" name="payment-before-charge-endpoint" />
+		</munit:execution>
+		<munit:validation>
+			<munit-tools:assert-that doc:name="400" expression="#[vars.httpStatus as Number]" is="#[MunitTools::equalTo(400)]" />
+		</munit:validation>
+	</munit:test>
+
+	<munit:test name="idempotent-batch-unknown-version-returns-404" description="Idempotent receiver: the batch client only knows the before and after endpoints">
+		<munit:execution>
+			<munit:set-event doc:name="Unknown version">
+				<munit:payload value="#[output application/json --- [{orderId: 'ORD-IR-X-1', amount: 10}]]" mediaType="application/json" />
+				<munit:attributes value="#[{ uriParams: { version: 'sideways' } }]" />
+			</munit:set-event>
+			<flow-ref doc:name="POST /eip/payments/sideways/charges/batch" name="payment-charge-batch-client" />
+		</munit:execution>
+		<munit:validation>
+			<munit-tools:assert-that doc:name="404" expression="#[vars.httpStatus as Number]" is="#[MunitTools::equalTo(404)]" />
+		</munit:validation>
+	</munit:test>
+
+	<munit:test name="idempotent-batch-empty-returns-400" description="Idempotent receiver: the batch client needs a non-empty array">
+		<munit:execution>
+			<munit:set-event doc:name="Empty batch">
+				<munit:payload value="#[output application/json --- []]" mediaType="application/json" />
+				<munit:attributes value="#[{ uriParams: { version: 'after' } }]" />
+			</munit:set-event>
+			<flow-ref doc:name="POST /eip/payments/after/charges/batch" name="payment-charge-batch-client" />
+		</munit:execution>
+		<munit:validation>
+			<munit-tools:assert-that doc:name="400" expression="#[vars.httpStatus as Number]" is="#[MunitTools::equalTo(400)]" />
+		</munit:validation>
+	</munit:test>
+
+	<munit:test name="idempotent-ledger-endpoint-counts-charges" description="Idempotent receiver: GET /eip/payments/{orderId}/charges counts charges and rejected duplicates">
+		<munit:behavior>
+			<!-- The provider leg belongs to the correlation identifier suite; here it answers 202 and does nothing. -->
+			<munit-tools:mock-when doc:name="Provider accepts" processor="http:request">
+				<munit-tools:with-attributes>
+					<munit-tools:with-attribute attributeName="doc:name" whereValue="Send payment request to provider" />
+				</munit-tools:with-attributes>
+				<munit-tools:then-return>
+					<munit-tools:payload value="#[output application/java --- { requestId: vars.paymentRequest.requestId, status: 'ACCEPTED' }]" />
+				</munit-tools:then-return>
+			</munit-tools:mock-when>
+		</munit:behavior>
+		<munit:execution>
+			<munit:set-event doc:name="Charge">
+				<munit:payload value="#[output application/json --- {orderId: 'ORD-IR-LEDGER-1', amount: 15}]" mediaType="application/json" />
+			</munit:set-event>
+			<flow-ref doc:name="Charge (after)" name="payment-after-charge-endpoint" />
+			<set-payload doc:name="Same charge again" value="#[output application/json --- {orderId: 'ORD-IR-LEDGER-1', amount: 15}]" />
+			<flow-ref doc:name="Charge again (after)" name="payment-after-charge-endpoint" />
+			<munit:set-event doc:name="GET ledger">
+				<munit:attributes value="#[{ uriParams: { orderId: 'ORD-IR-LEDGER-1' } }]" />
+			</munit:set-event>
+			<flow-ref doc:name="GET /eip/payments/ORD-IR-LEDGER-1/charges" name="payment-get-ledger" />
+		</munit:execution>
+		<munit:validation>
+			<munit-tools:assert-that doc:name="Order" expression="#[payload.orderId]" is="#[MunitTools::equalTo('ORD-IR-LEDGER-1')]" />
+			<munit-tools:assert-that doc:name="Charges" expression="#[payload.charges]" is="#[MunitTools::equalTo(1)]" />
+			<munit-tools:assert-that doc:name="Duplicates rejected" expression="#[payload.duplicatesRejected]" is="#[MunitTools::equalTo(1)]" />
+		</munit:validation>
+	</munit:test>
+</mule>
