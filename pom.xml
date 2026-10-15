@@ -3,13 +3,13 @@
 	<modelVersion>4.0.0</modelVersion>
 
 	<groupId>com.brunosouzas.examples</groupId>
-	<artifactId>mulesoft-solid-examples</artifactId>
+	<artifactId>mulesoft-patterns-examples</artifactId>
 	<version>1.0.0-SNAPSHOT</version>
 	<packaging>mule-application</packaging>
 
-	<name>mulesoft-solid-examples</name>
-	<description>Before and after examples of the SOLID principles applied to Mule 4 flows, with MUnit tests.</description>
-	<url>https://github.com/brunosouzas/mulesoft-solid-examples</url>
+	<name>mulesoft-patterns-examples</name>
+	<description>Runnable Mule 4 examples of design and integration patterns (SOLID, Enterprise Integration Patterns), with MUnit tests.</description>
+	<url>https://github.com/brunosouzas/mulesoft-patterns-examples</url>
 
 	<licenses>
 		<license>
