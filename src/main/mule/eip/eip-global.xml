@@ -13,7 +13,7 @@
 		by the correlation identifier's payment provider simulator (request and callback) and by the Mule
 		correlation ID demo. It shares http.port with the listener, so MUnit's dynamic port works.
 	-->
-	<http:request-config name="eip-self-http-request-config" doc:name="HTTP requester to this app">
+	<http:request-config name="eip-self-http-request-config" doc:name="Self Call Http Request Config">
 		<http:request-connection host="${eip.selfCall.host}" port="${http.port}" />
 	</http:request-config>
 </mule>
