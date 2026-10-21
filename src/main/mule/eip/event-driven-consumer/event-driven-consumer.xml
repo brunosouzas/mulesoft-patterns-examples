@@ -1,0 +1,68 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<mule xmlns="http://www.mulesoft.org/schema/mule/core"
+	xmlns:http="http://www.mulesoft.org/schema/mule/http"
+	xmlns:os="http://www.mulesoft.org/schema/mule/os"
+	xmlns:ee="http://www.mulesoft.org/schema/mule/ee/core"
+	xmlns:doc="http://www.mulesoft.org/schema/mule/documentation"
+	xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+	xsi:schemaLocation="http://www.mulesoft.org/schema/mule/core http://www.mulesoft.org/schema/mule/core/current/mule.xsd
+		http://www.mulesoft.org/schema/mule/http http://www.mulesoft.org/schema/mule/http/current/mule-http.xsd
+		http://www.mulesoft.org/schema/mule/os http://www.mulesoft.org/schema/mule/os/current/mule-os.xsd
+		http://www.mulesoft.org/schema/mule/ee/core http://www.mulesoft.org/schema/mule/ee/core/current/mule-ee.xsd">
+
+	<!--
+		EVENT-DRIVEN CONSUMER (Hohpe and Woolf): the consumer does not ask for messages; the channel delivers each
+		one as it arrives and that starts the processing. Here: a payment provider notifies payment events
+		(PAYMENT_CONFIRMED, PAYMENT_FAILED) and each one updates the order's payment state as it arrives.
+		POST /eip/payment-events             the event-driven consumer
+		GET  /eip/payment-events/{orderId}   the payment state the events left on the order
+
+		In Mule the event-driven consumer is a flow that starts with a source (trigger): "Some connectors have
+		sources, or triggers" that start the flow (https://docs.mulesoft.com/connectors/introduction/introduction-to-anypoint-connectors).
+		Here the source is the HTTP Listener (https://docs.mulesoft.com/http-connector/latest/http-listener-ref):
+		the flow runs once per request, nothing runs between requests, and the event is processed by the time
+		the sender gets its answer. Compare polling-consumer/, where an order waits until the next poll.
+
+		The messaging equivalents are the VM Listener (<vm:listener>, https://docs.mulesoft.com/vm-connector/latest/vm-reference)
+		and the Anypoint MQ Subscriber (<anypoint-mq:subscriber>,
+		https://docs.mulesoft.com/anypoint-mq-connector/latest/anypoint-mq-listener): the same flow shape with another
+		source. They are not used here: this project runs without a broker and does not simulate one with VM.
+	-->
+	<os:object-store name="eip-payment-event-state-store" doc:name="Payment Event State Object Store" persistent="false" />
+
+	<flow name="payment-consume-event" doc:description="Event-driven consumer: an HTTP Listener delivers each payment event as it arrives, and the flow applies it to the order's payment state before answering.">
+		<http:listener doc:name="POST /eip/payment-events" config-ref="http-listener-config" path="/eip/payment-events" allowedMethods="POST">
+			<http:response statusCode="#[vars.httpStatus default 200]" />
+		</http:listener>
+		<choice doc:name="Validate Payment Event">
+			<when expression="#[(not (payload is Object)) or isEmpty(payload.eventId) or isEmpty(payload.orderId) or not (['PAYMENT_CONFIRMED', 'PAYMENT_FAILED'] contains payload.'type')]">
+				<raise-error doc:name="Raise BAD_REQUEST Error - Bad event" type="APP:BAD_REQUEST" description="eventId, orderId and type (PAYMENT_CONFIRMED or PAYMENT_FAILED) are required" />
+			</when>
+		</choice>
+		<set-variable doc:name="SET vEvent" variableName="vEvent" value="#[output application/java --- payload]" />
+		<os:store doc:name="Store Payment State" key="#[vars.vEvent.orderId]" objectStore="eip-payment-event-state-store">
+			<os:value><![CDATA[#[output application/java --- {
+	orderId: vars.vEvent.orderId,
+	status: if (vars.vEvent.'type' == "PAYMENT_CONFIRMED") "PAID" else "PAYMENT_FAILED",
+	lastEventId: vars.vEvent.eventId,
+	processedAt: now() as String
+}]]]></os:value>
+		</os:store>
+		<logger doc:name="INFO: Log event consumed" level="INFO" message="#['Payment event ' ++ vars.vEvent.eventId ++ ' (' ++ vars.vEvent.'type' ++ ') consumed for orderId=' ++ vars.vEvent.orderId ++ ', correlationId=' ++ correlationId]" />
+		<set-payload doc:name="Set Consumed Response" value="#[output application/json --- { eventId: vars.vEvent.eventId, orderId: vars.vEvent.orderId, result: 'CONSUMED' }]" />
+	</flow>
+
+	<flow name="payment-get-event-state" doc:description="GET /eip/payment-events/{orderId}: the payment state left on the order by its events; 404 when no event was received for it.">
+		<http:listener doc:name="GET /eip/payment-events/{orderId}" config-ref="http-listener-config" path="/eip/payment-events/{orderId}" allowedMethods="GET">
+			<http:response statusCode="#[vars.httpStatus default 200]" />
+		</http:listener>
+		<os:contains doc:name="Check Known Order" key="#[attributes.uriParams.orderId]" objectStore="eip-payment-event-state-store" target="vKnown" />
+		<choice doc:name="Check Found">
+			<when expression="#[not vars.vKnown]">
+				<raise-error doc:name="Raise NOT_FOUND Error - No event" type="APP:NOT_FOUND" description="No payment event for this order" />
+			</when>
+		</choice>
+		<os:retrieve doc:name="Read Payment State" key="#[attributes.uriParams.orderId]" objectStore="eip-payment-event-state-store" />
+		<set-payload doc:name="Set State As JSON" value="#[output application/json --- payload]" />
+	</flow>
+</mule>
