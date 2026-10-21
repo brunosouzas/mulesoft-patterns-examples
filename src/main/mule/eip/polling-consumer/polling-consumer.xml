@@ -1,0 +1,123 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<mule xmlns="http://www.mulesoft.org/schema/mule/core"
+	xmlns:http="http://www.mulesoft.org/schema/mule/http"
+	xmlns:os="http://www.mulesoft.org/schema/mule/os"
+	xmlns:ee="http://www.mulesoft.org/schema/mule/ee/core"
+	xmlns:doc="http://www.mulesoft.org/schema/mule/documentation"
+	xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+	xsi:schemaLocation="http://www.mulesoft.org/schema/mule/core http://www.mulesoft.org/schema/mule/core/current/mule.xsd
+		http://www.mulesoft.org/schema/mule/http http://www.mulesoft.org/schema/mule/http/current/mule-http.xsd
+		http://www.mulesoft.org/schema/mule/os http://www.mulesoft.org/schema/mule/os/current/mule-os.xsd
+		http://www.mulesoft.org/schema/mule/ee/core http://www.mulesoft.org/schema/mule/ee/core/current/mule-ee.xsd">
+
+	<!--
+		POLLING CONSUMER (Hohpe and Woolf): the consumer decides when to read; it checks the source at its own
+		pace and takes what is there. Here: orders waiting for stock allocation are written to a pending list,
+		and an allocation job polls the list at a fixed frequency.
+		POST /eip/stock/pending-orders   adds an order to the pending list (the source being polled)
+		GET  /eip/stock/polled-orders    the watermark and what the poller has allocated so far
+		(the poll itself is the flow stock-poll-pending-orders, started by a Scheduler, not by a request)
+
+		The Scheduler (https://docs.mulesoft.com/mule-runtime/latest/scheduler-concept) runs the flow every
+		eip.pollingConsumer.frequencyMillis. An order added between two polls waits for the next one; compare
+		event-driven-consumer/, where the event is processed by the time the sender gets its answer. Per that page:
+		- "By default, the Scheduler does not wait for one execution of a given flow to complete before executing
+		  another instance"; disallowConcurrentExecution="true" makes it skip a run while one is still going, so
+		  two polls never read the same orders at once;
+		- "In a Mule runtime engine cluster or multi-worker CloudHub deployment, the Scheduler executes only on
+		  the primary node".
+
+		The pending list is never emptied (as a table polled by another system would not be). What the poller has
+		already read is remembered by a watermark: every pending order gets an increasing sequence number, and
+		the poller keeps the highest one it has processed in an object store. Each poll reads only the orders
+		above the watermark and then moves it, so an order is allocated once however many polls run. The
+		watermark is stored only after the orders are processed: if a poll fails half way, the next one reads
+		those orders again, so processing must tolerate a repeat (at least once, not exactly once).
+		Database and file sources have a built-in watermark; an object store does it for any source.
+		Object Store connector: https://docs.mulesoft.com/object-store-connector/latest/object-store-connector-reference
+	-->
+	<os:object-store name="eip-pending-orders-store" doc:name="Pending Orders Object Store" persistent="false" />
+	<os:object-store name="eip-polling-watermark-store" doc:name="Polling Watermark Object Store" persistent="false" />
+	<os:object-store name="eip-polled-orders-store" doc:name="Polled Orders Object Store" persistent="false" />
+
+	<!-- maxConcurrency 1: two orders added at the same moment cannot get the same sequence number. -->
+	<flow name="stock-add-pending-order" maxConcurrency="1" doc:description="Adds an order to the pending list polled by the polling consumer, with the next sequence number.">
+		<http:listener doc:name="POST /eip/stock/pending-orders" config-ref="http-listener-config" path="/eip/stock/pending-orders" allowedMethods="POST">
+			<http:response statusCode="#[vars.httpStatus default 202]" />
+		</http:listener>
+		<choice doc:name="Validate Pending Order">
+			<when expression="#[(not (payload is Object)) or isEmpty(payload.orderId)]">
+				<raise-error doc:name="Raise BAD_REQUEST Error - Missing orderId" type="APP:BAD_REQUEST" description="orderId is required" />
+			</when>
+		</choice>
+		<set-variable doc:name="SET vOrderId" variableName="vOrderId" value="#[payload.orderId]" />
+		<os:retrieve doc:name="Read Last Sequence" key="lastSequence" objectStore="eip-pending-orders-store" target="vLastSequence">
+			<os:default-value><![CDATA[#[0]]]></os:default-value>
+		</os:retrieve>
+		<set-variable doc:name="SET vSequence" variableName="vSequence" value="#[(vars.vLastSequence as Number) + 1]" />
+		<os:store doc:name="Store Pending Order" key="#['order-' ++ vars.vSequence]" objectStore="eip-pending-orders-store">
+			<os:value><![CDATA[#[output application/java --- { orderId: vars.vOrderId, sequence: vars.vSequence, addedAt: now() as String }]]]></os:value>
+		</os:store>
+		<os:store doc:name="Store Last Sequence" key="lastSequence" objectStore="eip-pending-orders-store">
+			<os:value><![CDATA[#[vars.vSequence]]]></os:value>
+		</os:store>
+		<set-payload doc:name="Set Pending Response" value="#[output application/json --- { orderId: vars.vOrderId, sequence: vars.vSequence, status: 'PENDING' }]" />
+	</flow>
+
+	<flow name="stock-poll-pending-orders" doc:description="Polling consumer: a Scheduler polls the pending orders at a fixed frequency and allocates stock for the ones above the watermark, then moves the watermark.">
+		<scheduler doc:name="Scheduler - Poll Pending Orders" disallowConcurrentExecution="true">
+			<scheduling-strategy>
+				<fixed-frequency frequency="${eip.pollingConsumer.frequencyMillis}" timeUnit="MILLISECONDS" />
+			</scheduling-strategy>
+		</scheduler>
+		<os:retrieve doc:name="Read Watermark" key="watermark" objectStore="eip-polling-watermark-store" target="vWatermark">
+			<os:default-value><![CDATA[#[0]]]></os:default-value>
+		</os:retrieve>
+		<os:retrieve-all doc:name="Read Pending Orders" objectStore="eip-pending-orders-store" />
+		<ee:transform doc:name="Select Orders Above Watermark">
+			<ee:variables>
+				<ee:set-variable variableName="vNewOrders"><![CDATA[%dw 2.0
+output application/java
+---
+(payload pluck $) filter (($ is Object) and ($.sequence > (vars.vWatermark as Number))) orderBy $.sequence]]></ee:set-variable>
+			</ee:variables>
+		</ee:transform>
+		<foreach doc:name="For Each New Order" collection="#[vars.vNewOrders]">
+			<flow-ref doc:name="Refer to sf-allocate-polled-order" name="sf-allocate-polled-order" />
+		</foreach>
+		<choice doc:name="Check Anything Read">
+			<when expression="#[not isEmpty(vars.vNewOrders)]">
+				<os:store doc:name="Store Watermark" key="watermark" objectStore="eip-polling-watermark-store">
+					<os:value><![CDATA[#[max(vars.vNewOrders map $.sequence)]]]></os:value>
+				</os:store>
+			</when>
+		</choice>
+		<logger doc:name="INFO: Log poll" level="INFO" message="#['Polled pending orders: ' ++ sizeOf(vars.vNewOrders) ++ ' new above watermark ' ++ vars.vWatermark ++ ', correlationId=' ++ correlationId]" />
+	</flow>
+
+	<sub-flow name="sf-allocate-polled-order" doc:description="Allocates stock for one polled order and records it, counting how many times the order was allocated.">
+		<os:retrieve doc:name="Read Previous Allocation" key="#[payload.orderId]" objectStore="eip-polled-orders-store" target="vPrevious">
+			<os:default-value><![CDATA[#[output application/java --- { timesAllocated: 0 }]]]></os:default-value>
+		</os:retrieve>
+		<os:store doc:name="Store Allocation" key="#[payload.orderId]" objectStore="eip-polled-orders-store">
+			<os:value><![CDATA[#[output application/java --- {
+	orderId: payload.orderId,
+	sequence: payload.sequence,
+	status: "ALLOCATED",
+	timesAllocated: (vars.vPrevious.timesAllocated as Number) + 1,
+	allocatedAt: now() as String
+}]]]></os:value>
+		</os:store>
+	</sub-flow>
+
+	<flow name="stock-get-polled-orders" doc:description="GET /eip/stock/polled-orders: the polling consumer's watermark and the orders it has allocated.">
+		<http:listener doc:name="GET /eip/stock/polled-orders" config-ref="http-listener-config" path="/eip/stock/polled-orders" allowedMethods="GET">
+			<http:response statusCode="#[vars.httpStatus default 200]" />
+		</http:listener>
+		<os:retrieve doc:name="Read Watermark" key="watermark" objectStore="eip-polling-watermark-store" target="vWatermark">
+			<os:default-value><![CDATA[#[0]]]></os:default-value>
+		</os:retrieve>
+		<os:retrieve-all doc:name="Read Allocations" objectStore="eip-polled-orders-store" />
+		<set-payload doc:name="Set Polled Orders As JSON" value="#[output application/json --- { watermark: vars.vWatermark as Number, orders: (payload pluck $) orderBy $.sequence }]" />
+	</flow>
+</mule>
