@@ -49,6 +49,7 @@ var first = payload[0]
 	orderId: "ORD-" ++ first.partnerOrderRef,
 	customerId: "CUS-" ++ first.buyerCode,
 	country: upper(first.shipToCountry),
+	// The partner contract is BRL-only: the CSV has no currency column and its prices are BRL cents.
 	currency: "BRL",
 	items: payload map ((row) -> {
 		sku: skuFor(row.productCode),
