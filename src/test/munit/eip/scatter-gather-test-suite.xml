@@ -122,6 +122,7 @@
 			<munit-tools:assert-that doc:name="Stock result kept" expression="#[payload.completedChecks.stock.available]" is="#[MunitTools::equalTo(true)]" />
 			<munit-tools:assert-that doc:name="Failed checks" expression="#[keysOf(payload.failedChecks) map ($ as String)]" is="#[MunitTools::equalTo(['fraud'])]" />
 			<munit-tools:assert-that doc:name="Failure error type" expression="#[payload.failedChecks.fraud.errorType]" is="#[MunitTools::equalTo('HTTP:SERVICE_UNAVAILABLE')]" />
+			<munit-tools:assert-that doc:name="No error description in the response" expression="#[payload.failedChecks.fraud.description default null]" is="#[MunitTools::nullValue()]" />
 			<munit-tools:verify-call doc:name="Call Pricing Service called 1x" processor="http:request" times="1">
 				<munit-tools:with-attributes>
 					<munit-tools:with-attribute attributeName="doc:name" whereValue="Call Pricing Service" />
