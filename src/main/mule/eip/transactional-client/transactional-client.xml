@@ -1,0 +1,114 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<mule xmlns="http://www.mulesoft.org/schema/mule/core"
+	xmlns:http="http://www.mulesoft.org/schema/mule/http"
+	xmlns:os="http://www.mulesoft.org/schema/mule/os"
+	xmlns:doc="http://www.mulesoft.org/schema/mule/documentation"
+	xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+	xsi:schemaLocation="http://www.mulesoft.org/schema/mule/core http://www.mulesoft.org/schema/mule/core/current/mule.xsd
+		http://www.mulesoft.org/schema/mule/http http://www.mulesoft.org/schema/mule/http/current/mule-http.xsd
+		http://www.mulesoft.org/schema/mule/os http://www.mulesoft.org/schema/mule/os/current/mule-os.xsd">
+
+	<!--
+		TRANSACTIONAL CLIENT (Hohpe and Woolf): the client controls the transaction boundaries, so that several
+		messaging operations (receive a message, send others, update a store) succeed or fail as one unit: on
+		failure everything inside the boundary is rolled back and the received message goes back to its channel.
+		Here: a payment writes two records, a debit in the payment ledger and PAID on the order. Both or neither.
+		POST /eip/payments/transactional/before   a Try scope with transactionalAction="ALWAYS_BEGIN" around
+		                                         the two writes: looks transactional, is not
+		POST /eip/payments/transactional/after    the same two writes with a compensation: when the second
+		                                         write fails, the first is undone and the caller gets 503
+		GET  /eip/payments/transactional/{orderId}  what the ledger and the order hold
+
+		Why the "before" Try does not roll back: in Mule a transaction only covers operations that support
+		transactions. To join a Single Resource (local) transaction "The operation must support transactions",
+		"All operations inside the transaction must belong to the same Connector" and use the same configuration
+		(https://docs.mulesoft.com/mule-runtime/latest/transaction-management). The Try scope "treats child
+		operations as a transaction when the Transactional Action is set to ALWAYS_BEGIN or BEGIN_OR_JOIN"
+		(https://docs.mulesoft.com/mule-runtime/latest/try-scope-concept), but the Object Store and HTTP
+		operations do not support transactions: they run, and stay done, whatever the Try decides. The test
+		tc-before-try-transaction-does-not-roll-back-the-debit shows the debit left behind by a failed payment.
+
+		Real transactions need a transactional connector: JMS, VM, Database (and XA across several of them,
+		https://docs.mulesoft.com/mule-runtime/latest/xa-transactions). With a jms:listener or a Database
+		connection inside the Try, the same configuration would commit or roll back both writes. This app uses no
+		external system and, by the series' rule, no VM queue standing in for a broker, so it has no transactional
+		resource; the "after" flow does what is left without one, a compensation (undo the first write when the
+		second fails). A compensation is not a transaction: another reader can see the debit before it is undone,
+		and a crash between the failure and the undo leaves the debit in place. When that matters, put both
+		records in one database and use a Database transaction.
+	-->
+	<os:object-store name="eip-tc-ledger-store" doc:name="Transactional Client Ledger Object Store" persistent="false" />
+	<os:object-store name="eip-tc-orders-store" doc:name="Transactional Client Orders Object Store" persistent="false" />
+
+	<flow name="payment-charge-in-try-transaction" doc:description="Transactional client, before: writes the ledger debit and the order's PAID status inside a Try with transactionalAction ALWAYS_BEGIN; the Object Store is not transactional, so a failure leaves the debit.">
+		<http:listener doc:name="POST /eip/payments/transactional/before" config-ref="http-listener-config" path="/eip/payments/transactional/before" allowedMethods="POST">
+			<http:response statusCode="#[vars.httpStatus default 200]" />
+		</http:listener>
+		<flow-ref doc:name="Refer to sf-validate-transactional-payment" name="sf-validate-transactional-payment" />
+		<try doc:name="Try Charge In Transaction" transactionalAction="ALWAYS_BEGIN" transactionType="LOCAL">
+			<flow-ref doc:name="Refer to sf-debit-ledger-and-mark-order-paid" name="sf-debit-ledger-and-mark-order-paid" />
+		</try>
+		<set-payload doc:name="Set Paid Response" value="#[output application/json --- { orderId: vars.vOrderId, status: 'PAID' }]" />
+	</flow>
+
+	<flow name="payment-charge-with-compensation" doc:description="Transactional client, after: writes the ledger debit and the order's PAID status; when the second write fails, a compensation removes the debit and the caller gets 503.">
+		<http:listener doc:name="POST /eip/payments/transactional/after" config-ref="http-listener-config" path="/eip/payments/transactional/after" allowedMethods="POST">
+			<http:response statusCode="#[vars.httpStatus default 200]" />
+		</http:listener>
+		<flow-ref doc:name="Refer to sf-validate-transactional-payment" name="sf-validate-transactional-payment" />
+		<try doc:name="Try Charge With Compensation">
+			<flow-ref doc:name="Refer to sf-debit-ledger-and-mark-order-paid" name="sf-debit-ledger-and-mark-order-paid" />
+			<error-handler>
+				<on-error-continue doc:name="On Error Continue (compensate the debit)" type="ANY" logException="false">
+					<logger doc:name="WARN: Log payment compensated" level="WARN" message="#['Payment of order ' ++ vars.vOrderId ++ ' failed (' ++ error.errorType.namespace ++ ':' ++ error.errorType.identifier ++ '), compensating the ledger debit, correlationId=' ++ correlationId]" />
+					<os:contains doc:name="Check Debit Written" key="#[vars.vOrderId]" objectStore="eip-tc-ledger-store" target="vDebitWritten" />
+					<choice doc:name="Check Debit To Undo">
+						<when expression="#[vars.vDebitWritten]">
+							<os:remove doc:name="Undo Ledger Debit" key="#[vars.vOrderId]" objectStore="eip-tc-ledger-store" />
+						</when>
+					</choice>
+					<set-variable doc:name="SET vCompensated" variableName="vCompensated" value="#[true]" />
+				</on-error-continue>
+			</error-handler>
+		</try>
+		<choice doc:name="Check Compensated">
+			<when expression="#[vars.vCompensated default false]">
+				<raise-error doc:name="Raise SERVICE_UNAVAILABLE Error - Payment not recorded" type="APP:SERVICE_UNAVAILABLE" description="Payment not recorded; the ledger debit was undone" />
+			</when>
+		</choice>
+		<set-payload doc:name="Set Paid Response" value="#[output application/json --- { orderId: vars.vOrderId, status: 'PAID' }]" />
+	</flow>
+
+	<sub-flow name="sf-validate-transactional-payment" doc:description="Checks the payment has an orderId and a positive amount, and keeps them in variables.">
+		<choice doc:name="Validate Payment">
+			<when expression="#[(not (payload is Object)) or isEmpty(payload.orderId) or (not (payload.amount is Number)) or (payload.amount &lt;= 0)]">
+				<raise-error doc:name="Raise BAD_REQUEST Error - Invalid payment" type="APP:BAD_REQUEST" description="orderId and a positive amount are required" />
+			</when>
+		</choice>
+		<set-variable doc:name="SET vOrderId" variableName="vOrderId" value="#[payload.orderId]" />
+		<set-variable doc:name="SET vAmount" variableName="vAmount" value="#[payload.amount]" />
+	</sub-flow>
+
+	<sub-flow name="sf-debit-ledger-and-mark-order-paid" doc:description="The two writes of a payment that must succeed or fail together: the ledger debit, then the order's PAID status.">
+		<os:store doc:name="Write Ledger Debit" key="#[vars.vOrderId]" objectStore="eip-tc-ledger-store">
+			<os:value><![CDATA[#[output application/java --- { orderId: vars.vOrderId, amount: vars.vAmount, entry: 'DEBIT' }]]]></os:value>
+		</os:store>
+		<os:store doc:name="Mark Order Paid" key="#[vars.vOrderId]" objectStore="eip-tc-orders-store">
+			<os:value><![CDATA[#[output application/java --- { orderId: vars.vOrderId, status: 'PAID' }]]]></os:value>
+		</os:store>
+	</sub-flow>
+
+	<flow name="payment-get-transactional-state" doc:description="GET /eip/payments/transactional/{orderId}: the ledger debit and the order status of a payment, null where nothing was written.">
+		<http:listener doc:name="GET /eip/payments/transactional/{orderId}" config-ref="http-listener-config" path="/eip/payments/transactional/{orderId}" allowedMethods="GET">
+			<http:response statusCode="#[vars.httpStatus default 200]" />
+		</http:listener>
+		<set-variable doc:name="SET vOrderId" variableName="vOrderId" value="#[attributes.uriParams.orderId]" />
+		<os:retrieve doc:name="Read Ledger Debit" key="#[vars.vOrderId]" objectStore="eip-tc-ledger-store" target="vDebit">
+			<os:default-value><![CDATA[#[output application/java --- {}]]]></os:default-value>
+		</os:retrieve>
+		<os:retrieve doc:name="Read Order Status" key="#[vars.vOrderId]" objectStore="eip-tc-orders-store" target="vOrder">
+			<os:default-value><![CDATA[#[output application/java --- {}]]]></os:default-value>
+		</os:retrieve>
+		<set-payload doc:name="Set State As JSON" value="#[output application/json --- { orderId: vars.vOrderId, ledgerDebit: if (isEmpty(vars.vDebit)) null else vars.vDebit, orderStatus: vars.vOrder.status }]" />
+	</flow>
+</mule>
