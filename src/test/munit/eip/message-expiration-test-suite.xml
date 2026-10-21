@@ -1,0 +1,179 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<mule xmlns="http://www.mulesoft.org/schema/mule/core"
+	xmlns:munit="http://www.mulesoft.org/schema/mule/munit"
+	xmlns:munit-tools="http://www.mulesoft.org/schema/mule/munit-tools"
+	xmlns:http="http://www.mulesoft.org/schema/mule/http"
+	xmlns:os="http://www.mulesoft.org/schema/mule/os"
+	xmlns:doc="http://www.mulesoft.org/schema/mule/documentation"
+	xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+	xsi:schemaLocation="http://www.mulesoft.org/schema/mule/core http://www.mulesoft.org/schema/mule/core/current/mule.xsd
+		http://www.mulesoft.org/schema/mule/munit http://www.mulesoft.org/schema/mule/munit/current/mule-munit.xsd
+		http://www.mulesoft.org/schema/mule/munit-tools http://www.mulesoft.org/schema/mule/munit-tools/current/mule-munit-tools.xsd
+		http://www.mulesoft.org/schema/mule/http http://www.mulesoft.org/schema/mule/http/current/mule-http.xsd
+		http://www.mulesoft.org/schema/mule/os http://www.mulesoft.org/schema/mule/os/current/mule-os.xsd">
+
+	<!--
+		Message expiration: requests carry expiresAt; the consumer reserves stock for the valid ones and moves the
+		expired ones aside. Times are relative to now() (a short TTL), so the tests need no fixed clock. The Scheduler
+		source is off unless enabled, so most tests run one consumer pass with a flow-ref.
+	-->
+	<munit:config name="message-expiration-test-suite.xml" />
+
+	<munit:test name="me-valid-request-is-reserved" description="Message expiration: a request that expires in a minute is QUEUED until the consumer runs, then RESERVED">
+		<munit:enable-flow-sources>
+			<munit:enable-flow-source value="stock-queue-expiring-request" />
+			<munit:enable-flow-source value="stock-get-expiring-request" />
+		</munit:enable-flow-sources>
+		<munit:execution>
+			<http:request doc:name="POST ORD-ME-1" config-ref="eip-self-http-request-config" method="POST" path="/eip/stock/expiring-requests" target="vPosted" targetValue="#[output application/java --- { status: attributes.statusCode, contentType: attributes.headers.'content-type' default '', body: payload }]">
+				<http:body><![CDATA[#[output application/json --- { orderId: 'ORD-ME-1', sku: 'SKU-BOOK', quantity: 2, expiresAt: (now() + |PT60S|) as String }]]]></http:body>
+				<http:response-validator>
+					<http:success-status-code-validator values="200..599" />
+				</http:response-validator>
+			</http:request>
+			<http:request doc:name="GET ORD-ME-1" config-ref="eip-self-http-request-config" method="GET" path="/eip/stock/expiring-requests/ORD-ME-1" target="vBefore" targetValue="#[output application/java --- { status: attributes.statusCode, contentType: attributes.headers.'content-type' default '', body: payload }]">
+				<http:response-validator>
+					<http:success-status-code-validator values="200..599" />
+				</http:response-validator>
+			</http:request>
+			<flow-ref doc:name="Refer to stock-consume-expiring-requests (one run)" name="stock-consume-expiring-requests" />
+			<http:request doc:name="GET ORD-ME-1" config-ref="eip-self-http-request-config" method="GET" path="/eip/stock/expiring-requests/ORD-ME-1" target="vAfter" targetValue="#[output application/java --- { status: attributes.statusCode, contentType: attributes.headers.'content-type' default '', body: payload }]">
+				<http:response-validator>
+					<http:success-status-code-validator values="200..599" />
+				</http:response-validator>
+			</http:request>
+		</munit:execution>
+		<munit:validation>
+			<munit-tools:assert-that doc:name="202" expression="#[vars.vPosted.status]" is="#[MunitTools::equalTo(202)]" />
+			<munit-tools:assert-that doc:name="JSON" expression="#[vars.vPosted.contentType]" is="#[MunitTools::startsWith('application/json')]" />
+			<munit-tools:assert-that doc:name="Queued" expression="#[vars.vPosted.body.status]" is="#[MunitTools::equalTo('QUEUED')]" />
+			<munit-tools:assert-that doc:name="Still queued before the consumer" expression="#[vars.vBefore.body.status]" is="#[MunitTools::equalTo('QUEUED')]" />
+			<munit-tools:assert-that doc:name="Reserved" expression="#[vars.vAfter.body.status]" is="#[MunitTools::equalTo('RESERVED')]" />
+			<munit-tools:assert-that doc:name="Quantity" expression="#[vars.vAfter.body.quantity]" is="#[MunitTools::equalTo(2)]" />
+		</munit:validation>
+	</munit:test>
+
+	<munit:test name="me-already-expired-request-is-not-reserved" description="Message expiration: a request whose expiresAt has passed is moved to the expired requests with the reason, and no stock is reserved">
+		<munit:enable-flow-sources>
+			<munit:enable-flow-source value="stock-queue-expiring-request" />
+			<munit:enable-flow-source value="stock-get-expiring-request" />
+		</munit:enable-flow-sources>
+		<munit:execution>
+			<http:request doc:name="POST ORD-ME-2" config-ref="eip-self-http-request-config" method="POST" path="/eip/stock/expiring-requests" target="vPosted" targetValue="#[output application/java --- { status: attributes.statusCode, contentType: attributes.headers.'content-type' default '', body: payload }]">
+				<http:body><![CDATA[#[output application/json --- { orderId: 'ORD-ME-2', sku: 'SKU-BOOK', quantity: 2, expiresAt: (now() - |PT1S|) as String }]]]></http:body>
+				<http:response-validator>
+					<http:success-status-code-validator values="200..599" />
+				</http:response-validator>
+			</http:request>
+			<flow-ref doc:name="Refer to stock-consume-expiring-requests (one run)" name="stock-consume-expiring-requests" />
+			<http:request doc:name="GET ORD-ME-2" config-ref="eip-self-http-request-config" method="GET" path="/eip/stock/expiring-requests/ORD-ME-2" target="vAfter" targetValue="#[output application/java --- { status: attributes.statusCode, contentType: attributes.headers.'content-type' default '', body: payload }]">
+				<http:response-validator>
+					<http:success-status-code-validator values="200..599" />
+				</http:response-validator>
+			</http:request>
+		</munit:execution>
+		<munit:validation>
+			<munit-tools:assert-that doc:name="202" expression="#[vars.vPosted.status]" is="#[MunitTools::equalTo(202)]" />
+			<munit-tools:assert-that doc:name="Expired" expression="#[vars.vAfter.body.status]" is="#[MunitTools::equalTo('EXPIRED')]" />
+			<munit-tools:assert-that doc:name="Reason" expression="#[vars.vAfter.body.reason]" is="#[MunitTools::equalTo('expired before it was consumed')]" />
+			<munit-tools:assert-that doc:name="No reservation" expression="#[vars.vAfter.body.sku]" is="#[MunitTools::nullValue()]" />
+		</munit:validation>
+	</munit:test>
+
+	<munit:test name="me-request-expires-while-it-waits" description="Message expiration: a request valid when sent (expires in 1 s) waits 1.5 s in the queue and the consumer finds it expired; one sent with a minute left is reserved in the same run">
+		<munit:enable-flow-sources>
+			<munit:enable-flow-source value="stock-queue-expiring-request" />
+			<munit:enable-flow-source value="stock-get-expiring-request" />
+		</munit:enable-flow-sources>
+		<munit:execution>
+			<http:request doc:name="POST ORD-ME-3" config-ref="eip-self-http-request-config" method="POST" path="/eip/stock/expiring-requests" target="vShort" targetValue="#[output application/java --- { status: attributes.statusCode, contentType: attributes.headers.'content-type' default '', body: payload }]">
+				<http:body><![CDATA[#[output application/json --- { orderId: 'ORD-ME-3', sku: 'SKU-BOOK', quantity: 2, expiresAt: (now() + |PT1S|) as String }]]]></http:body>
+				<http:response-validator>
+					<http:success-status-code-validator values="200..599" />
+				</http:response-validator>
+			</http:request>
+			<http:request doc:name="POST ORD-ME-4" config-ref="eip-self-http-request-config" method="POST" path="/eip/stock/expiring-requests" target="vLong" targetValue="#[output application/java --- { status: attributes.statusCode, contentType: attributes.headers.'content-type' default '', body: payload }]">
+				<http:body><![CDATA[#[output application/json --- { orderId: 'ORD-ME-4', sku: 'SKU-BOOK', quantity: 2, expiresAt: (now() + |PT60S|) as String }]]]></http:body>
+				<http:response-validator>
+					<http:success-status-code-validator values="200..599" />
+				</http:response-validator>
+			</http:request>
+			<munit-tools:sleep doc:name="Wait past the short expiry" time="1500" timeUnit="MILLISECONDS" />
+			<flow-ref doc:name="Refer to stock-consume-expiring-requests (one run)" name="stock-consume-expiring-requests" />
+			<http:request doc:name="GET ORD-ME-3" config-ref="eip-self-http-request-config" method="GET" path="/eip/stock/expiring-requests/ORD-ME-3" target="vShortAfter" targetValue="#[output application/java --- { status: attributes.statusCode, contentType: attributes.headers.'content-type' default '', body: payload }]">
+				<http:response-validator>
+					<http:success-status-code-validator values="200..599" />
+				</http:response-validator>
+			</http:request>
+			<http:request doc:name="GET ORD-ME-4" config-ref="eip-self-http-request-config" method="GET" path="/eip/stock/expiring-requests/ORD-ME-4" target="vLongAfter" targetValue="#[output application/java --- { status: attributes.statusCode, contentType: attributes.headers.'content-type' default '', body: payload }]">
+				<http:response-validator>
+					<http:success-status-code-validator values="200..599" />
+				</http:response-validator>
+			</http:request>
+		</munit:execution>
+		<munit:validation>
+			<munit-tools:assert-that doc:name="Short accepted when sent" expression="#[vars.vShort.status]" is="#[MunitTools::equalTo(202)]" />
+			<munit-tools:assert-that doc:name="Short expired" expression="#[vars.vShortAfter.body.status]" is="#[MunitTools::equalTo('EXPIRED')]" />
+			<munit-tools:assert-that doc:name="Long reserved" expression="#[vars.vLongAfter.body.status]" is="#[MunitTools::equalTo('RESERVED')]" />
+		</munit:validation>
+	</munit:test>
+
+	<munit:test name="me-scheduler-consumes-on-its-own" description="Message expiration: with the Scheduler source enabled, a queued request is consumed with no request to the consumer">
+		<munit:enable-flow-sources>
+			<munit:enable-flow-source value="stock-queue-expiring-request" />
+			<munit:enable-flow-source value="stock-get-expiring-request" />
+			<munit:enable-flow-source value="stock-consume-expiring-requests" />
+		</munit:enable-flow-sources>
+		<munit:execution>
+			<http:request doc:name="POST ORD-ME-5" config-ref="eip-self-http-request-config" method="POST" path="/eip/stock/expiring-requests" target="vPosted" targetValue="#[output application/java --- { status: attributes.statusCode, contentType: attributes.headers.'content-type' default '', body: payload }]">
+				<http:body><![CDATA[#[output application/json --- { orderId: 'ORD-ME-5', sku: 'SKU-BOOK', quantity: 2, expiresAt: (now() + |PT60S|) as String }]]]></http:body>
+				<http:response-validator>
+					<http:success-status-code-validator values="200..599" />
+				</http:response-validator>
+			</http:request>
+			<munit-tools:sleep doc:name="Wait for a consumer run" time="2500" timeUnit="MILLISECONDS" />
+			<http:request doc:name="GET ORD-ME-5" config-ref="eip-self-http-request-config" method="GET" path="/eip/stock/expiring-requests/ORD-ME-5" target="vAfter" targetValue="#[output application/java --- { status: attributes.statusCode, contentType: attributes.headers.'content-type' default '', body: payload }]">
+				<http:response-validator>
+					<http:success-status-code-validator values="200..599" />
+				</http:response-validator>
+			</http:request>
+		</munit:execution>
+		<munit:validation>
+			<munit-tools:assert-that doc:name="Reserved by the Scheduler" expression="#[vars.vAfter.body.status]" is="#[MunitTools::equalTo('RESERVED')]" />
+		</munit:validation>
+	</munit:test>
+
+	<munit:test name="me-request-without-valid-expiry-is-rejected" description="Message expiration: a request without expiresAt, or with one that is not a date-time, gets 400 in JSON and is not queued; an unknown request is 404">
+		<munit:enable-flow-sources>
+			<munit:enable-flow-source value="stock-queue-expiring-request" />
+			<munit:enable-flow-source value="stock-get-expiring-request" />
+		</munit:enable-flow-sources>
+		<munit:execution>
+			<http:request doc:name="POST no expiry" config-ref="eip-self-http-request-config" method="POST" path="/eip/stock/expiring-requests" target="vNone" targetValue="#[output application/java --- { status: attributes.statusCode, contentType: attributes.headers.'content-type' default '', body: payload }]">
+				<http:body><![CDATA[#[output application/json --- { orderId: 'ORD-ME-6', sku: 'SKU-BOOK' }]]]></http:body>
+				<http:response-validator>
+					<http:success-status-code-validator values="200..599" />
+				</http:response-validator>
+			</http:request>
+			<http:request doc:name="POST ORD-ME-7" config-ref="eip-self-http-request-config" method="POST" path="/eip/stock/expiring-requests" target="vBad" targetValue="#[output application/java --- { status: attributes.statusCode, contentType: attributes.headers.'content-type' default '', body: payload }]">
+				<http:body><![CDATA[#[output application/json --- { orderId: 'ORD-ME-7', sku: 'SKU-BOOK', quantity: 2, expiresAt: 'tomorrow' }]]]></http:body>
+				<http:response-validator>
+					<http:success-status-code-validator values="200..599" />
+				</http:response-validator>
+			</http:request>
+			<http:request doc:name="GET ORD-ME-6" config-ref="eip-self-http-request-config" method="GET" path="/eip/stock/expiring-requests/ORD-ME-6" target="vGet" targetValue="#[output application/java --- { status: attributes.statusCode, contentType: attributes.headers.'content-type' default '', body: payload }]">
+				<http:response-validator>
+					<http:success-status-code-validator values="200..599" />
+				</http:response-validator>
+			</http:request>
+		</munit:execution>
+		<munit:validation>
+			<munit-tools:assert-that doc:name="400" expression="#[vars.vNone.status]" is="#[MunitTools::equalTo(400)]" />
+			<munit-tools:assert-that doc:name="JSON" expression="#[vars.vNone.contentType]" is="#[MunitTools::startsWith('application/json')]" />
+			<munit-tools:assert-that doc:name="Says why" expression="#[vars.vNone.body.error]" is="#[MunitTools::equalTo('orderId, sku and an ISO date-time expiresAt are required')]" />
+			<munit-tools:assert-that doc:name="Not a date 400" expression="#[vars.vBad.status]" is="#[MunitTools::equalTo(400)]" />
+			<munit-tools:assert-that doc:name="Not queued" expression="#[vars.vGet.status]" is="#[MunitTools::equalTo(404)]" />
+		</munit:validation>
+	</munit:test>
+
+</mule>
