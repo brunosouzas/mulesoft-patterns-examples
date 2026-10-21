@@ -18,9 +18,10 @@
 		GET /eip/adapters/legacy-orders/{orderId}   the adapter: answers the order message as JSON
 		GET /eip/legacy/orders/{orderId}            the legacy ERP, simulated on this app (legacy-erp.xml): CSV
 
-		In Mule every connector plays this role: "A connector can act as: An inbound endpoint that starts the app
-		flow ... A message processor that performs operations in the middle of a flow ... An outbound endpoint"
-		(https://docs.mulesoft.com/connectors/introduction/introduction-to-anypoint-connectors). The HTTP Request
+		In Mule a connector can act as a source that starts a flow or as an operation in the middle of it ("A
+		connector can act as: An inbound endpoint that starts the app flow ... A message processor that performs
+		operations in the middle of a flow ... An outbound endpoint":
+		https://docs.mulesoft.com/connectors/introduction/introduction-to-anypoint-connectors). The HTTP Request
 		operation is the adapter's connector here; a Database, SFTP or SAP connector would be another system's.
 		The connector speaks the system's protocol; the DataWeave transformation after it turns the system's
 		format into the message. DataWeave reads the CSV with the separator ";" as a reader property
@@ -28,18 +29,33 @@
 
 		The legacy system's quirks stop at the adapter: its 404 becomes this app's 404 (APP:NOT_FOUND), and a
 		status code the adapter does not know becomes UNKNOWN, with the original code kept in legacyStatusCode.
+		When the legacy ERP answers 5xx or cannot be reached, the adapter answers 503 (APP:SERVICE_UNAVAILABLE):
+		the order exists or not, the adapter cannot tell, and the caller may retry later.
 	-->
 	<flow name="order-read-through-legacy-adapter" doc:description="Channel adapter: reads an order from the simulated legacy ERP's CSV endpoint with the HTTP Request connector and turns it into the app's order message (JSON).">
 		<http:listener doc:name="GET /eip/adapters/legacy-orders/{orderId}" config-ref="http-listener-config" path="/eip/adapters/legacy-orders/{orderId}" allowedMethods="GET">
 			<http:response statusCode="#[vars.httpStatus default 200]" />
 		</http:listener>
 		<set-variable doc:name="SET vOrderId" variableName="vOrderId" value="#[attributes.uriParams.orderId]" />
-		<http:request doc:name="GET Order From Legacy ERP" config-ref="eip-self-http-request-config" method="GET" path="/eip/legacy/orders/{orderId}">
-			<http:uri-params><![CDATA[#[output application/java --- { orderId: vars.vOrderId }]]]></http:uri-params>
-			<http:response-validator>
-				<http:success-status-code-validator values="200,404" />
-			</http:response-validator>
-		</http:request>
+		<try doc:name="Try Read Legacy ERP">
+			<http:request doc:name="GET Order From Legacy ERP" config-ref="eip-self-http-request-config" method="GET" path="/eip/legacy/orders/{orderId}">
+				<http:uri-params><![CDATA[#[output application/java --- { orderId: vars.vOrderId }]]]></http:uri-params>
+				<http:response-validator>
+					<http:success-status-code-validator values="200,404" />
+				</http:response-validator>
+			</http:request>
+			<error-handler>
+				<on-error-continue doc:name="On Error Continue (legacy ERP unavailable)" type="HTTP:INTERNAL_SERVER_ERROR, HTTP:BAD_GATEWAY, HTTP:SERVICE_UNAVAILABLE, HTTP:GATEWAY_TIMEOUT, HTTP:CONNECTIVITY, HTTP:TIMEOUT" logException="false">
+					<logger doc:name="WARN: Log legacy ERP unavailable" level="WARN" message="#['Legacy ERP unavailable for order ' ++ vars.vOrderId ++ ': ' ++ error.errorType.namespace ++ ':' ++ error.errorType.identifier ++ ', correlationId=' ++ correlationId]" />
+					<set-variable doc:name="SET vLegacyDown" variableName="vLegacyDown" value="#[true]" />
+				</on-error-continue>
+			</error-handler>
+		</try>
+		<choice doc:name="Check Legacy Reachable">
+			<when expression="#[vars.vLegacyDown default false]">
+				<raise-error doc:name="Raise SERVICE_UNAVAILABLE Error - Legacy ERP down" type="APP:SERVICE_UNAVAILABLE" description="Legacy ERP unavailable" />
+			</when>
+		</choice>
 		<choice doc:name="Check Legacy Response">
 			<when expression="#[attributes.statusCode == 404]">
 				<raise-error doc:name="Raise NOT_FOUND Error - Unknown order" type="APP:NOT_FOUND" description="Order not found in the legacy ERP" />
