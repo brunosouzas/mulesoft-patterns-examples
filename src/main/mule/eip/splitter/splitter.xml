@@ -14,7 +14,9 @@
 		POST /eip/stock/availability/for-each           { orderId, items: [ { sku, quantity } ] }
 		POST /eip/stock/availability/parallel-for-each  (same body)
 
-		Mule has two splitters, and they hand back different things:
+		Mule splits with two scopes, and they hand back different things. Only For Each is a Splitter alone:
+		Parallel For Each also collects the results, in input order, so it is closer to a Splitter followed by an
+		Aggregator.
 		- For Each runs the items one after another. Inside the scope the payload is the item, and vars.counter
 		  its position (from 1). After the scope the payload is the ORIGINAL message again: For Each does not
 		  collect results. Whatever must survive is put in a variable, and variables set inside the scope are
