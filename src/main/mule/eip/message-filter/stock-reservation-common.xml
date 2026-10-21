@@ -18,7 +18,7 @@
 		  GET /eip/stock/{orderId}/reservations) can count how many times stock was reserved for an order.
 		- sf-validate-stock-request: validates the order event { orderId, status, items }.
 	-->
-	<os:object-store name="eip-stock-reservations-store" doc:name="Stock reservations" persistent="false" />
+	<os:object-store name="eip-stock-reservations-store" doc:name="Stock Reservations Object Store" persistent="false" />
 
 	<sub-flow name="sf-validate-stock-request" doc:description="Validates an order event sent to a stock reservation endpoint: orderId, status and a non-empty items array are required.">
 		<choice doc:name="Validate Stock Request">
