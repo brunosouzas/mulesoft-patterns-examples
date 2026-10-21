@@ -80,14 +80,19 @@
 		</munit:validation>
 	</munit:test>
 
-	<munit:test name="me-request-expires-while-it-waits" description="Message expiration: a request valid when sent (expires in 1 s) waits 1.5 s in the queue and the consumer finds it expired; one sent with a minute left is reserved in the same run">
+	<munit:test name="me-request-expires-while-it-waits" description="Message expiration: the consumer checks expiresAt when it takes a request, not when it is queued: one queued with expiresAt already past is accepted (202) and found expired, one with a minute left is reserved in the same run">
+		<!--
+			The queue does not check expiresAt, only the consumer does, so a request queued with expiresAt already past
+			is the same case as one that expired while it waited, without a wait: a request expiring in 1 s and a
+			fixed sleep would depend on how fast the build machine is.
+		-->
 		<munit:enable-flow-sources>
 			<munit:enable-flow-source value="stock-queue-expiring-request" />
 			<munit:enable-flow-source value="stock-get-expiring-request" />
 		</munit:enable-flow-sources>
 		<munit:execution>
 			<http:request doc:name="POST ORD-ME-3" config-ref="eip-self-http-request-config" method="POST" path="/eip/stock/expiring-requests" target="vShort" targetValue="#[output application/java --- { status: attributes.statusCode, contentType: attributes.headers.'content-type' default '', body: payload }]">
-				<http:body><![CDATA[#[output application/json --- { orderId: 'ORD-ME-3', sku: 'SKU-BOOK', quantity: 2, expiresAt: (now() + |PT1S|) as String }]]]></http:body>
+				<http:body><![CDATA[#[output application/json --- { orderId: 'ORD-ME-3', sku: 'SKU-BOOK', quantity: 2, expiresAt: (now() - |PT1M|) as String }]]]></http:body>
 				<http:response-validator>
 					<http:success-status-code-validator values="200..599" />
 				</http:response-validator>
@@ -98,7 +103,6 @@
 					<http:success-status-code-validator values="200..599" />
 				</http:response-validator>
 			</http:request>
-			<munit-tools:sleep doc:name="Wait past the short expiry" time="1500" timeUnit="MILLISECONDS" />
 			<flow-ref doc:name="Refer to stock-consume-expiring-requests (one run)" name="stock-consume-expiring-requests" />
 			<http:request doc:name="GET ORD-ME-3" config-ref="eip-self-http-request-config" method="GET" path="/eip/stock/expiring-requests/ORD-ME-3" target="vShortAfter" targetValue="#[output application/java --- { status: attributes.statusCode, contentType: attributes.headers.'content-type' default '', body: payload }]">
 				<http:response-validator>
@@ -112,7 +116,7 @@
 			</http:request>
 		</munit:execution>
 		<munit:validation>
-			<munit-tools:assert-that doc:name="Short accepted when sent" expression="#[vars.vShort.status]" is="#[MunitTools::equalTo(202)]" />
+			<munit-tools:assert-that doc:name="Past expiry still queued" expression="#[vars.vShort.status]" is="#[MunitTools::equalTo(202)]" />
 			<munit-tools:assert-that doc:name="Short expired" expression="#[vars.vShortAfter.body.status]" is="#[MunitTools::equalTo('EXPIRED')]" />
 			<munit-tools:assert-that doc:name="Long reserved" expression="#[vars.vLongAfter.body.status]" is="#[MunitTools::equalTo('RESERVED')]" />
 		</munit:validation>
@@ -131,12 +135,18 @@
 					<http:success-status-code-validator values="200..599" />
 				</http:response-validator>
 			</http:request>
-			<munit-tools:sleep doc:name="Wait for a consumer run" time="2500" timeUnit="MILLISECONDS" />
-			<http:request doc:name="GET ORD-ME-5" config-ref="eip-self-http-request-config" method="GET" path="/eip/stock/expiring-requests/ORD-ME-5" target="vAfter" targetValue="#[output application/java --- { status: attributes.statusCode, contentType: attributes.headers.'content-type' default '', body: payload }]">
-				<http:response-validator>
-					<http:success-status-code-validator values="200..599" />
-				</http:response-validator>
-			</http:request>
+			<until-successful doc:name="Wait for the Scheduler" maxRetries="50" millisBetweenRetries="100">
+				<http:request doc:name="GET ORD-ME-5" config-ref="eip-self-http-request-config" method="GET" path="/eip/stock/expiring-requests/ORD-ME-5" target="vAfter" targetValue="#[output application/java --- { status: attributes.statusCode, contentType: attributes.headers.'content-type' default '', body: payload }]">
+					<http:response-validator>
+						<http:success-status-code-validator values="200..599" />
+					</http:response-validator>
+				</http:request>
+				<choice doc:name="Check Consumed">
+					<when expression="#[vars.vAfter.body.status == 'QUEUED']">
+						<raise-error doc:name="Raise TEST:NOT_YET Error" type="TEST:NOT_YET" description="Not yet" />
+					</when>
+				</choice>
+			</until-successful>
 		</munit:execution>
 		<munit:validation>
 			<munit-tools:assert-that doc:name="Reserved by the Scheduler" expression="#[vars.vAfter.body.status]" is="#[MunitTools::equalTo('RESERVED')]" />
@@ -176,4 +186,90 @@
 		</munit:validation>
 	</munit:test>
 
+	<munit:test name="tc-second-payment-of-an-order-is-refused" description="Transactional client: a second payment of an order already paid gets 409 in JSON from both endpoints, and the first debit is not replaced">
+		<munit:enable-flow-sources>
+			<munit:enable-flow-source value="payment-charge-in-try-transaction" />
+			<munit:enable-flow-source value="payment-charge-with-compensation" />
+			<munit:enable-flow-source value="payment-get-transactional-state" />
+		</munit:enable-flow-sources>
+		<munit:execution>
+			<http:request doc:name="POST after" config-ref="eip-self-http-request-config" method="POST" path="/eip/payments/transactional/after" target="vFirst" targetValue="#[output application/java --- { status: attributes.statusCode, contentType: attributes.headers.'content-type' default '', body: payload }]">
+				<http:body><![CDATA[#[output application/json --- { orderId: 'ORD-TC-7', amount: 40 }]]]></http:body>
+				<http:response-validator>
+					<http:success-status-code-validator values="200..599" />
+				</http:response-validator>
+			</http:request>
+			<http:request doc:name="POST after again" config-ref="eip-self-http-request-config" method="POST" path="/eip/payments/transactional/after" target="vAgain" targetValue="#[output application/java --- { status: attributes.statusCode, contentType: attributes.headers.'content-type' default '', body: payload }]">
+				<http:body><![CDATA[#[output application/json --- { orderId: 'ORD-TC-7', amount: 90 }]]]></http:body>
+				<http:response-validator>
+					<http:success-status-code-validator values="200..599" />
+				</http:response-validator>
+			</http:request>
+			<http:request doc:name="POST before again" config-ref="eip-self-http-request-config" method="POST" path="/eip/payments/transactional/before" target="vBeforeAgain" targetValue="#[output application/java --- { status: attributes.statusCode, contentType: attributes.headers.'content-type' default '', body: payload }]">
+				<http:body><![CDATA[#[output application/json --- { orderId: 'ORD-TC-7', amount: 90 }]]]></http:body>
+				<http:response-validator>
+					<http:success-status-code-validator values="200..599" />
+				</http:response-validator>
+			</http:request>
+			<http:request doc:name="GET state" config-ref="eip-self-http-request-config" method="GET" path="/eip/payments/transactional/ORD-TC-7" target="vState" targetValue="#[output application/java --- { status: attributes.statusCode, contentType: attributes.headers.'content-type' default '', body: payload }]">
+				<http:response-validator>
+					<http:success-status-code-validator values="200..599" />
+				</http:response-validator>
+			</http:request>
+		</munit:execution>
+		<munit:validation>
+			<munit-tools:assert-that doc:name="First 200" expression="#[vars.vFirst.status]" is="#[MunitTools::equalTo(200)]" />
+			<munit-tools:assert-that doc:name="Again 409" expression="#[vars.vAgain.status]" is="#[MunitTools::equalTo(409)]" />
+			<munit-tools:assert-that doc:name="JSON" expression="#[vars.vAgain.contentType]" is="#[MunitTools::startsWith('application/json')]" />
+			<munit-tools:assert-that doc:name="Says why" expression="#[vars.vAgain.body.error]" is="#[MunitTools::equalTo('Order already has a payment')]" />
+			<munit-tools:assert-that doc:name="Before 409" expression="#[vars.vBeforeAgain.status]" is="#[MunitTools::equalTo(409)]" />
+			<munit-tools:assert-that doc:name="First debit kept" expression="#[vars.vState.body.ledgerDebit.amount]" is="#[MunitTools::equalTo(40)]" />
+		</munit:validation>
+	</munit:test>
+
+	<munit:test name="tc-after-failed-compensation-answers-500" description="Transactional client, after: the second write fails and the undo of the debit fails too; the caller gets 500 compensation failed in JSON, not 503, and the debit is still recorded">
+		<munit:enable-flow-sources>
+			<munit:enable-flow-source value="payment-charge-in-try-transaction" />
+			<munit:enable-flow-source value="payment-charge-with-compensation" />
+			<munit:enable-flow-source value="payment-get-transactional-state" />
+		</munit:enable-flow-sources>
+		<munit:behavior>
+			<munit-tools:mock-when doc:name="Mark Order Paid fails" processor="os:store">
+				<munit-tools:with-attributes>
+					<munit-tools:with-attribute attributeName="doc:name" whereValue="Mark Order Paid" />
+				</munit-tools:with-attributes>
+				<munit-tools:then-return>
+					<munit-tools:error typeId="OS:STORE_NOT_AVAILABLE" />
+				</munit-tools:then-return>
+			</munit-tools:mock-when>
+			<munit-tools:mock-when doc:name="Undo Ledger Debit fails" processor="os:remove">
+				<munit-tools:with-attributes>
+					<munit-tools:with-attribute attributeName="doc:name" whereValue="Undo Ledger Debit" />
+				</munit-tools:with-attributes>
+				<munit-tools:then-return>
+					<munit-tools:error typeId="OS:STORE_NOT_AVAILABLE" />
+				</munit-tools:then-return>
+			</munit-tools:mock-when>
+		</munit:behavior>
+		<munit:execution>
+			<http:request doc:name="POST after" config-ref="eip-self-http-request-config" method="POST" path="/eip/payments/transactional/after" target="vAfter" targetValue="#[output application/java --- { status: attributes.statusCode, contentType: attributes.headers.'content-type' default '', body: payload }]">
+				<http:body><![CDATA[#[output application/json --- { orderId: 'ORD-TC-8', amount: 60 }]]]></http:body>
+				<http:response-validator>
+					<http:success-status-code-validator values="200..599" />
+				</http:response-validator>
+			</http:request>
+			<http:request doc:name="GET state" config-ref="eip-self-http-request-config" method="GET" path="/eip/payments/transactional/ORD-TC-8" target="vState" targetValue="#[output application/java --- { status: attributes.statusCode, contentType: attributes.headers.'content-type' default '', body: payload }]">
+				<http:response-validator>
+					<http:success-status-code-validator values="200..599" />
+				</http:response-validator>
+			</http:request>
+		</munit:execution>
+		<munit:validation>
+			<munit-tools:assert-that doc:name="500" expression="#[vars.vAfter.status]" is="#[MunitTools::equalTo(500)]" />
+			<munit-tools:assert-that doc:name="JSON" expression="#[vars.vAfter.contentType]" is="#[MunitTools::startsWith('application/json')]" />
+			<munit-tools:assert-that doc:name="Says why" expression="#[vars.vAfter.body.error]" is="#[MunitTools::equalTo('Payment not recorded and the compensation failed: the ledger debit is still recorded')]" />
+			<munit-tools:assert-that doc:name="Debit still there" expression="#[vars.vState.body.ledgerDebit.amount]" is="#[MunitTools::equalTo(60)]" />
+			<munit-tools:assert-that doc:name="Order not paid" expression="#[vars.vState.body.orderStatus]" is="#[MunitTools::nullValue()]" />
+		</munit:validation>
+	</munit:test>
 </mule>

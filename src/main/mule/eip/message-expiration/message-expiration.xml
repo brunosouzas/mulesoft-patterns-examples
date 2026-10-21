@@ -17,12 +17,17 @@
 		set by the sender: after it, the checkout has given up and holding stock would block other customers).
 		Requests wait in a queue (an object store) until the consumer reads them; the consumer reserves stock for
 		the ones still valid and moves the expired ones to an expired-requests store, with when and why.
-		POST /eip/stock/expiring-requests             queues a request (202 QUEUED); expiresAt is required
-		GET  /eip/stock/expiring-requests/{orderId}   QUEUED, RESERVED or EXPIRED
+		POST /eip/stock/expiring-requests             queues a request (202 QUEUED); expiresAt is required, and
+		                                              quantity, when given, must be a positive integer
+		                                              (default 1)
+		GET  /eip/stock/expiring-requests/{orderId}   QUEUED, RESERVED, EXPIRED or FAILED
 		(the consumer is the flow stock-consume-expiring-requests, started by a Scheduler, not by a request)
 
 		The expiry is checked when the consumer takes the message, not when it is sent: a message valid on arrival
 		expires while it waits. The sender's and the consumer's clocks must agree; expiresAt carries its offset.
+		Each request is handled inside its own error handling: one the consumer cannot handle (for example a
+		stored expiresAt that no longer parses) is moved aside as FAILED with the error, and the run goes on with
+		the next request.
 
 		With Anypoint MQ the broker does it: a queue's "Message TTL (time-to-live) specifies how long unprocessed
 		messages persist before being deleted" (https://docs.mulesoft.com/mq/mq-queues), and a dead-letter queue
@@ -54,13 +59,18 @@ output application/java
 				<raise-error doc:name="Raise BAD_REQUEST Error - Invalid request" type="APP:BAD_REQUEST" description="orderId, sku and an ISO date-time expiresAt are required" />
 			</when>
 		</choice>
+		<choice doc:name="Validate Quantity">
+			<when expression="#[(payload.quantity != null) and ((not (payload.quantity is Number)) or (payload.quantity &lt;= 0) or ((payload.quantity mod 1) != 0))]">
+				<raise-error doc:name="Raise BAD_REQUEST Error - Invalid quantity" type="APP:BAD_REQUEST" description="quantity must be a positive integer" />
+			</when>
+		</choice>
 		<os:store doc:name="Queue Request" key="#[payload.orderId]" objectStore="eip-me-queue-store">
 			<os:value><![CDATA[#[output application/java --- { orderId: payload.orderId, sku: payload.sku, quantity: payload.quantity default 1, expiresAt: payload.expiresAt, queuedAt: now() as String }]]]></os:value>
 		</os:store>
 		<set-payload doc:name="Set Queued Response" value="#[output application/json --- { orderId: payload.orderId, status: 'QUEUED', expiresAt: payload.expiresAt }]" />
 	</flow>
 
-	<flow name="stock-consume-expiring-requests" doc:description="Message expiration consumer: a Scheduler takes every queued request, reserves stock for the ones not yet expired and moves the expired ones aside with the reason.">
+	<flow name="stock-consume-expiring-requests" doc:description="Message expiration consumer: a Scheduler takes every queued request, reserves stock for the ones not yet expired and moves the expired ones aside with the reason; a request that fails is moved aside as FAILED and the run goes on.">
 		<scheduler doc:name="Scheduler - Consume Expiring Requests" disallowConcurrentExecution="true">
 			<scheduling-strategy>
 				<fixed-frequency frequency="${eip.messageExpiration.consumerFrequencyMillis}" timeUnit="MILLISECONDS" />
@@ -69,25 +79,36 @@ output application/java
 		<os:retrieve-all doc:name="Read Queued Requests" objectStore="eip-me-queue-store" />
 		<set-variable doc:name="SET vRequests" variableName="vRequests" value="#[output application/java --- (payload pluck $) orderBy $.queuedAt]" />
 		<foreach doc:name="For Each Queued Request" collection="#[vars.vRequests]">
-			<set-variable doc:name="SET vConsumedAt" variableName="vConsumedAt" value="#[now()]" />
-			<choice doc:name="Check Expired">
-				<when expression="#[(payload.expiresAt as DateTime) &lt;= vars.vConsumedAt]">
-					<os:store doc:name="Move To Expired Requests" key="#[payload.orderId]" objectStore="eip-me-outcome-store">
-						<os:value><![CDATA[#[output application/java --- { orderId: payload.orderId, status: 'EXPIRED', expiresAt: payload.expiresAt, consumedAt: vars.vConsumedAt as String, reason: 'expired before it was consumed' }]]]></os:value>
-					</os:store>
-					<logger doc:name="WARN: Log request expired" level="WARN" message="#['Reservation request of order ' ++ payload.orderId ++ ' expired at ' ++ payload.expiresAt ++ ', not processed, correlationId=' ++ correlationId]" />
-				</when>
-				<otherwise>
-					<os:store doc:name="Reserve Stock" key="#[payload.orderId]" objectStore="eip-me-outcome-store">
-						<os:value><![CDATA[#[output application/java --- { orderId: payload.orderId, status: 'RESERVED', sku: payload.sku, quantity: payload.quantity, expiresAt: payload.expiresAt, consumedAt: vars.vConsumedAt as String }]]]></os:value>
-					</os:store>
-				</otherwise>
-			</choice>
-			<os:remove doc:name="Take Request Off The Queue" key="#[payload.orderId]" objectStore="eip-me-queue-store" />
+			<try doc:name="Try Consume One Request">
+				<set-variable doc:name="SET vConsumedAt" variableName="vConsumedAt" value="#[now()]" />
+				<choice doc:name="Check Expired">
+					<when expression="#[(payload.expiresAt as DateTime) &lt;= vars.vConsumedAt]">
+						<os:store doc:name="Move To Expired Requests" key="#[payload.orderId]" objectStore="eip-me-outcome-store">
+							<os:value><![CDATA[#[output application/java --- { orderId: payload.orderId, status: 'EXPIRED', expiresAt: payload.expiresAt, consumedAt: vars.vConsumedAt as String, reason: 'expired before it was consumed' }]]]></os:value>
+						</os:store>
+						<logger doc:name="WARN: Log request expired" level="WARN" message="#['Reservation request of order ' ++ payload.orderId ++ ' expired at ' ++ payload.expiresAt ++ ', not processed, correlationId=' ++ correlationId]" />
+					</when>
+					<otherwise>
+						<os:store doc:name="Reserve Stock" key="#[payload.orderId]" objectStore="eip-me-outcome-store">
+							<os:value><![CDATA[#[output application/java --- { orderId: payload.orderId, status: 'RESERVED', sku: payload.sku, quantity: payload.quantity, expiresAt: payload.expiresAt, consumedAt: vars.vConsumedAt as String }]]]></os:value>
+						</os:store>
+					</otherwise>
+				</choice>
+				<os:remove doc:name="Take Request Off The Queue" key="#[payload.orderId]" objectStore="eip-me-queue-store" />
+				<error-handler>
+					<on-error-continue doc:name="On Error Continue (this request failed, the run goes on)" type="ANY" logException="false">
+						<os:store doc:name="Move To Failed Requests" key="#[payload.orderId]" objectStore="eip-me-outcome-store">
+							<os:value><![CDATA[#[output application/java --- { orderId: payload.orderId, status: 'FAILED', expiresAt: payload.expiresAt, reason: 'could not be consumed: ' ++ error.errorType.namespace ++ ':' ++ error.errorType.identifier }]]]></os:value>
+						</os:store>
+						<os:remove doc:name="Take Failed Request Off The Queue" key="#[payload.orderId]" objectStore="eip-me-queue-store" />
+						<logger doc:name="WARN: Log request failed" level="WARN" message="#['Reservation request of order ' ++ payload.orderId ++ ' could not be consumed (' ++ error.errorType.identifier ++ '), moved aside, correlationId=' ++ correlationId]" />
+					</on-error-continue>
+				</error-handler>
+			</try>
 		</foreach>
 	</flow>
 
-	<flow name="stock-get-expiring-request" doc:description="GET /eip/stock/expiring-requests/{orderId}: QUEUED while waiting, then RESERVED or EXPIRED; 404 when unknown.">
+	<flow name="stock-get-expiring-request" doc:description="GET /eip/stock/expiring-requests/{orderId}: QUEUED while waiting, then RESERVED, EXPIRED or FAILED; 404 when unknown.">
 		<http:listener doc:name="GET /eip/stock/expiring-requests/{orderId}" config-ref="http-listener-config" path="/eip/stock/expiring-requests/{orderId}" allowedMethods="GET">
 			<http:response statusCode="#[vars.httpStatus default 200]" />
 		</http:listener>
