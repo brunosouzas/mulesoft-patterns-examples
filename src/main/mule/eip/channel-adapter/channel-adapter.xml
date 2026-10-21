@@ -1,0 +1,67 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<mule xmlns="http://www.mulesoft.org/schema/mule/core"
+	xmlns:http="http://www.mulesoft.org/schema/mule/http"
+	xmlns:os="http://www.mulesoft.org/schema/mule/os"
+	xmlns:ee="http://www.mulesoft.org/schema/mule/ee/core"
+	xmlns:doc="http://www.mulesoft.org/schema/mule/documentation"
+	xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+	xsi:schemaLocation="http://www.mulesoft.org/schema/mule/core http://www.mulesoft.org/schema/mule/core/current/mule.xsd
+		http://www.mulesoft.org/schema/mule/http http://www.mulesoft.org/schema/mule/http/current/mule-http.xsd
+		http://www.mulesoft.org/schema/mule/os http://www.mulesoft.org/schema/mule/os/current/mule-os.xsd
+		http://www.mulesoft.org/schema/mule/ee/core http://www.mulesoft.org/schema/mule/ee/core/current/mule-ee.xsd">
+
+	<!--
+		CHANNEL ADAPTER (Hohpe and Woolf): connects an application that knows nothing about messaging to the
+		integration, turning its API and data into the messages the rest of the integration uses. Here: a legacy
+		ERP exposes orders only as semicolon-separated CSV, with amounts in cents and one-letter status codes;
+		the adapter turns that into the order message the other examples use (orderId, amount, status).
+		GET /eip/adapters/legacy-orders/{orderId}   the adapter: answers the order message as JSON
+		GET /eip/legacy/orders/{orderId}            the legacy ERP, simulated on this app (legacy-erp.xml): CSV
+
+		In Mule every connector plays this role: "A connector can act as: An inbound endpoint that starts the app
+		flow ... A message processor that performs operations in the middle of a flow ... An outbound endpoint"
+		(https://docs.mulesoft.com/connectors/introduction/introduction-to-anypoint-connectors). The HTTP Request
+		operation is the adapter's connector here; a Database, SFTP or SAP connector would be another system's.
+		The connector speaks the system's protocol; the DataWeave transformation after it turns the system's
+		format into the message. DataWeave reads the CSV with the separator ";" as a reader property
+		(https://docs.mulesoft.com/dataweave/latest/dataweave-formats-csv).
+
+		The legacy system's quirks stop at the adapter: its 404 becomes this app's 404 (APP:NOT_FOUND), and a
+		status code the adapter does not know becomes UNKNOWN, with the original code kept in legacyStatusCode.
+	-->
+	<flow name="order-read-through-legacy-adapter" doc:description="Channel adapter: reads an order from the simulated legacy ERP's CSV endpoint with the HTTP Request connector and turns it into the app's order message (JSON).">
+		<http:listener doc:name="GET /eip/adapters/legacy-orders/{orderId}" config-ref="http-listener-config" path="/eip/adapters/legacy-orders/{orderId}" allowedMethods="GET">
+			<http:response statusCode="#[vars.httpStatus default 200]" />
+		</http:listener>
+		<set-variable doc:name="SET vOrderId" variableName="vOrderId" value="#[attributes.uriParams.orderId]" />
+		<http:request doc:name="GET Order From Legacy ERP" config-ref="eip-self-http-request-config" method="GET" path="/eip/legacy/orders/{orderId}">
+			<http:uri-params><![CDATA[#[output application/java --- { orderId: vars.vOrderId }]]]></http:uri-params>
+			<http:response-validator>
+				<http:success-status-code-validator values="200,404" />
+			</http:response-validator>
+		</http:request>
+		<choice doc:name="Check Legacy Response">
+			<when expression="#[attributes.statusCode == 404]">
+				<raise-error doc:name="Raise NOT_FOUND Error - Unknown order" type="APP:NOT_FOUND" description="Order not found in the legacy ERP" />
+			</when>
+		</choice>
+		<ee:transform doc:name="Legacy CSV To Order Message">
+			<ee:message>
+				<ee:set-payload><![CDATA[%dw 2.0
+output application/json
+var row = read(payload.^raw, "application/csv", { separator: ";" })[0]
+var statuses = { P: "PAID", D: "PAYMENT_DECLINED", R: "REFUNDED" }
+---
+{
+	orderId: row.ORDER_ID,
+	amount: (row.TOTAL_CENTS as Number) / 100,
+	currency: row.CURRENCY,
+	status: statuses[row.STATUS_CODE] default "UNKNOWN",
+	(legacyStatusCode: row.STATUS_CODE) if (statuses[row.STATUS_CODE] == null),
+	source: "legacy-erp"
+}]]></ee:set-payload>
+			</ee:message>
+		</ee:transform>
+		<logger doc:name="INFO: Log order adapted" level="INFO" message="#['Legacy order ' ++ vars.vOrderId ++ ' adapted, status=' ++ payload.status ++ ', correlationId=' ++ correlationId]" />
+	</flow>
+</mule>
