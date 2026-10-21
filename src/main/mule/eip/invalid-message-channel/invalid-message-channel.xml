@@ -1,0 +1,128 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<mule xmlns="http://www.mulesoft.org/schema/mule/core"
+	xmlns:http="http://www.mulesoft.org/schema/mule/http"
+	xmlns:os="http://www.mulesoft.org/schema/mule/os"
+	xmlns:ee="http://www.mulesoft.org/schema/mule/ee/core"
+	xmlns:doc="http://www.mulesoft.org/schema/mule/documentation"
+	xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+	xsi:schemaLocation="http://www.mulesoft.org/schema/mule/core http://www.mulesoft.org/schema/mule/core/current/mule.xsd
+		http://www.mulesoft.org/schema/mule/http http://www.mulesoft.org/schema/mule/http/current/mule-http.xsd
+		http://www.mulesoft.org/schema/mule/os http://www.mulesoft.org/schema/mule/os/current/mule-os.xsd
+		http://www.mulesoft.org/schema/mule/ee/core http://www.mulesoft.org/schema/mule/ee/core/current/mule-ee.xsd">
+
+	<!--
+		INVALID MESSAGE CHANNEL (Hohpe and Woolf): a receiver that gets a message it cannot understand (it cannot be
+		parsed, or it breaks the expected format) does not drop it and does not process it: it moves it to a
+		separate channel, kept with the reason, where someone can look at it. Here: invoice requests arrive as JSON;
+		one that is not JSON, is malformed JSON, or misses a required field goes to the invalid-message store with
+		the reason, the content type and the body as received, and is never invoiced.
+		POST /eip/invoices/requests               202 ACCEPTED for a valid request; 400 for an invalid one, which
+		                                         is kept in the invalid message channel
+		GET  /eip/invoices/requests/{orderId}     the accepted request, 404 when there is none
+		GET  /eip/invoices/invalid-messages       what landed in the invalid message channel
+
+		Not the dead letter channel (wave 1): a dead letter channel receives a valid message that could not be
+		delivered or processed (for example after the maximum number of deliveries); the invalid message channel
+		receives a message that is wrong in itself and would fail again however often it is retried. Anypoint MQ has
+		dead-letter queues (https://docs.mulesoft.com/mq/mq-queues) and nothing for invalid messages: the consumer
+		has to recognise them and publish them to a queue of their own.
+
+		The HTTP Listener does not parse the body; DataWeave parses it when the flow first reads it. The flow
+		parses it explicitly, inside a Try, so a malformed body is caught at one place and keeps its raw text
+		(DataWeave JSON format: https://docs.mulesoft.com/dataweave/latest/dataweave-formats-json). The required
+		fields are checked with DataWeave; a JSON Schema validation (JSON module) would do the same in a contract.
+		The sender still gets 400, because HTTP is request-reply: in a queue-based channel the sender would not
+		know and the invalid channel would be the only trace.
+	-->
+	<os:object-store name="eip-imc-invoice-requests-store" doc:name="Invoice Requests Object Store" persistent="false" />
+	<os:object-store name="eip-imc-invalid-messages-store" doc:name="Invalid Message Channel Object Store" persistent="false" />
+
+	<flow name="invoice-receive-request" doc:description="Invalid message channel: accepts a valid invoice request; a request that is not JSON, is malformed or misses a field is kept in the invalid message channel with the reason and answered 400.">
+		<http:listener doc:name="POST /eip/invoices/requests" config-ref="http-listener-config" path="/eip/invoices/requests" allowedMethods="POST">
+			<http:response statusCode="#[vars.httpStatus default 202]" />
+		</http:listener>
+		<set-variable doc:name="SET vContentType" variableName="vContentType" value="#[attributes.headers.'content-type' default '']" />
+		<set-variable doc:name="SET vRawBody" variableName="vRawBody" value="#[if (payload.^raw == null) '' else read(payload.^raw, 'text/plain') as String]" />
+		<choice doc:name="Check Content Type">
+			<when expression="#[not (vars.vContentType startsWith 'application/json')]">
+				<set-variable doc:name="SET vReason" variableName="vReason" value="#['unsupported content type: ' ++ (if (isEmpty(vars.vContentType)) 'none' else vars.vContentType)]" />
+			</when>
+			<otherwise>
+				<try doc:name="Try Parse JSON">
+					<set-variable doc:name="SET vRequest" variableName="vRequest" value="#[read(vars.vRawBody, 'application/json')]" />
+					<error-handler>
+						<on-error-continue doc:name="On Error Continue (malformed JSON)" type="MULE:EXPRESSION" logException="false">
+							<set-variable doc:name="SET vReason" variableName="vReason" value="malformed JSON" />
+						</on-error-continue>
+					</error-handler>
+				</try>
+			</otherwise>
+		</choice>
+		<choice doc:name="Check Required Fields">
+			<when expression="#[vars.vReason == null]">
+				<ee:transform doc:name="List Field Violations">
+					<ee:variables>
+						<ee:set-variable variableName="vViolations"><![CDATA[%dw 2.0
+output application/java
+var r = vars.vRequest
+---
+if (!(r is Object)) ["body must be a JSON object"]
+else [
+	("orderId is required") if (!(r.orderId is String) or isEmpty(r.orderId)),
+	("amount must be a positive number") if (!(r.amount is Number) or ((r.amount default 0) <= 0)),
+	("currency must be a 3-letter code") if (!(r.currency is String) or !((r.currency default "") matches /[A-Z]{3}/))
+]]]></ee:set-variable>
+					</ee:variables>
+				</ee:transform>
+				<choice doc:name="Check Violations">
+					<when expression="#[not isEmpty(vars.vViolations)]">
+						<set-variable doc:name="SET vReason" variableName="vReason" value="#['schema violation: ' ++ (vars.vViolations joinBy '; ')]" />
+					</when>
+				</choice>
+			</when>
+		</choice>
+		<choice doc:name="Route Valid Or Invalid">
+			<when expression="#[vars.vReason != null]">
+				<flow-ref doc:name="Refer to sf-send-to-invalid-message-channel" name="sf-send-to-invalid-message-channel" />
+			</when>
+			<otherwise>
+				<os:store doc:name="Store Invoice Request" key="#[vars.vRequest.orderId]" objectStore="eip-imc-invoice-requests-store">
+					<os:value><![CDATA[#[output application/java --- vars.vRequest]]]></os:value>
+				</os:store>
+				<set-payload doc:name="Set Accepted Response" value="#[output application/json --- { orderId: vars.vRequest.orderId, status: 'ACCEPTED' }]" />
+			</otherwise>
+		</choice>
+	</flow>
+
+	<sub-flow name="sf-send-to-invalid-message-channel" doc:description="Keeps an invalid message in the invalid message channel with its reason, content type and raw body, then rejects it with 400.">
+		<set-variable doc:name="SET vInvalidMessageId" variableName="vInvalidMessageId" value="#['INV-MSG-' ++ uuid()]" />
+		<os:store doc:name="Store Invalid Message" key="#[vars.vInvalidMessageId]" objectStore="eip-imc-invalid-messages-store">
+			<os:value><![CDATA[#[output application/java --- { invalidMessageId: vars.vInvalidMessageId, reason: vars.vReason, contentType: vars.vContentType, body: vars.vRawBody, receivedAt: now() as String, correlationId: correlationId }]]]></os:value>
+		</os:store>
+		<logger doc:name="WARN: Log invalid message" level="WARN" message="#['Invoice request moved to the invalid message channel as ' ++ vars.vInvalidMessageId ++ ': ' ++ vars.vReason ++ ', correlationId=' ++ correlationId]" />
+		<raise-error doc:name="Raise BAD_REQUEST Error - Invalid message" type="APP:BAD_REQUEST" description="#['Invalid message ' ++ vars.vInvalidMessageId ++ ': ' ++ vars.vReason]" />
+	</sub-flow>
+
+	<flow name="invoice-get-request" doc:description="GET /eip/invoices/requests/{orderId}: the accepted invoice request, 404 when there is none.">
+		<http:listener doc:name="GET /eip/invoices/requests/{orderId}" config-ref="http-listener-config" path="/eip/invoices/requests/{orderId}" allowedMethods="GET">
+			<http:response statusCode="#[vars.httpStatus default 200]" />
+		</http:listener>
+		<os:retrieve doc:name="Read Invoice Request" key="#[attributes.uriParams.orderId]" objectStore="eip-imc-invoice-requests-store">
+			<os:default-value><![CDATA[#[output application/java --- {}]]]></os:default-value>
+		</os:retrieve>
+		<choice doc:name="Check Request Found">
+			<when expression="#[isEmpty(payload)]">
+				<raise-error doc:name="Raise NOT_FOUND Error - No request" type="APP:NOT_FOUND" description="Invoice request not found" />
+			</when>
+		</choice>
+		<set-payload doc:name="Set Request As JSON" value="#[output application/json --- payload]" />
+	</flow>
+
+	<flow name="invoice-get-invalid-messages" doc:description="GET /eip/invoices/invalid-messages: the messages in the invalid message channel, oldest first.">
+		<http:listener doc:name="GET /eip/invoices/invalid-messages" config-ref="http-listener-config" path="/eip/invoices/invalid-messages" allowedMethods="GET">
+			<http:response statusCode="#[vars.httpStatus default 200]" />
+		</http:listener>
+		<os:retrieve-all doc:name="Read Invalid Messages" objectStore="eip-imc-invalid-messages-store" />
+		<set-payload doc:name="Set Invalid Messages As JSON" value="#[output application/json --- (payload pluck $) orderBy $.receivedAt]" />
+	</flow>
+</mule>
