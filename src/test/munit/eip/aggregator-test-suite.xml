@@ -176,4 +176,21 @@
 			<munit-tools:assert-that doc:name="404" expression="#[vars.httpStatus as Number]" is="#[MunitTools::equalTo(404)]" />
 		</munit:validation>
 	</munit:test>
+
+	<munit:test name="agg-client-order-without-items-returns-400" description="Aggregator client: POST /eip/invoices/orders rejects an order without items with 400 and sends nothing to the aggregator">
+		<munit:execution>
+			<munit:set-event doc:name="Order without items">
+				<munit:payload value="#[output application/json --- {orderId: 'ORD-AGG-CLIENT-BAD', items: []}]" mediaType="application/json" />
+			</munit:set-event>
+			<flow-ref doc:name="POST /eip/invoices/orders" name="invoice-send-order-items" />
+		</munit:execution>
+		<munit:validation>
+			<munit-tools:assert-that doc:name="400" expression="#[vars.httpStatus as Number]" is="#[MunitTools::equalTo(400)]" />
+			<munit-tools:verify-call doc:name="No item sent" processor="http:request" times="0">
+				<munit-tools:with-attributes>
+					<munit-tools:with-attribute attributeName="doc:name" whereValue="POST Item To Invoice Aggregator" />
+				</munit-tools:with-attributes>
+			</munit-tools:verify-call>
+		</munit:validation>
+	</munit:test>
 </mule>
