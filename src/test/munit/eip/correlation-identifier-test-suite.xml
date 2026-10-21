@@ -160,7 +160,7 @@
 			<os:contains doc:name="Still pending?" key="#[vars.request.requestId]" objectStore="eip-pending-payment-requests-store" target="stillPending" />
 		</munit:execution>
 		<munit:validation>
-			<munit-tools:assert-that doc:name="200" expression="#[vars.httpStatus default 200]" is="#[MunitTools::equalTo(200)]" />
+			<munit-tools:assert-that doc:name="200: no error status set" expression="#[vars.httpStatus]" is="#[MunitTools::nullValue()]" />
 			<munit-tools:assert-that doc:name="Callback matched" expression="#[vars.callbackResponse.result]" is="#[MunitTools::equalTo('MATCHED')]" />
 			<munit-tools:assert-that doc:name="Response names the outcome" expression="#[vars.callbackResponse.orderStatus]" is="#[MunitTools::equalTo('PAYMENT_DECLINED')]" />
 			<munit-tools:assert-that doc:name="Order declined" expression="#[vars.orderStatus.status]" is="#[MunitTools::equalTo('PAYMENT_DECLINED')]" />
@@ -193,7 +193,7 @@
 			<os:retrieve doc:name="Order status" key="ORD-CID-MISMATCH" objectStore="eip-order-payment-status-store" target="orderStatus" />
 		</munit:execution>
 		<munit:validation>
-			<munit-tools:assert-that doc:name="200" expression="#[vars.httpStatus default 200]" is="#[MunitTools::equalTo(200)]" />
+			<munit-tools:assert-that doc:name="200: no error status set" expression="#[vars.httpStatus]" is="#[MunitTools::nullValue()]" />
 			<munit-tools:assert-that doc:name="Response names the outcome" expression="#[vars.callbackResponse.orderStatus]" is="#[MunitTools::equalTo('PAYMENT_REVIEW')]" />
 			<munit-tools:assert-that doc:name="Order in review" expression="#[vars.orderStatus.status]" is="#[MunitTools::equalTo('PAYMENT_REVIEW')]" />
 			<munit-tools:assert-that doc:name="Reason" expression="#[vars.orderStatus.reviewReason]" is="#[MunitTools::equalTo('AMOUNT_MISMATCH')]" />
@@ -226,7 +226,7 @@
 			<os:contains doc:name="Still pending?" key="#[vars.request.requestId]" objectStore="eip-pending-payment-requests-store" target="stillPending" />
 		</munit:execution>
 		<munit:validation>
-			<munit-tools:assert-that doc:name="200" expression="#[vars.httpStatus default 200]" is="#[MunitTools::equalTo(200)]" />
+			<munit-tools:assert-that doc:name="200: no error status set" expression="#[vars.httpStatus]" is="#[MunitTools::nullValue()]" />
 			<munit-tools:assert-that doc:name="Response names the outcome" expression="#[vars.callbackResponse.orderStatus]" is="#[MunitTools::equalTo('PAYMENT_REVIEW')]" />
 			<munit-tools:assert-that doc:name="Order in review" expression="#[vars.orderStatus.status]" is="#[MunitTools::equalTo('PAYMENT_REVIEW')]" />
 			<munit-tools:assert-that doc:name="Reason" expression="#[vars.orderStatus.reviewReason]" is="#[MunitTools::equalTo('UNKNOWN_STATUS')]" />
@@ -256,7 +256,7 @@
 			<set-payload doc:name="Send it" value="#[vars.approvedCallback]" />
 			<flow-ref doc:name="POST /eip/payments/callback (first)" name="payment-confirm-from-provider-callback" />
 			<set-variable doc:name="First response" variableName="firstResponse" value="#[payload]" />
-			<set-variable doc:name="First status code" variableName="firstHttpStatus" value="#[vars.httpStatus default 200]" />
+			<set-variable doc:name="First status code" variableName="firstHttpStatus" value="#[vars.httpStatus]" />
 			<set-payload doc:name="Send the same callback again" value="#[vars.approvedCallback]" />
 			<flow-ref doc:name="POST /eip/payments/callback (repeat)" name="payment-confirm-from-provider-callback" />
 			<set-variable doc:name="Repeat status code" variableName="repeatHttpStatus" value="#[vars.httpStatus as Number]" />
@@ -268,7 +268,7 @@
 			<os:retrieve doc:name="Order status" key="ORD-CID-REPEAT" objectStore="eip-order-payment-status-store" target="orderStatus" />
 		</munit:execution>
 		<munit:validation>
-			<munit-tools:assert-that doc:name="First: 200" expression="#[vars.firstHttpStatus]" is="#[MunitTools::equalTo(200)]" />
+			<munit-tools:assert-that doc:name="First: 200 (no error status set)" expression="#[vars.firstHttpStatus]" is="#[MunitTools::nullValue()]" />
 			<munit-tools:assert-that doc:name="First: PAID" expression="#[vars.firstResponse.orderStatus]" is="#[MunitTools::equalTo('PAID')]" />
 			<munit-tools:assert-that doc:name="Repeat: 404" expression="#[vars.repeatHttpStatus]" is="#[MunitTools::equalTo(404)]" />
 			<munit-tools:assert-that doc:name="Repeat: says why" expression="#[vars.repeatResponse.error]" is="#[MunitTools::equalTo('No pending payment request for this correlationId')]" />
