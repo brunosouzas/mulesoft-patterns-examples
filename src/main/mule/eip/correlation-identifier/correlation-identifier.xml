@@ -158,16 +158,16 @@ output application/java
 		</choice>
 		<choice doc:name="Route On Callback Status">
 			<when expression="#[vars.vCallback.status == 'APPROVED' and vars.vCallback.approvedAmount == vars.vPendingRequest.amount]">
-				<set-variable doc:name="SET vOutcome" variableName="vOutcome" value="#[{ status: 'PAID' }]" />
+				<set-variable doc:name="SET vOutcome (PAID)" variableName="vOutcome" value="#[{ status: 'PAID' }]" />
 			</when>
 			<when expression="#[vars.vCallback.status == 'DECLINED']">
-				<set-variable doc:name="SET vOutcome" variableName="vOutcome" value="#[{ status: 'PAYMENT_DECLINED' }]" />
+				<set-variable doc:name="SET vOutcome (PAYMENT_DECLINED)" variableName="vOutcome" value="#[{ status: 'PAYMENT_DECLINED' }]" />
 			</when>
 			<when expression="#[vars.vCallback.status == 'APPROVED']">
-				<set-variable doc:name="SET vOutcome" variableName="vOutcome" value="#[{ status: 'PAYMENT_REVIEW', reviewReason: 'AMOUNT_MISMATCH' }]" />
+				<set-variable doc:name="SET vOutcome (PAYMENT_REVIEW, AMOUNT_MISMATCH)" variableName="vOutcome" value="#[{ status: 'PAYMENT_REVIEW', reviewReason: 'AMOUNT_MISMATCH' }]" />
 			</when>
 			<otherwise>
-				<set-variable doc:name="SET vOutcome" variableName="vOutcome" value="#[{ status: 'PAYMENT_REVIEW', reviewReason: 'UNKNOWN_STATUS' }]" />
+				<set-variable doc:name="SET vOutcome (PAYMENT_REVIEW, UNKNOWN_STATUS)" variableName="vOutcome" value="#[{ status: 'PAYMENT_REVIEW', reviewReason: 'UNKNOWN_STATUS' }]" />
 			</otherwise>
 		</choice>
 		<os:store doc:name="Record Payment Outcome" key="#[vars.vPendingRequest.orderId]" objectStore="eip-order-payment-status-store">
