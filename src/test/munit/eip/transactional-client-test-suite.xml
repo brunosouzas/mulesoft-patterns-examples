@@ -62,7 +62,7 @@
 		</munit:validation>
 	</munit:test>
 
-	<munit:test name="tc-before-try-transaction-does-not-roll-back-the-debit" description="Transactional client, before: the second write fails inside a Try with ALWAYS_BEGIN; the caller gets 500 and the ledger debit stays, the order is not paid: the Object Store did not join the transaction">
+	<munit:test name="tc-before-try-transaction-does-not-roll-back-the-debit" description="Transactional client, before: the second write fails inside the Try; the caller gets 500 and the ledger debit stays, the order is not paid. The Try holds no transactional resource, so this shows the outcome, not an effect of ALWAYS_BEGIN">
 		<munit:enable-flow-sources>
 			<munit:enable-flow-source value="payment-charge-in-try-transaction" />
 			<munit:enable-flow-source value="payment-charge-with-compensation" />
@@ -201,4 +201,90 @@
 		</munit:validation>
 	</munit:test>
 
+	<munit:test name="tc-second-payment-of-an-order-is-refused" description="Transactional client: a second payment of an order already paid gets 409 in JSON from both endpoints, and the first debit is not replaced">
+		<munit:enable-flow-sources>
+			<munit:enable-flow-source value="payment-charge-in-try-transaction" />
+			<munit:enable-flow-source value="payment-charge-with-compensation" />
+			<munit:enable-flow-source value="payment-get-transactional-state" />
+		</munit:enable-flow-sources>
+		<munit:execution>
+			<http:request doc:name="POST after" config-ref="eip-self-http-request-config" method="POST" path="/eip/payments/transactional/after" target="vFirst" targetValue="#[output application/java --- { status: attributes.statusCode, contentType: attributes.headers.'content-type' default '', body: payload }]">
+				<http:body><![CDATA[#[output application/json --- { orderId: 'ORD-TC-7', amount: 40 }]]]></http:body>
+				<http:response-validator>
+					<http:success-status-code-validator values="200..599" />
+				</http:response-validator>
+			</http:request>
+			<http:request doc:name="POST after again" config-ref="eip-self-http-request-config" method="POST" path="/eip/payments/transactional/after" target="vAgain" targetValue="#[output application/java --- { status: attributes.statusCode, contentType: attributes.headers.'content-type' default '', body: payload }]">
+				<http:body><![CDATA[#[output application/json --- { orderId: 'ORD-TC-7', amount: 90 }]]]></http:body>
+				<http:response-validator>
+					<http:success-status-code-validator values="200..599" />
+				</http:response-validator>
+			</http:request>
+			<http:request doc:name="POST before again" config-ref="eip-self-http-request-config" method="POST" path="/eip/payments/transactional/before" target="vBeforeAgain" targetValue="#[output application/java --- { status: attributes.statusCode, contentType: attributes.headers.'content-type' default '', body: payload }]">
+				<http:body><![CDATA[#[output application/json --- { orderId: 'ORD-TC-7', amount: 90 }]]]></http:body>
+				<http:response-validator>
+					<http:success-status-code-validator values="200..599" />
+				</http:response-validator>
+			</http:request>
+			<http:request doc:name="GET state" config-ref="eip-self-http-request-config" method="GET" path="/eip/payments/transactional/ORD-TC-7" target="vState" targetValue="#[output application/java --- { status: attributes.statusCode, contentType: attributes.headers.'content-type' default '', body: payload }]">
+				<http:response-validator>
+					<http:success-status-code-validator values="200..599" />
+				</http:response-validator>
+			</http:request>
+		</munit:execution>
+		<munit:validation>
+			<munit-tools:assert-that doc:name="First 200" expression="#[vars.vFirst.status]" is="#[MunitTools::equalTo(200)]" />
+			<munit-tools:assert-that doc:name="Again 409" expression="#[vars.vAgain.status]" is="#[MunitTools::equalTo(409)]" />
+			<munit-tools:assert-that doc:name="JSON" expression="#[vars.vAgain.contentType]" is="#[MunitTools::startsWith('application/json')]" />
+			<munit-tools:assert-that doc:name="Says why" expression="#[vars.vAgain.body.error]" is="#[MunitTools::equalTo('Order already has a payment')]" />
+			<munit-tools:assert-that doc:name="Before 409" expression="#[vars.vBeforeAgain.status]" is="#[MunitTools::equalTo(409)]" />
+			<munit-tools:assert-that doc:name="First debit kept" expression="#[vars.vState.body.ledgerDebit.amount]" is="#[MunitTools::equalTo(40)]" />
+		</munit:validation>
+	</munit:test>
+
+	<munit:test name="tc-after-failed-compensation-answers-500" description="Transactional client, after: the second write fails and the undo of the debit fails too; the caller gets 500 compensation failed in JSON, not 503, and the debit is still recorded">
+		<munit:enable-flow-sources>
+			<munit:enable-flow-source value="payment-charge-in-try-transaction" />
+			<munit:enable-flow-source value="payment-charge-with-compensation" />
+			<munit:enable-flow-source value="payment-get-transactional-state" />
+		</munit:enable-flow-sources>
+		<munit:behavior>
+			<munit-tools:mock-when doc:name="Mark Order Paid fails" processor="os:store">
+				<munit-tools:with-attributes>
+					<munit-tools:with-attribute attributeName="doc:name" whereValue="Mark Order Paid" />
+				</munit-tools:with-attributes>
+				<munit-tools:then-return>
+					<munit-tools:error typeId="OS:STORE_NOT_AVAILABLE" />
+				</munit-tools:then-return>
+			</munit-tools:mock-when>
+			<munit-tools:mock-when doc:name="Undo Ledger Debit fails" processor="os:remove">
+				<munit-tools:with-attributes>
+					<munit-tools:with-attribute attributeName="doc:name" whereValue="Undo Ledger Debit" />
+				</munit-tools:with-attributes>
+				<munit-tools:then-return>
+					<munit-tools:error typeId="OS:STORE_NOT_AVAILABLE" />
+				</munit-tools:then-return>
+			</munit-tools:mock-when>
+		</munit:behavior>
+		<munit:execution>
+			<http:request doc:name="POST after" config-ref="eip-self-http-request-config" method="POST" path="/eip/payments/transactional/after" target="vAfter" targetValue="#[output application/java --- { status: attributes.statusCode, contentType: attributes.headers.'content-type' default '', body: payload }]">
+				<http:body><![CDATA[#[output application/json --- { orderId: 'ORD-TC-8', amount: 60 }]]]></http:body>
+				<http:response-validator>
+					<http:success-status-code-validator values="200..599" />
+				</http:response-validator>
+			</http:request>
+			<http:request doc:name="GET state" config-ref="eip-self-http-request-config" method="GET" path="/eip/payments/transactional/ORD-TC-8" target="vState" targetValue="#[output application/java --- { status: attributes.statusCode, contentType: attributes.headers.'content-type' default '', body: payload }]">
+				<http:response-validator>
+					<http:success-status-code-validator values="200..599" />
+				</http:response-validator>
+			</http:request>
+		</munit:execution>
+		<munit:validation>
+			<munit-tools:assert-that doc:name="500" expression="#[vars.vAfter.status]" is="#[MunitTools::equalTo(500)]" />
+			<munit-tools:assert-that doc:name="JSON" expression="#[vars.vAfter.contentType]" is="#[MunitTools::startsWith('application/json')]" />
+			<munit-tools:assert-that doc:name="Says why" expression="#[vars.vAfter.body.error]" is="#[MunitTools::equalTo('Payment not recorded and the compensation failed: the ledger debit is still recorded')]" />
+			<munit-tools:assert-that doc:name="Debit still there" expression="#[vars.vState.body.ledgerDebit.amount]" is="#[MunitTools::equalTo(60)]" />
+			<munit-tools:assert-that doc:name="Order not paid" expression="#[vars.vState.body.orderStatus]" is="#[MunitTools::nullValue()]" />
+		</munit:validation>
+	</munit:test>
 </mule>
