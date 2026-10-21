@@ -26,7 +26,7 @@
 			<flow-ref doc:name="POST /eip/orders/route" name="order-route-by-content" />
 		</munit:execution>
 		<munit:validation>
-			<munit-tools:assert-that doc:name="200" expression="#[vars.httpStatus default 200]" is="#[MunitTools::equalTo(200)]" />
+			<munit-tools:assert-that doc:name="200: no error status set" expression="#[vars.httpStatus]" is="#[MunitTools::nullValue()]" />
 			<munit-tools:assert-that doc:name="Routed to DOMESTIC_FULFILMENT" expression="#[payload.routedTo]" is="#[MunitTools::equalTo('DOMESTIC_FULFILMENT')]" />
 			<munit-tools:assert-that doc:name="Response names the order" expression="#[payload.orderId]" is="#[MunitTools::equalTo('ORD-CBR-DOM')]" />
 			<munit-tools:assert-that doc:name="No customs" expression="#[payload.customsDeclarationRequired]" is="#[MunitTools::equalTo(false)]" />
@@ -56,7 +56,7 @@
 			<flow-ref doc:name="POST /eip/orders/route" name="order-route-by-content" />
 		</munit:execution>
 		<munit:validation>
-			<munit-tools:assert-that doc:name="200" expression="#[vars.httpStatus default 200]" is="#[MunitTools::equalTo(200)]" />
+			<munit-tools:assert-that doc:name="200: no error status set" expression="#[vars.httpStatus]" is="#[MunitTools::nullValue()]" />
 			<munit-tools:assert-that doc:name="Routed to INTERNATIONAL_FULFILMENT" expression="#[payload.routedTo]" is="#[MunitTools::equalTo('INTERNATIONAL_FULFILMENT')]" />
 			<munit-tools:assert-that doc:name="Response names the order" expression="#[payload.orderId]" is="#[MunitTools::equalTo('ORD-CBR-INT')]" />
 			<munit-tools:assert-that doc:name="Customs declaration" expression="#[payload.customsDeclarationRequired]" is="#[MunitTools::equalTo(true)]" />
@@ -87,7 +87,7 @@
 			<flow-ref doc:name="POST /eip/orders/route" name="order-route-by-content" />
 		</munit:execution>
 		<munit:validation>
-			<munit-tools:assert-that doc:name="200" expression="#[vars.httpStatus default 200]" is="#[MunitTools::equalTo(200)]" />
+			<munit-tools:assert-that doc:name="200: no error status set" expression="#[vars.httpStatus]" is="#[MunitTools::nullValue()]" />
 			<munit-tools:assert-that doc:name="Routed to MANUAL_REVIEW" expression="#[payload.routedTo]" is="#[MunitTools::equalTo('MANUAL_REVIEW')]" />
 			<munit-tools:assert-that doc:name="Response names the order" expression="#[payload.orderId]" is="#[MunitTools::equalTo('ORD-CBR-REV')]" />
 			<munit-tools:assert-that doc:name="Reason" expression="#[payload.reason]" is="#[MunitTools::equalTo('AMOUNT_AT_OR_ABOVE_THRESHOLD')]" />
@@ -117,7 +117,7 @@
 			<flow-ref doc:name="POST /eip/orders/route" name="order-route-by-content" />
 		</munit:execution>
 		<munit:validation>
-			<munit-tools:assert-that doc:name="200" expression="#[vars.httpStatus default 200]" is="#[MunitTools::equalTo(200)]" />
+			<munit-tools:assert-that doc:name="200: no error status set" expression="#[vars.httpStatus]" is="#[MunitTools::nullValue()]" />
 			<munit-tools:assert-that doc:name="Routed to MANUAL_REVIEW" expression="#[payload.routedTo]" is="#[MunitTools::equalTo('MANUAL_REVIEW')]" />
 			<munit-tools:assert-that doc:name="Response names the order" expression="#[payload.orderId]" is="#[MunitTools::equalTo('ORD-CBR-BOTH')]" />
 			<munit-tools:verify-call doc:name="Called: sf-route-order-to-review" processor="flow-ref" times="1">

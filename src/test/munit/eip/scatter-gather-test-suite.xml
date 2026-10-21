@@ -32,7 +32,7 @@
 			<flow-ref doc:name="POST /eip/orders/checks" name="order-check-before-acceptance" />
 		</munit:execution>
 		<munit:validation>
-			<munit-tools:assert-that doc:name="200" expression="#[vars.httpStatus default 200]" is="#[MunitTools::equalTo(200)]" />
+			<munit-tools:assert-that doc:name="200: no error status set" expression="#[vars.httpStatus]" is="#[MunitTools::nullValue()]" />
 			<munit-tools:assert-that doc:name="ACCEPTED" expression="#[payload.decision]" is="#[MunitTools::equalTo('ACCEPTED')]" />
 			<munit-tools:assert-that doc:name="Total from pricing" expression="#[payload.total]" is="#[MunitTools::equalTo(72.5)]" />
 			<munit-tools:assert-that doc:name="Stock from stock" expression="#[payload.stock.available]" is="#[MunitTools::equalTo(true)]" />

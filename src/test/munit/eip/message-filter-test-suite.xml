@@ -33,7 +33,7 @@
 			<flow-ref doc:name="GET /eip/stock/ORD-MF-B-DECLINED/reservations" name="stock-get-reservations" />
 		</munit:execution>
 		<munit:validation>
-			<munit-tools:assert-that doc:name="200" expression="#[vars.httpStatus default 200]" is="#[MunitTools::equalTo(200)]" />
+			<munit-tools:assert-that doc:name="200: no error status set" expression="#[vars.httpStatus]" is="#[MunitTools::nullValue()]" />
 			<munit-tools:assert-that doc:name="Response names the order" expression="#[vars.response.orderId]" is="#[MunitTools::equalTo('ORD-MF-B-DECLINED')]" />
 			<munit-tools:assert-that doc:name="Caller is told DISCARDED" expression="#[vars.response.result]" is="#[MunitTools::equalTo('DISCARDED')]" />
 			<munit-tools:assert-that doc:name="Reservations: 1" expression="#[payload.reservations]" is="#[MunitTools::equalTo(1)]" />
@@ -58,7 +58,7 @@
 			<flow-ref doc:name="GET /eip/stock/ORD-MF-B-PAID/reservations" name="stock-get-reservations" />
 		</munit:execution>
 		<munit:validation>
-			<munit-tools:assert-that doc:name="200" expression="#[vars.httpStatus default 200]" is="#[MunitTools::equalTo(200)]" />
+			<munit-tools:assert-that doc:name="200: no error status set" expression="#[vars.httpStatus]" is="#[MunitTools::nullValue()]" />
 			<munit-tools:assert-that doc:name="Response names the order" expression="#[vars.response.orderId]" is="#[MunitTools::equalTo('ORD-MF-B-PAID')]" />
 			<munit-tools:assert-that doc:name="Caller is told RESERVED" expression="#[vars.response.result]" is="#[MunitTools::equalTo('RESERVED')]" />
 			<munit-tools:assert-that doc:name="Reservations: 1" expression="#[payload.reservations]" is="#[MunitTools::equalTo(1)]" />
@@ -78,7 +78,7 @@
 			<flow-ref doc:name="GET /eip/stock/ORD-MF-A-DECLINED/reservations" name="stock-get-reservations" />
 		</munit:execution>
 		<munit:validation>
-			<munit-tools:assert-that doc:name="200" expression="#[vars.httpStatus default 200]" is="#[MunitTools::equalTo(200)]" />
+			<munit-tools:assert-that doc:name="200: no error status set" expression="#[vars.httpStatus]" is="#[MunitTools::nullValue()]" />
 			<munit-tools:assert-that doc:name="Response names the order" expression="#[vars.response.orderId]" is="#[MunitTools::equalTo('ORD-MF-A-DECLINED')]" />
 			<munit-tools:assert-that doc:name="Caller is told DISCARDED" expression="#[vars.response.result]" is="#[MunitTools::equalTo('DISCARDED')]" />
 			<munit-tools:assert-that doc:name="Reservations: 0" expression="#[payload.reservations]" is="#[MunitTools::equalTo(0)]" />
@@ -103,7 +103,7 @@
 			<flow-ref doc:name="GET /eip/stock/ORD-MF-A-REVIEW/reservations" name="stock-get-reservations" />
 		</munit:execution>
 		<munit:validation>
-			<munit-tools:assert-that doc:name="200" expression="#[vars.httpStatus default 200]" is="#[MunitTools::equalTo(200)]" />
+			<munit-tools:assert-that doc:name="200: no error status set" expression="#[vars.httpStatus]" is="#[MunitTools::nullValue()]" />
 			<munit-tools:assert-that doc:name="Response names the order" expression="#[vars.response.orderId]" is="#[MunitTools::equalTo('ORD-MF-A-REVIEW')]" />
 			<munit-tools:assert-that doc:name="Caller is told DISCARDED" expression="#[vars.response.result]" is="#[MunitTools::equalTo('DISCARDED')]" />
 			<munit-tools:assert-that doc:name="Reservations: 0" expression="#[payload.reservations]" is="#[MunitTools::equalTo(0)]" />
@@ -128,7 +128,7 @@
 			<flow-ref doc:name="GET /eip/stock/ORD-MF-A-PAID/reservations" name="stock-get-reservations" />
 		</munit:execution>
 		<munit:validation>
-			<munit-tools:assert-that doc:name="200" expression="#[vars.httpStatus default 200]" is="#[MunitTools::equalTo(200)]" />
+			<munit-tools:assert-that doc:name="200: no error status set" expression="#[vars.httpStatus]" is="#[MunitTools::nullValue()]" />
 			<munit-tools:assert-that doc:name="Response names the order" expression="#[vars.response.orderId]" is="#[MunitTools::equalTo('ORD-MF-A-PAID')]" />
 			<munit-tools:assert-that doc:name="Caller is told RESERVED" expression="#[vars.response.result]" is="#[MunitTools::equalTo('RESERVED')]" />
 			<munit-tools:assert-that doc:name="Reservations: 1" expression="#[payload.reservations]" is="#[MunitTools::equalTo(1)]" />
