@@ -31,7 +31,8 @@
 		of the routes that succeeded and error.errorMessage.payload.failures the error of each route that failed,
 		both by route key. The handler below answers 503 with what is known (decision INCOMPLETE, the completed
 		and the failed checks), instead of a bare 500. A route that does not finish within timeout
-		(eip.scatterGather.timeoutMillis) fails the same way, with MULE:TIMEOUT as its failure.
+		(eip.scatterGather.timeoutMillis) counts as failed too, and is reported among the failures (not covered
+		by the MUnit suite).
 	-->
 	<flow name="order-check-before-acceptance" doc:description="Scatter-gather: runs the pricing, stock and fraud checks of an order in parallel on POST /eip/orders/checks and combines them into one acceptance decision; a failed check returns the partial result.">
 		<http:listener doc:name="POST /eip/orders/checks" config-ref="http-listener-config" path="/eip/orders/checks" allowedMethods="POST">
