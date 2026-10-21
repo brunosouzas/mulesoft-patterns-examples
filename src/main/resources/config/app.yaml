@@ -22,10 +22,13 @@ eip:
   # Correlation identifier: where the simulated payment provider sends its asynchronous callback.
   provider:
     callbackPath: "/eip/payments/callback"
+  # Orders of the routing examples: shipping to another country is international (content-based router,
+  # recipient list).
+  orders:
+    homeCountry: "BR"
   # Content-based router: orders at or above the threshold go to manual review; orders shipped outside
   # the home country go to international fulfilment; the rest to domestic fulfilment.
   router:
-    homeCountry: "BR"
     reviewThreshold: "1000"
   # Aggregator: how long an order's items may take to arrive before the group times out (short, so the
   # demo and the tests can show it), and how long a finished group is remembered to reject late items.

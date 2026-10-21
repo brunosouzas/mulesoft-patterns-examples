@@ -15,7 +15,7 @@
 		In Mule the router is a Choice: each <when> is a rule on the order's content, and the handler is a
 		flow reference. The rules here, in this order:
 		1. amount at or above eip.router.reviewThreshold: manual review (big orders are checked by a person first);
-		2. country other than eip.router.homeCountry: international fulfilment (customs paperwork);
+		2. country other than eip.orders.homeCountry: international fulfilment (customs paperwork);
 		3. otherwise: domestic fulfilment.
 
 		Choice evaluates the <when> expressions top to bottom and runs only the first that is true, so the order of
@@ -41,7 +41,7 @@
 			<when expression="#[payload.amount &gt;= (p('eip.router.reviewThreshold') as Number)]">
 				<flow-ref doc:name="Refer to sf-route-order-to-review" name="sf-route-order-to-review" />
 			</when>
-			<when expression="#[upper(payload.country) != upper(p('eip.router.homeCountry'))]">
+			<when expression="#[upper(payload.country) != upper(p('eip.orders.homeCountry'))]">
 				<flow-ref doc:name="Refer to sf-route-order-to-international-fulfilment" name="sf-route-order-to-international-fulfilment" />
 			</when>
 			<otherwise>
