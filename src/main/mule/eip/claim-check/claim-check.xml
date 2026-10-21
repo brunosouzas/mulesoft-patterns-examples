@@ -1,0 +1,107 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<mule xmlns="http://www.mulesoft.org/schema/mule/core"
+	xmlns:http="http://www.mulesoft.org/schema/mule/http"
+	xmlns:os="http://www.mulesoft.org/schema/mule/os"
+	xmlns:ee="http://www.mulesoft.org/schema/mule/ee/core"
+	xmlns:doc="http://www.mulesoft.org/schema/mule/documentation"
+	xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+	xsi:schemaLocation="http://www.mulesoft.org/schema/mule/core http://www.mulesoft.org/schema/mule/core/current/mule.xsd
+		http://www.mulesoft.org/schema/mule/http http://www.mulesoft.org/schema/mule/http/current/mule-http.xsd
+		http://www.mulesoft.org/schema/mule/os http://www.mulesoft.org/schema/mule/os/current/mule-os.xsd
+		http://www.mulesoft.org/schema/mule/ee/core http://www.mulesoft.org/schema/mule/ee/core/current/mule-ee.xsd">
+
+	<!--
+		CLAIM CHECK (Hohpe and Woolf): stores the message data in a persistent store and passes a claim check
+		(a key) to the next components, which can use it to retrieve the data later. The message on the way
+		stays small, and only the component that needs the data fetches it.
+
+		Here an order comes with a document (a signed purchase order as base64) that only the archive needs:
+		POST /eip/orders/documents   { orderId, document: { fileName, mediaType, contentBase64 } }
+		  1. check in: the document is stored in an object store under a new claim key (CLM-<uuid>);
+		  2. the message sent on to the archive is { orderId, claimKey, fileName }, without the content;
+		  3. the archive (claim-check-archive.xml, simulated on this app) checks the document out with the key.
+		  -> 202 { orderId, claimKey, archive: <the archive's reply> }
+		GET /eip/orders/documents/{claimKey}   checks a document out: 200 with it, or 404 when the key is
+		                                       unknown or the claim has expired.
+
+		Checking out does not remove the document: it stays claimable by other components until its time to
+		live ends. The store's entryTtl is eip.claimCheck.ttlSeconds (3 seconds here, so the tests can show it;
+		in production it is as long as the slowest consumer may take) and expirationInterval is how often the
+		store removes expired entries; expirationInterval needs entryTtl or maxEntries to be set, or the
+		expiration thread does not run:
+		https://docs.mulesoft.com/object-store-connector/latest/object-store-connector-reference (Object Store).
+		A key that is not in the store makes os:retrieve raise OS:KEY_NOT_FOUND when no default value is given
+		(same page, Retrieve); here that becomes 404.
+
+		The store is in memory so the examples start clean. A real claim check needs a store every consumer can
+		reach, and that survives a restart for as long as the claim is valid (Object Store v2 on CloudHub, which
+		limits entryTtl to between 1 second and 30 days, or a file or blob store for large documents).
+	-->
+	<os:object-store name="eip-claim-check-documents-store" doc:name="Claim Check Documents Object Store" persistent="false"
+		entryTtl="${eip.claimCheck.ttlSeconds}" entryTtlUnit="SECONDS"
+		expirationInterval="${eip.claimCheck.expirationIntervalSeconds}" expirationIntervalUnit="SECONDS" />
+
+	<flow name="order-check-in-document" doc:description="Claim check: POST /eip/orders/documents stores an order's document under a claim key and sends the archive only the key, which the archive uses to fetch the document.">
+		<http:listener doc:name="POST /eip/orders/documents" config-ref="http-listener-config" path="/eip/orders/documents" allowedMethods="POST">
+			<http:response statusCode="#[vars.httpStatus default 202]" />
+		</http:listener>
+		<choice doc:name="Validate Order Document">
+			<when expression="#[(not (payload is Object)) or isEmpty(payload.orderId) or isEmpty(payload.document.fileName) or isEmpty(payload.document.contentBase64)]">
+				<raise-error doc:name="Raise BAD_REQUEST Error - Missing document fields" type="APP:BAD_REQUEST" description="orderId, document.fileName and document.contentBase64 are required" />
+			</when>
+		</choice>
+		<set-variable doc:name="SET vClaimKey" variableName="vClaimKey" value="#['CLM-' ++ uuid()]" />
+		<os:store doc:name="Check In Order Document" key="#[vars.vClaimKey]" objectStore="eip-claim-check-documents-store">
+			<os:value><![CDATA[#[output application/java --- {
+	orderId: payload.orderId,
+	fileName: payload.document.fileName,
+	mediaType: payload.document.mediaType default "application/octet-stream",
+	contentBase64: payload.document.contentBase64,
+	checkedInAt: now() as String
+}]]]></os:value>
+		</os:store>
+		<logger doc:name="INFO: Log document checked in" level="INFO" message="#['Document of orderId=' ++ payload.orderId ++ ' checked in as ' ++ vars.vClaimKey ++ ', correlationId=' ++ correlationId]" />
+		<ee:transform doc:name="Build Claim Message">
+			<ee:message>
+				<ee:set-payload><![CDATA[%dw 2.0
+output application/json
+---
+{ orderId: payload.orderId, claimKey: vars.vClaimKey, fileName: payload.document.fileName }]]></ee:set-payload>
+			</ee:message>
+		</ee:transform>
+		<http:request doc:name="Send Claim To Archive" config-ref="eip-self-http-request-config" method="POST" path="/eip/archive/documents" target="vArchiveReply" />
+		<ee:transform doc:name="Build Check In Response">
+			<ee:message>
+				<ee:set-payload><![CDATA[%dw 2.0
+output application/json
+---
+{ orderId: payload.orderId, claimKey: vars.vClaimKey, archive: vars.vArchiveReply }]]></ee:set-payload>
+			</ee:message>
+		</ee:transform>
+	</flow>
+
+	<flow name="order-check-out-document" doc:description="Claim check: GET /eip/orders/documents/{claimKey} returns the document stored under a claim key, or 404 when the key is unknown or expired.">
+		<http:listener doc:name="GET /eip/orders/documents/{claimKey}" config-ref="http-listener-config" path="/eip/orders/documents/{claimKey}" allowedMethods="GET">
+			<http:response statusCode="#[vars.httpStatus default 200]" />
+		</http:listener>
+		<set-variable doc:name="SET vClaimKey" variableName="vClaimKey" value="#[attributes.uriParams.claimKey]" />
+		<flow-ref doc:name="Refer to sf-check-out-document" name="sf-check-out-document" />
+	</flow>
+
+	<sub-flow name="sf-check-out-document" doc:description="Retrieves the document stored under vars.vClaimKey into the payload; raises APP:NOT_FOUND when the claim is unknown or has expired. Does not remove the document.">
+		<try doc:name="Try Retrieve Claimed Document">
+			<os:retrieve doc:name="Check Out Order Document" key="#[vars.vClaimKey]" objectStore="eip-claim-check-documents-store" />
+			<error-handler>
+				<on-error-continue doc:name="On Error Continue (claim not found)" type="OS:KEY_NOT_FOUND" logException="false">
+					<set-variable doc:name="SET vClaimMissing" variableName="vClaimMissing" value="#[true]" />
+				</on-error-continue>
+			</error-handler>
+		</try>
+		<choice doc:name="Validate Claim Found">
+			<when expression="#[vars.vClaimMissing default false]">
+				<logger doc:name="WARN: Log missing claim" level="WARN" message="#['Claim ' ++ vars.vClaimKey ++ ' not found or expired, correlationId=' ++ correlationId]" />
+				<raise-error doc:name="Raise NOT_FOUND Error - Claim not found" type="APP:NOT_FOUND" description="#['claim ' ++ vars.vClaimKey ++ ' not found or expired']" />
+			</when>
+		</choice>
+	</sub-flow>
+</mule>
