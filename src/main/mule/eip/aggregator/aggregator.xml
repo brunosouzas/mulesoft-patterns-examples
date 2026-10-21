@@ -34,8 +34,8 @@
 		its routes do come out, which is how the endpoint knows whether this item completed the invoice
 		(201 with the invoice) or not yet (202 with the progress).
 
-		The content is stored in an object store, so it must be serializable: the content expression has output application/java, so it stores a
-		plain map, not the request's JSON stream.
+		The content is stored in an object store, so it must be serializable: the content expression has
+		output application/java, so it stores a plain map, not the request's JSON stream.
 
 		Groups that never complete: after eip.invoice.groupTimeoutSeconds the group times out; the listener flow
 		below (includeTimedOutGroups="true") records the invoice as INCOMPLETE with the items that did arrive.
