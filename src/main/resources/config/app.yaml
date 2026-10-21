@@ -50,3 +50,16 @@ eip:
   claimCheck:
     ttlSeconds: "3"
     expirationIntervalSeconds: "1"
+  # Request-reply: how long the simulated warehouse takes to make a reservation (so waiting shows in the
+  # timings), and the requestor's fixed reply channel for asynchronous replies.
+  requestReply:
+    warehouseDelayMillis: "300"
+    replyChannelPath: "/eip/stock/reservation-replies"
+  # Polling consumer: how often the Scheduler polls the pending orders.
+  pollingConsumer:
+    frequencyMillis: "1000"
+  # Competing consumers: how many consumers run at once (also the consumer flow's maxConcurrency), and how
+  # long issuing one invoice takes, so the consumers overlap.
+  competingConsumers:
+    consumers: "3"
+    workMillis: "50"

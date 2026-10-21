@@ -1,0 +1,182 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<mule xmlns="http://www.mulesoft.org/schema/mule/core"
+	xmlns:munit="http://www.mulesoft.org/schema/mule/munit"
+	xmlns:munit-tools="http://www.mulesoft.org/schema/mule/munit-tools"
+	xmlns:http="http://www.mulesoft.org/schema/mule/http"
+	xmlns:os="http://www.mulesoft.org/schema/mule/os"
+	xmlns:doc="http://www.mulesoft.org/schema/mule/documentation"
+	xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+	xsi:schemaLocation="http://www.mulesoft.org/schema/mule/core http://www.mulesoft.org/schema/mule/core/current/mule.xsd
+		http://www.mulesoft.org/schema/mule/munit http://www.mulesoft.org/schema/mule/munit/current/mule-munit.xsd
+		http://www.mulesoft.org/schema/mule/munit-tools http://www.mulesoft.org/schema/mule/munit-tools/current/mule-munit-tools.xsd
+		http://www.mulesoft.org/schema/mule/http http://www.mulesoft.org/schema/mule/http/current/mule-http.xsd
+		http://www.mulesoft.org/schema/mule/os http://www.mulesoft.org/schema/mule/os/current/mule-os.xsd">
+
+	<!--
+		Request-reply: the same reservation asked synchronously (the requestor waits for the HTTP response) and
+		asynchronously (the requestor answers 202 and the warehouse calls the reply channel later). Every call
+		goes over HTTP to this app; the warehouse takes 300 ms (eip.requestReply.warehouseDelayMillis).
+	-->
+	<munit:config name="request-reply-test-suite.xml" />
+
+	<munit:test name="rr-sync-requestor-waits-for-the-reply" description="Request-reply, synchronous: the requestor calls the warehouse over HTTP and waits; its response already holds the reservation, after at least the warehouse delay (300 ms)">
+		<munit:enable-flow-sources>
+			<munit:enable-flow-source value="stock-reserve-request-reply-sync" />
+			<munit:enable-flow-source value="stock-reserve-request-reply-async" />
+			<munit:enable-flow-source value="warehouse-reserve-sync" />
+			<munit:enable-flow-source value="warehouse-reserve-async" />
+			<munit:enable-flow-source value="stock-receive-reservation-reply" />
+			<munit:enable-flow-source value="stock-get-reservation-reply" />
+		</munit:enable-flow-sources>
+		<munit:execution>
+			<http:request doc:name="POST /eip/stock/reservations/sync" config-ref="eip-self-http-request-config" method="POST" path="/eip/stock/reservations/sync" target="vResponse" targetValue="#[output application/java --- { status: attributes.statusCode, contentType: attributes.headers.'content-type' default '', body: payload }]">
+				<http:body><![CDATA[#[output application/json --- {orderId: 'ORD-RR-SYNC', sku: 'SKU-BOOK', quantity: 2}]]]></http:body>
+				<http:response-validator>
+					<http:success-status-code-validator values="200..499" />
+				</http:response-validator>
+			</http:request>
+		</munit:execution>
+		<munit:validation>
+			<munit-tools:assert-that doc:name="200" expression="#[vars.vResponse.status]" is="#[MunitTools::equalTo(200)]" />
+			<munit-tools:assert-that doc:name="JSON" expression="#[vars.vResponse.contentType]" is="#[MunitTools::startsWith('application/json')]" />
+			<munit-tools:assert-that doc:name="Synchronous" expression="#[vars.vResponse.body.mode]" is="#[MunitTools::equalTo('SYNC')]" />
+			<munit-tools:assert-that doc:name="Reply in the response" expression="#[vars.vResponse.body.reply.status]" is="#[MunitTools::equalTo('RESERVED')]" />
+			<munit-tools:assert-that doc:name="Reply for this order" expression="#[vars.vResponse.body.reply.orderId]" is="#[MunitTools::equalTo('ORD-RR-SYNC')]" />
+			<munit-tools:assert-that doc:name="Reservation id" expression="#[vars.vResponse.body.reply.reservationId]" is="#[MunitTools::notNullValue()]" />
+			<munit-tools:assert-that doc:name="Waited for the warehouse" expression="#[vars.vResponse.body.waitedMillis]" is="#[MunitTools::greaterThanOrEqualTo(300)]" />
+			<munit-tools:verify-call doc:name="No reply sent to the reply channel" processor="http:request" times="0">
+				<munit-tools:with-attributes>
+					<munit-tools:with-attribute attributeName="doc:name" whereValue="POST Reply To Reply Channel" />
+				</munit-tools:with-attributes>
+			</munit-tools:verify-call>
+		</munit:validation>
+	</munit:test>
+
+	<munit:test name="rr-async-requestor-is-called-back-on-the-reply-channel" description="Request-reply, asynchronous: the requestor answers 202 PENDING without the reservation; the warehouse later posts the reply to the reply channel, once">
+		<munit:enable-flow-sources>
+			<munit:enable-flow-source value="stock-reserve-request-reply-sync" />
+			<munit:enable-flow-source value="stock-reserve-request-reply-async" />
+			<munit:enable-flow-source value="warehouse-reserve-sync" />
+			<munit:enable-flow-source value="warehouse-reserve-async" />
+			<munit:enable-flow-source value="stock-receive-reservation-reply" />
+			<munit:enable-flow-source value="stock-get-reservation-reply" />
+		</munit:enable-flow-sources>
+		<munit:execution>
+			<http:request doc:name="POST /eip/stock/reservations/async" config-ref="eip-self-http-request-config" method="POST" path="/eip/stock/reservations/async" target="vResponse" targetValue="#[output application/java --- { status: attributes.statusCode, contentType: attributes.headers.'content-type' default '', body: payload }]">
+				<http:body><![CDATA[#[output application/json --- {orderId: 'ORD-RR-ASYNC', sku: 'SKU-MUG', quantity: 1}]]]></http:body>
+				<http:response-validator>
+					<http:success-status-code-validator values="200..499" />
+				</http:response-validator>
+			</http:request>
+			<http:request doc:name="GET reply right away" config-ref="eip-self-http-request-config" method="GET" path="/eip/stock/reservation-replies/ORD-RR-ASYNC" target="vRightAway" targetValue="#[output application/java --- { status: attributes.statusCode, contentType: attributes.headers.'content-type' default '', body: payload }]">
+				<http:response-validator>
+					<http:success-status-code-validator values="200..499" />
+				</http:response-validator>
+			</http:request>
+			<until-successful doc:name="Wait for the reply" maxRetries="50" millisBetweenRetries="100">
+				<http:request doc:name="GET reply" config-ref="eip-self-http-request-config" method="GET" path="/eip/stock/reservation-replies/ORD-RR-ASYNC" target="vReply" targetValue="#[output application/java --- { status: attributes.statusCode, contentType: attributes.headers.'content-type' default '', body: payload }]">
+					<http:response-validator>
+						<http:success-status-code-validator values="200..499" />
+					</http:response-validator>
+				</http:request>
+				<choice doc:name="Check Arrived">
+					<when expression="#[vars.vReply.body.status != 'RESERVED']">
+						<raise-error doc:name="Raise TEST:NOT_YET Error" type="TEST:NOT_YET" description="Not yet" />
+					</when>
+				</choice>
+			</until-successful>
+		</munit:execution>
+		<munit:validation>
+			<munit-tools:assert-that doc:name="202" expression="#[vars.vResponse.status]" is="#[MunitTools::equalTo(202)]" />
+			<munit-tools:assert-that doc:name="JSON" expression="#[vars.vResponse.contentType]" is="#[MunitTools::startsWith('application/json')]" />
+			<munit-tools:assert-that doc:name="Pending" expression="#[vars.vResponse.body.status]" is="#[MunitTools::equalTo('PENDING')]" />
+			<munit-tools:assert-that doc:name="No reservation in the response" expression="#[vars.vResponse.body.reservationId]" is="#[MunitTools::nullValue()]" />
+			<munit-tools:assert-that doc:name="Names the reply channel" expression="#[vars.vResponse.body.replyChannel]" is="#[MunitTools::equalTo('/eip/stock/reservation-replies')]" />
+			<munit-tools:assert-that doc:name="Still pending right after" expression="#[vars.vRightAway.body.status]" is="#[MunitTools::equalTo('PENDING')]" />
+			<munit-tools:assert-that doc:name="Reply arrived" expression="#[vars.vReply.body.status]" is="#[MunitTools::equalTo('RESERVED')]" />
+			<munit-tools:assert-that doc:name="Reservation id" expression="#[vars.vReply.body.reservationId]" is="#[MunitTools::notNullValue()]" />
+			<munit-tools:verify-call doc:name="Warehouse replied once" processor="http:request" times="1">
+				<munit-tools:with-attributes>
+					<munit-tools:with-attribute attributeName="doc:name" whereValue="POST Reply To Reply Channel" />
+				</munit-tools:with-attributes>
+			</munit-tools:verify-call>
+		</munit:validation>
+	</munit:test>
+
+	<munit:test name="rr-reply-without-a-request-returns-404" description="Request-reply: a reply for an order that sent no request is rejected with 404 and not recorded">
+		<munit:enable-flow-sources>
+			<munit:enable-flow-source value="stock-reserve-request-reply-sync" />
+			<munit:enable-flow-source value="stock-reserve-request-reply-async" />
+			<munit:enable-flow-source value="warehouse-reserve-sync" />
+			<munit:enable-flow-source value="warehouse-reserve-async" />
+			<munit:enable-flow-source value="stock-receive-reservation-reply" />
+			<munit:enable-flow-source value="stock-get-reservation-reply" />
+		</munit:enable-flow-sources>
+		<munit:execution>
+			<http:request doc:name="POST stray reply" config-ref="eip-self-http-request-config" method="POST" path="/eip/stock/reservation-replies" target="vResponse" targetValue="#[output application/java --- { status: attributes.statusCode, contentType: attributes.headers.'content-type' default '', body: payload }]">
+				<http:body><![CDATA[#[output application/json --- {orderId: 'ORD-RR-STRAY', status: 'RESERVED'}]]]></http:body>
+				<http:response-validator>
+					<http:success-status-code-validator values="200..499" />
+				</http:response-validator>
+			</http:request>
+			<http:request doc:name="GET reply" config-ref="eip-self-http-request-config" method="GET" path="/eip/stock/reservation-replies/ORD-RR-STRAY" target="vReply" targetValue="#[output application/java --- { status: attributes.statusCode, contentType: attributes.headers.'content-type' default '', body: payload }]">
+				<http:response-validator>
+					<http:success-status-code-validator values="200..499" />
+				</http:response-validator>
+			</http:request>
+		</munit:execution>
+		<munit:validation>
+			<munit-tools:assert-that doc:name="404" expression="#[vars.vResponse.status]" is="#[MunitTools::equalTo(404)]" />
+			<munit-tools:assert-that doc:name="JSON" expression="#[vars.vResponse.contentType]" is="#[MunitTools::startsWith('application/json')]" />
+			<munit-tools:assert-that doc:name="Says why" expression="#[vars.vResponse.body.error]" is="#[MunitTools::equalTo('No reservation request for this orderId')]" />
+			<munit-tools:assert-that doc:name="Not recorded" expression="#[vars.vReply.status]" is="#[MunitTools::equalTo(404)]" />
+		</munit:validation>
+	</munit:test>
+
+	<munit:test name="rr-invalid-request-returns-400" description="Request-reply: a reservation request without sku or quantity is rejected with 400 and the warehouse is not called">
+		<munit:enable-flow-sources>
+			<munit:enable-flow-source value="stock-reserve-request-reply-sync" />
+			<munit:enable-flow-source value="stock-reserve-request-reply-async" />
+			<munit:enable-flow-source value="warehouse-reserve-sync" />
+			<munit:enable-flow-source value="warehouse-reserve-async" />
+			<munit:enable-flow-source value="stock-receive-reservation-reply" />
+			<munit:enable-flow-source value="stock-get-reservation-reply" />
+		</munit:enable-flow-sources>
+		<munit:execution>
+			<http:request doc:name="POST sync without sku" config-ref="eip-self-http-request-config" method="POST" path="/eip/stock/reservations/sync" target="vSync" targetValue="#[output application/java --- { status: attributes.statusCode, contentType: attributes.headers.'content-type' default '', body: payload }]">
+				<http:body><![CDATA[#[output application/json --- {orderId: 'ORD-RR-BAD'}]]]></http:body>
+				<http:response-validator>
+					<http:success-status-code-validator values="200..499" />
+				</http:response-validator>
+			</http:request>
+			<http:request doc:name="POST async with quantity 0" config-ref="eip-self-http-request-config" method="POST" path="/eip/stock/reservations/async" target="vAsync" targetValue="#[output application/java --- { status: attributes.statusCode, contentType: attributes.headers.'content-type' default '', body: payload }]">
+				<http:body><![CDATA[#[output application/json --- {orderId: 'ORD-RR-BAD', sku: 'SKU-MUG', quantity: 0}]]]></http:body>
+				<http:response-validator>
+					<http:success-status-code-validator values="200..499" />
+				</http:response-validator>
+			</http:request>
+			<http:request doc:name="POST reply without orderId" config-ref="eip-self-http-request-config" method="POST" path="/eip/stock/reservation-replies" target="vReply" targetValue="#[output application/java --- { status: attributes.statusCode, contentType: attributes.headers.'content-type' default '', body: payload }]">
+				<http:body><![CDATA[#[output application/json --- {status: 'RESERVED'}]]]></http:body>
+				<http:response-validator>
+					<http:success-status-code-validator values="200..499" />
+				</http:response-validator>
+			</http:request>
+		</munit:execution>
+		<munit:validation>
+			<munit-tools:assert-that doc:name="Sync 400" expression="#[vars.vSync.status]" is="#[MunitTools::equalTo(400)]" />
+			<munit-tools:assert-that doc:name="Async 400" expression="#[vars.vAsync.status]" is="#[MunitTools::equalTo(400)]" />
+			<munit-tools:assert-that doc:name="Reply 400" expression="#[vars.vReply.status]" is="#[MunitTools::equalTo(400)]" />
+			<munit-tools:assert-that doc:name="JSON" expression="#[vars.vSync.contentType]" is="#[MunitTools::startsWith('application/json')]" />
+			<munit-tools:verify-call doc:name="Warehouse not called (sync)" processor="http:request" times="0">
+				<munit-tools:with-attributes>
+					<munit-tools:with-attribute attributeName="doc:name" whereValue="POST Reservation To Warehouse And Wait" />
+				</munit-tools:with-attributes>
+			</munit-tools:verify-call>
+			<munit-tools:verify-call doc:name="Warehouse not called (async)" processor="http:request" times="0">
+				<munit-tools:with-attributes>
+					<munit-tools:with-attribute attributeName="doc:name" whereValue="POST Reservation Request To Warehouse" />
+				</munit-tools:with-attributes>
+			</munit-tools:verify-call>
+		</munit:validation>
+	</munit:test>
+</mule>

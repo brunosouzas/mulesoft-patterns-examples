@@ -1,0 +1,61 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<mule xmlns="http://www.mulesoft.org/schema/mule/core"
+	xmlns:http="http://www.mulesoft.org/schema/mule/http"
+	xmlns:os="http://www.mulesoft.org/schema/mule/os"
+	xmlns:ee="http://www.mulesoft.org/schema/mule/ee/core"
+	xmlns:doc="http://www.mulesoft.org/schema/mule/documentation"
+	xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+	xsi:schemaLocation="http://www.mulesoft.org/schema/mule/core http://www.mulesoft.org/schema/mule/core/current/mule.xsd
+		http://www.mulesoft.org/schema/mule/http http://www.mulesoft.org/schema/mule/http/current/mule-http.xsd
+		http://www.mulesoft.org/schema/mule/os http://www.mulesoft.org/schema/mule/os/current/mule-os.xsd
+		http://www.mulesoft.org/schema/mule/ee/core http://www.mulesoft.org/schema/mule/ee/core/current/mule-ee.xsd">
+
+	<!--
+		REQUEST-REPLY: the warehouse (the replier), simulated on this application. Making a reservation takes
+		eip.requestReply.warehouseDelayMillis (300 ms), so the difference between waiting and being called back
+		shows in the timings.
+		POST /eip/warehouse/reservations           synchronous: replies 201 with the reservation, after the delay
+		POST /eip/warehouse/reservation-requests   asynchronous: answers 202 at once and POSTs the reservation to the
+		                                           requestor's reply channel (eip.requestReply.replyChannelPath) later
+	-->
+	<flow name="warehouse-reserve-sync" doc:description="Simulated warehouse, synchronous replier: makes the reservation and replies with it in the HTTP response.">
+		<http:listener doc:name="POST /eip/warehouse/reservations" config-ref="http-listener-config" path="/eip/warehouse/reservations" allowedMethods="POST">
+			<http:response statusCode="#[vars.httpStatus default 201]" />
+		</http:listener>
+		<flow-ref doc:name="Refer to sf-make-reservation" name="sf-make-reservation" />
+		<set-payload doc:name="Set Reservation As JSON" value="#[output application/json --- payload]" />
+	</flow>
+
+	<flow name="warehouse-reserve-async" doc:description="Simulated warehouse, asynchronous replier: accepts the reservation request with 202 and sends the reservation to the fixed reply channel from an Async scope.">
+		<http:listener doc:name="POST /eip/warehouse/reservation-requests" config-ref="http-listener-config" path="/eip/warehouse/reservation-requests" allowedMethods="POST">
+			<http:response statusCode="#[vars.httpStatus default 202]" />
+		</http:listener>
+		<set-variable doc:name="SET vRequest" variableName="vRequest" value="#[output application/java --- payload]" />
+		<async doc:name="Async Reply Later">
+			<flow-ref doc:name="Refer to sf-make-reservation" name="sf-make-reservation" />
+			<http:request doc:name="POST Reply To Reply Channel" config-ref="eip-self-http-request-config" method="POST" path="${eip.requestReply.replyChannelPath}">
+				<http:body><![CDATA[#[output application/json --- payload]]]></http:body>
+			</http:request>
+		</async>
+		<set-payload doc:name="Set Accepted Response" value="#[output application/json --- { orderId: vars.vRequest.orderId, status: 'ACCEPTED' }]" />
+	</flow>
+
+	<sub-flow name="sf-make-reservation" doc:description="Simulated reservation: waits eip.requestReply.warehouseDelayMillis and returns a reservation for the order in the payload.">
+		<ee:transform doc:name="Make Reservation">
+			<ee:message>
+				<ee:set-payload><![CDATA[%dw 2.0
+output application/java
+import wait from dw::Runtime
+---
+({
+	orderId: payload.orderId,
+	sku: payload.sku,
+	quantity: payload.quantity,
+	reservationId: "RSV-" ++ uuid(),
+	status: "RESERVED"
+} wait (p('eip.requestReply.warehouseDelayMillis') as Number)) ++ { reservedAt: now() as String }]]></ee:set-payload>
+			</ee:message>
+		</ee:transform>
+		<logger doc:name="INFO: Log reservation made" level="INFO" message="#['Warehouse reserved orderId=' ++ payload.orderId ++ ', correlationId=' ++ correlationId]" />
+	</sub-flow>
+</mule>
