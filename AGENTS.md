@@ -11,6 +11,8 @@ A catalogue of runnable Mule 4 examples of design and integration patterns, one 
 
 HTTP endpoint paths are referenced by published articles; do not change them when moving files.
 
+EIP examples use the kit Mule naming rules; SOLID keeps the names its published articles quote.
+
 ## Technology declarations
 
 - `app.runtime = 4.9.17` — [pom.xml](pom.xml).
