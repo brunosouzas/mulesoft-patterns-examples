@@ -15,15 +15,18 @@
 	<!--
 		Guaranteed delivery: the order is persisted in the outbox before the 202, and the forwarder removes it only
 		after fulfilment accepted it. The Scheduler source is off in MUnit unless enabled, so the tests run one
-		forwarder pass at a time with a flow-ref; gd-scheduler-redelivers-on-its-own enables it. A restart cannot
-		be run inside MUnit: the tests show what survives one, the order in the persistent store, readable before
-		any delivery attempt and after a failed one. The persistent stores are cleared before each test.
+		forwarder pass at a time with a flow-ref; gd-scheduler-redelivers-on-its-own enables it and polls the status
+		until the Scheduler delivered the order. A restart cannot be run inside MUnit: the tests show the order in
+		the store declared persistent, readable before any delivery attempt and after failed ones; that it survives
+		a restart is the connector's guarantee, not something these tests show. The stores are cleared before
+		each test.
 	-->
 	<munit:config name="guaranteed-delivery-test-suite.xml" />
 
 	<munit:before-test name="gd-clear-stores" description="Starts each test with empty outbox and delivery stores and fulfilment available">
 		<os:clear doc:name="Clear Outbox" objectStore="eip-gd-outbox-store" />
 		<os:clear doc:name="Clear Delivered" objectStore="eip-gd-delivered-store" />
+		<os:clear doc:name="Clear Dead" objectStore="eip-gd-dead-store" />
 		<os:clear doc:name="Clear Fulfilment" objectStore="eip-gd-fulfilment-store" />
 	</munit:before-test>
 
@@ -153,7 +156,7 @@
 		</munit:validation>
 	</munit:test>
 
-	<munit:test name="gd-crash-after-delivery-before-removal-sends-again" description="Guaranteed delivery: when removing the delivered order from the outbox fails (as a crash at that point would), the next pass sends it again: at least once, not exactly once">
+	<munit:test name="gd-crash-after-delivery-before-removal-sends-again" description="Guaranteed delivery: when removing the delivered order from the outbox fails (as a crash at that point would), the next pass sends it again: at least once, not exactly once; the idempotent fulfilment receives it twice and processes it once">
 		<munit:enable-flow-sources>
 			<munit:enable-flow-source value="order-store-for-guaranteed-delivery" />
 			<munit:enable-flow-source value="fulfilment-receive-order" />
@@ -185,6 +188,7 @@
 		<munit:validation>
 			<munit-tools:assert-that doc:name="Still in outbox" expression="#[vars.vInOutbox]" is="#[MunitTools::equalTo(true)]" />
 			<munit-tools:assert-that doc:name="Received twice" expression="#[vars.vFulfilment.body.timesReceived]" is="#[MunitTools::equalTo(2)]" />
+			<munit-tools:assert-that doc:name="Processed once" expression="#[vars.vFulfilment.body.timesProcessed]" is="#[MunitTools::equalTo(1)]" />
 		</munit:validation>
 	</munit:test>
 
@@ -199,15 +203,201 @@
 			<http:request doc:name="POST order" config-ref="eip-self-http-request-config" method="POST" path="/eip/orders/guaranteed">
 				<http:body><![CDATA[#[output application/json --- { orderId: 'ORD-GD-5', amount: 15 }]]]></http:body>
 			</http:request>
-			<munit-tools:sleep doc:name="Wait for two forwarder runs" time="2500" timeUnit="MILLISECONDS" />
-			<http:request doc:name="GET status" config-ref="eip-self-http-request-config" method="GET" path="/eip/orders/guaranteed/ORD-GD-5" target="vStatus" targetValue="#[output application/java --- { status: attributes.statusCode, body: payload }]">
+			<until-successful doc:name="Wait for the Scheduler" maxRetries="50" millisBetweenRetries="100">
+				<http:request doc:name="GET status" config-ref="eip-self-http-request-config" method="GET" path="/eip/orders/guaranteed/ORD-GD-5" target="vStatus" targetValue="#[output application/java --- { status: attributes.statusCode, body: payload }]">
+					<http:response-validator>
+						<http:success-status-code-validator values="200..499" />
+					</http:response-validator>
+				</http:request>
+				<choice doc:name="Check Delivered">
+					<when expression="#[vars.vStatus.body.status != 'DELIVERED']">
+						<raise-error doc:name="Raise TEST:NOT_YET Error" type="TEST:NOT_YET" description="Not yet" />
+					</when>
+				</choice>
+			</until-successful>
+		</munit:execution>
+		<munit:validation>
+			<munit-tools:assert-that doc:name="Delivered by the Scheduler" expression="#[vars.vStatus.body.status]" is="#[MunitTools::equalTo('DELIVERED')]" />
+		</munit:validation>
+	</munit:test>
+
+	<munit:test name="gd-rejected-order-is-moved-aside-and-the-pass-goes-on" description="Guaranteed delivery: fulfilment answers 400 to order A (no positive amount); A is moved to the dead store with the reason, and order B, stored after A, is still delivered in the same pass">
+		<munit:enable-flow-sources>
+			<munit:enable-flow-source value="order-store-for-guaranteed-delivery" />
+			<munit:enable-flow-source value="order-get-guaranteed-delivery-status" />
+			<munit:enable-flow-source value="fulfilment-receive-order" />
+			<munit:enable-flow-source value="fulfilment-set-availability" />
+			<munit:enable-flow-source value="fulfilment-get-order" />
+		</munit:enable-flow-sources>
+		<munit:execution>
+			<http:request doc:name="POST order A" config-ref="eip-self-http-request-config" method="POST" path="/eip/orders/guaranteed">
+				<http:body><![CDATA[#[output application/json --- { orderId: 'ORD-GD-A', amount: -1 }]]]></http:body>
 				<http:response-validator>
-					<http:success-status-code-validator values="200..499" />
+					<http:success-status-code-validator values="200..599" />
+				</http:response-validator>
+			</http:request>
+			<http:request doc:name="POST order B" config-ref="eip-self-http-request-config" method="POST" path="/eip/orders/guaranteed">
+				<http:body><![CDATA[#[output application/json --- { orderId: 'ORD-GD-B', amount: 30 }]]]></http:body>
+				<http:response-validator>
+					<http:success-status-code-validator values="200..599" />
+				</http:response-validator>
+			</http:request>
+			<flow-ref doc:name="Refer to order-forward-stored-orders (one pass)" name="order-forward-stored-orders" />
+			<http:request doc:name="GET status A" config-ref="eip-self-http-request-config" method="GET" path="/eip/orders/guaranteed/ORD-GD-A" target="vA" targetValue="#[output application/java --- { status: attributes.statusCode, contentType: attributes.headers.'content-type' default '', body: payload }]">
+				<http:response-validator>
+					<http:success-status-code-validator values="200..599" />
+				</http:response-validator>
+			</http:request>
+			<http:request doc:name="GET status B" config-ref="eip-self-http-request-config" method="GET" path="/eip/orders/guaranteed/ORD-GD-B" target="vB" targetValue="#[output application/java --- { status: attributes.statusCode, contentType: attributes.headers.'content-type' default '', body: payload }]">
+				<http:response-validator>
+					<http:success-status-code-validator values="200..599" />
+				</http:response-validator>
+			</http:request>
+			<os:retrieve-all-keys doc:name="Read outbox keys" objectStore="eip-gd-outbox-store" target="vKeys" />
+		</munit:execution>
+		<munit:validation>
+			<munit-tools:assert-that doc:name="A dead" expression="#[vars.vA.body.status]" is="#[MunitTools::equalTo('DEAD')]" />
+			<munit-tools:assert-that doc:name="A on its first attempt" expression="#[vars.vA.body.attempts]" is="#[MunitTools::equalTo(1)]" />
+			<munit-tools:assert-that doc:name="A error" expression="#[vars.vA.body.lastError]" is="#[MunitTools::equalTo('HTTP:BAD_REQUEST')]" />
+			<munit-tools:assert-that doc:name="A reason" expression="#[vars.vA.body.reason]" is="#[MunitTools::equalTo('rejected by fulfilment: HTTP:BAD_REQUEST')]" />
+			<munit-tools:assert-that doc:name="B delivered in the same pass" expression="#[vars.vB.body.status]" is="#[MunitTools::equalTo('DELIVERED')]" />
+			<munit-tools:assert-that doc:name="Outbox empty" expression="#[sizeOf(vars.vKeys)]" is="#[MunitTools::equalTo(0)]" />
+		</munit:validation>
+	</munit:test>
+
+	<munit:test name="gd-order-past-the-attempt-limit-is-moved-aside" description="Guaranteed delivery: while fulfilment answers 503 the order is kept for 4 attempts; the 5th failed attempt (eip.guaranteedDelivery.maxAttempts) moves it to the dead store, and a later pass does not send it">
+		<munit:enable-flow-sources>
+			<munit:enable-flow-source value="order-store-for-guaranteed-delivery" />
+			<munit:enable-flow-source value="order-get-guaranteed-delivery-status" />
+			<munit:enable-flow-source value="fulfilment-receive-order" />
+			<munit:enable-flow-source value="fulfilment-set-availability" />
+			<munit:enable-flow-source value="fulfilment-get-order" />
+		</munit:enable-flow-sources>
+		<munit:execution>
+			<http:request doc:name="PUT fulfilment down" config-ref="eip-self-http-request-config" method="PUT" path="/eip/fulfilment/availability">
+				<http:body><![CDATA[#[output application/json --- { available: false }]]]></http:body>
+				<http:response-validator>
+					<http:success-status-code-validator values="200..599" />
+				</http:response-validator>
+			</http:request>
+			<http:request doc:name="POST order" config-ref="eip-self-http-request-config" method="POST" path="/eip/orders/guaranteed">
+				<http:body><![CDATA[#[output application/json --- { orderId: 'ORD-GD-6', amount: 40 }]]]></http:body>
+				<http:response-validator>
+					<http:success-status-code-validator values="200..599" />
+				</http:response-validator>
+			</http:request>
+			<flow-ref doc:name="Refer to order-forward-stored-orders (1)" name="order-forward-stored-orders" />
+			<flow-ref doc:name="Refer to order-forward-stored-orders (2)" name="order-forward-stored-orders" />
+			<flow-ref doc:name="Refer to order-forward-stored-orders (3)" name="order-forward-stored-orders" />
+			<flow-ref doc:name="Refer to order-forward-stored-orders (4)" name="order-forward-stored-orders" />
+			<http:request doc:name="GET status after 4" config-ref="eip-self-http-request-config" method="GET" path="/eip/orders/guaranteed/ORD-GD-6" target="vAfter4" targetValue="#[output application/java --- { status: attributes.statusCode, contentType: attributes.headers.'content-type' default '', body: payload }]">
+				<http:response-validator>
+					<http:success-status-code-validator values="200..599" />
+				</http:response-validator>
+			</http:request>
+			<flow-ref doc:name="Refer to order-forward-stored-orders (5, the limit)" name="order-forward-stored-orders" />
+			<http:request doc:name="PUT fulfilment up" config-ref="eip-self-http-request-config" method="PUT" path="/eip/fulfilment/availability">
+				<http:body><![CDATA[#[output application/json --- { available: true }]]]></http:body>
+				<http:response-validator>
+					<http:success-status-code-validator values="200..599" />
+				</http:response-validator>
+			</http:request>
+			<flow-ref doc:name="Refer to order-forward-stored-orders (6, fulfilment up)" name="order-forward-stored-orders" />
+			<http:request doc:name="GET status" config-ref="eip-self-http-request-config" method="GET" path="/eip/orders/guaranteed/ORD-GD-6" target="vStatus" targetValue="#[output application/java --- { status: attributes.statusCode, contentType: attributes.headers.'content-type' default '', body: payload }]">
+				<http:response-validator>
+					<http:success-status-code-validator values="200..599" />
+				</http:response-validator>
+			</http:request>
+			<http:request doc:name="GET fulfilment" config-ref="eip-self-http-request-config" method="GET" path="/eip/fulfilment/orders/ORD-GD-6" target="vFulfilment" targetValue="#[output application/java --- { status: attributes.statusCode, contentType: attributes.headers.'content-type' default '', body: payload }]">
+				<http:response-validator>
+					<http:success-status-code-validator values="200..599" />
+				</http:response-validator>
+			</http:request>
+			<os:contains doc:name="Outbox still has it?" key="ORD-GD-6" objectStore="eip-gd-outbox-store" target="vInOutbox" />
+		</munit:execution>
+		<munit:validation>
+			<munit-tools:assert-that doc:name="Still stored after 4" expression="#[vars.vAfter4.body.status]" is="#[MunitTools::equalTo('STORED')]" />
+			<munit-tools:assert-that doc:name="Dead" expression="#[vars.vStatus.body.status]" is="#[MunitTools::equalTo('DEAD')]" />
+			<munit-tools:assert-that doc:name="Five attempts" expression="#[vars.vStatus.body.attempts]" is="#[MunitTools::equalTo(5)]" />
+			<munit-tools:assert-that doc:name="Last error" expression="#[vars.vStatus.body.lastError]" is="#[MunitTools::equalTo('HTTP:SERVICE_UNAVAILABLE')]" />
+			<munit-tools:assert-that doc:name="Reason" expression="#[vars.vStatus.body.reason]" is="#[MunitTools::equalTo('not delivered after 5 attempts, last error HTTP:SERVICE_UNAVAILABLE')]" />
+			<munit-tools:assert-that doc:name="Not in outbox" expression="#[vars.vInOutbox]" is="#[MunitTools::equalTo(false)]" />
+			<munit-tools:assert-that doc:name="Never sent once fulfilment was up" expression="#[vars.vFulfilment.status]" is="#[MunitTools::equalTo(404)]" />
+		</munit:validation>
+	</munit:test>
+
+	<munit:test name="gd-repeated-order-id-is-refused" description="Guaranteed delivery: a second POST of an orderId still in the outbox, or already delivered, gets 409 in JSON and the stored order is not replaced">
+		<munit:enable-flow-sources>
+			<munit:enable-flow-source value="order-store-for-guaranteed-delivery" />
+			<munit:enable-flow-source value="order-get-guaranteed-delivery-status" />
+			<munit:enable-flow-source value="fulfilment-receive-order" />
+			<munit:enable-flow-source value="fulfilment-set-availability" />
+			<munit:enable-flow-source value="fulfilment-get-order" />
+		</munit:enable-flow-sources>
+		<munit:execution>
+			<http:request doc:name="POST order" config-ref="eip-self-http-request-config" method="POST" path="/eip/orders/guaranteed">
+				<http:body><![CDATA[#[output application/json --- { orderId: 'ORD-GD-7', amount: 25 }]]]></http:body>
+				<http:response-validator>
+					<http:success-status-code-validator values="200..599" />
+				</http:response-validator>
+			</http:request>
+			<http:request doc:name="POST again while stored" config-ref="eip-self-http-request-config" method="POST" path="/eip/orders/guaranteed" target="vWhileStored" targetValue="#[output application/java --- { status: attributes.statusCode, contentType: attributes.headers.'content-type' default '', body: payload }]">
+				<http:body><![CDATA[#[output application/json --- { orderId: 'ORD-GD-7', amount: 99 }]]]></http:body>
+				<http:response-validator>
+					<http:success-status-code-validator values="200..599" />
+				</http:response-validator>
+			</http:request>
+			<os:retrieve doc:name="Read the outbox" key="ORD-GD-7" objectStore="eip-gd-outbox-store" target="vOutbox" />
+			<flow-ref doc:name="Refer to order-forward-stored-orders (delivers)" name="order-forward-stored-orders" />
+			<http:request doc:name="POST again once delivered" config-ref="eip-self-http-request-config" method="POST" path="/eip/orders/guaranteed" target="vWhenDelivered" targetValue="#[output application/java --- { status: attributes.statusCode, contentType: attributes.headers.'content-type' default '', body: payload }]">
+				<http:body><![CDATA[#[output application/json --- { orderId: 'ORD-GD-7', amount: 25 }]]]></http:body>
+				<http:response-validator>
+					<http:success-status-code-validator values="200..599" />
+				</http:response-validator>
+			</http:request>
+			<os:contains doc:name="Outbox has it again?" key="ORD-GD-7" objectStore="eip-gd-outbox-store" target="vInOutbox" />
+		</munit:execution>
+		<munit:validation>
+			<munit-tools:assert-that doc:name="409 while stored" expression="#[vars.vWhileStored.status]" is="#[MunitTools::equalTo(409)]" />
+			<munit-tools:assert-that doc:name="JSON" expression="#[vars.vWhileStored.contentType]" is="#[MunitTools::startsWith('application/json')]" />
+			<munit-tools:assert-that doc:name="Says why" expression="#[vars.vWhileStored.body.error]" is="#[MunitTools::equalTo('Order already received')]" />
+			<munit-tools:assert-that doc:name="First order kept" expression="#[vars.vOutbox.order.amount]" is="#[MunitTools::equalTo(25)]" />
+			<munit-tools:assert-that doc:name="409 once delivered" expression="#[vars.vWhenDelivered.status]" is="#[MunitTools::equalTo(409)]" />
+			<munit-tools:assert-that doc:name="Not stored again" expression="#[vars.vInOutbox]" is="#[MunitTools::equalTo(false)]" />
+		</munit:validation>
+	</munit:test>
+
+	<munit:test name="gd-fulfilment-processes-a-repeat-once" description="Guaranteed delivery: the simulated fulfilment, posted the same order twice over HTTP, answers RECEIVED then DUPLICATE and processes it once">
+		<munit:enable-flow-sources>
+			<munit:enable-flow-source value="fulfilment-receive-order" />
+			<munit:enable-flow-source value="fulfilment-get-order" />
+		</munit:enable-flow-sources>
+		<munit:execution>
+			<http:request doc:name="POST to fulfilment" config-ref="eip-self-http-request-config" method="POST" path="/eip/fulfilment/orders" target="vFirst" targetValue="#[output application/java --- { status: attributes.statusCode, contentType: attributes.headers.'content-type' default '', body: payload }]">
+				<http:body><![CDATA[#[output application/json --- { orderId: 'ORD-GD-8', amount: 5 }]]]></http:body>
+				<http:response-validator>
+					<http:success-status-code-validator values="200..599" />
+				</http:response-validator>
+			</http:request>
+			<http:request doc:name="POST to fulfilment again" config-ref="eip-self-http-request-config" method="POST" path="/eip/fulfilment/orders" target="vSecond" targetValue="#[output application/java --- { status: attributes.statusCode, contentType: attributes.headers.'content-type' default '', body: payload }]">
+				<http:body><![CDATA[#[output application/json --- { orderId: 'ORD-GD-8', amount: 5 }]]]></http:body>
+				<http:response-validator>
+					<http:success-status-code-validator values="200..599" />
+				</http:response-validator>
+			</http:request>
+			<http:request doc:name="GET fulfilment" config-ref="eip-self-http-request-config" method="GET" path="/eip/fulfilment/orders/ORD-GD-8" target="vFulfilment" targetValue="#[output application/java --- { status: attributes.statusCode, contentType: attributes.headers.'content-type' default '', body: payload }]">
+				<http:response-validator>
+					<http:success-status-code-validator values="200..599" />
 				</http:response-validator>
 			</http:request>
 		</munit:execution>
 		<munit:validation>
-			<munit-tools:assert-that doc:name="Delivered by the Scheduler" expression="#[vars.vStatus.body.status]" is="#[MunitTools::equalTo('DELIVERED')]" />
+			<munit-tools:assert-that doc:name="First 200" expression="#[vars.vFirst.status]" is="#[MunitTools::equalTo(200)]" />
+			<munit-tools:assert-that doc:name="First received" expression="#[vars.vFirst.body.status]" is="#[MunitTools::equalTo('RECEIVED')]" />
+			<munit-tools:assert-that doc:name="Second 200" expression="#[vars.vSecond.status]" is="#[MunitTools::equalTo(200)]" />
+			<munit-tools:assert-that doc:name="Second is a duplicate" expression="#[vars.vSecond.body.status]" is="#[MunitTools::equalTo('DUPLICATE')]" />
+			<munit-tools:assert-that doc:name="Received twice" expression="#[vars.vFulfilment.body.timesReceived]" is="#[MunitTools::equalTo(2)]" />
+			<munit-tools:assert-that doc:name="Processed once" expression="#[vars.vFulfilment.body.timesProcessed]" is="#[MunitTools::equalTo(1)]" />
 		</munit:validation>
 	</munit:test>
 

@@ -63,9 +63,11 @@ eip:
   competingConsumers:
     consumers: "3"
     workMillis: "50"
-  # Guaranteed delivery: how often the forwarder sends the orders still in the persistent outbox.
+  # Guaranteed delivery: how often the forwarder sends the orders still in the persistent outbox, and after
+  # how many failed attempts an order is moved to the dead (quarantine) store instead of being sent again.
   guaranteedDelivery:
     forwardFrequencyMillis: "1000"
+    maxAttempts: "5"
   # Message expiration: how often the consumer reads the queued stock reservation requests.
   messageExpiration:
     consumerFrequencyMillis: "1000"

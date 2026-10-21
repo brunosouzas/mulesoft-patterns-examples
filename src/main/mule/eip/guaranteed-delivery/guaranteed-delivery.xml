@@ -13,12 +13,21 @@
 	<!--
 		GUARANTEED DELIVERY (Hohpe and Woolf): the messaging system persists a message before it acknowledges it,
 		so a crash between receipt and delivery does not lose it; it is forwarded again after the restart. Here:
-		a new order is written to a persistent object store (the outbox) and only then answered 202; a forwarder
-		started by a Scheduler sends each stored order to the (simulated) fulfilment system and removes it from
-		the outbox only after fulfilment answered 2xx. While fulfilment is down the order stays in the outbox
-		and is sent again on the next run (store and forward).
-		POST /eip/orders/guaranteed            persists the order, then acknowledges it (202 STORED)
-		GET  /eip/orders/guaranteed/{orderId}  STORED (with attempts and the last error) or DELIVERED
+		a new order is written to an object store declared persistent="true" (the outbox) and only then answered
+		202; a forwarder started by a Scheduler sends each stored order to the (simulated) fulfilment system and
+		removes it from the outbox only after fulfilment answered 2xx. While fulfilment is down the order stays in
+		the outbox and is sent again on the next run (store and forward). The order is stored in a store declared
+		persistent="true"; surviving a restart is the connector's guarantee for such a store
+		(https://docs.mulesoft.com/object-store-connector/latest/object-store-connector-reference), not shown by
+		MUnit, which cannot restart the app: the tests show the order in that store before and after failed
+		attempts.
+		Each order is forwarded inside its own error handling, so one failing order never stops the pass. An order
+		fulfilment rejects with a 4xx, or one still failing after eip.guaranteedDelivery.maxAttempts attempts, is
+		moved aside to a quarantine store (the "dead" store, status DEAD, with the reason): retrying it would fail
+		the same way, and leaving it in the outbox would retry it forever.
+		POST /eip/orders/guaranteed            persists the order, then acknowledges it (202 STORED); 409 when
+		                                       the orderId is already stored, delivered or dead
+		GET  /eip/orders/guaranteed/{orderId}  STORED (with attempts and the last error), DELIVERED or DEAD
 		(the forwarder is the flow order-forward-stored-orders, started by a Scheduler, not by a request)
 		Simulated fulfilment (guaranteed-delivery-fulfilment.xml):
 		POST /eip/fulfilment/orders, PUT /eip/fulfilment/availability, GET /eip/fulfilment/orders/{orderId}
@@ -27,7 +36,7 @@
 		for eventual retrieval" (https://docs.mulesoft.com/mule-runtime/latest/mule-object-stores), and the
 		connector's object store has a Persistent field, "Whether the store is persistent or transient"
 		(https://docs.mulesoft.com/object-store-connector/latest/object-store-connector-reference). A transient
-		(in-memory) outbox would lose the order on restart, which is exactly what this pattern prevents. On
+		(in-memory) outbox loses its content when the app stops, which is exactly what this pattern prevents. On
 		CloudHub a persistent store is Object Store v2; on a customer-hosted runtime it is the worker's disk, so
 		one worker's outbox is not shared with another (https://docs.mulesoft.com/object-store/osv2-faq).
 
@@ -42,15 +51,18 @@
 
 		Why not only Until Successful: it "runs synchronously" and retries in the same event
 		(https://docs.mulesoft.com/mule-runtime/latest/until-successful-scope); the attempts in progress live in
-		memory, so a restart during the retries loses the message. The persistent outbox survives it.
+		the event, in memory, so a restart during the retries loses the message. The outbox is kept in a store
+		declared persistent, which the connector keeps across restarts.
 
 		Delivery is at least once, not exactly once: if the app stops after fulfilment answered 2xx and before the
 		order is removed from the outbox, the order is sent again after the restart. The receiver must tolerate a
 		repeat (an idempotent receiver, wave 1); the simulated fulfilment counts how many times it received each
-		order so the tests can show it.
+		order and processes each orderId once (an os:store with failIfPresent), so the tests show a repeat
+		received twice and processed once.
 	-->
 	<os:object-store name="eip-gd-outbox-store" doc:name="Guaranteed Delivery Outbox Object Store" persistent="true" />
 	<os:object-store name="eip-gd-delivered-store" doc:name="Guaranteed Delivery Delivered Object Store" persistent="true" />
+	<os:object-store name="eip-gd-dead-store" doc:name="Guaranteed Delivery Dead (Quarantine) Object Store" persistent="true" />
 
 	<flow name="order-store-for-guaranteed-delivery" doc:description="Guaranteed delivery: persists a new order in the persistent outbox and acknowledges it (202) only after the write; the forwarder delivers it later.">
 		<http:listener doc:name="POST /eip/orders/guaranteed" config-ref="http-listener-config" path="/eip/orders/guaranteed" allowedMethods="POST">
@@ -62,9 +74,23 @@
 			</when>
 		</choice>
 		<set-variable doc:name="SET vOrderId" variableName="vOrderId" value="#[payload.orderId]" />
-		<os:store doc:name="Persist Order In Outbox" key="#[vars.vOrderId]" objectStore="eip-gd-outbox-store">
-			<os:value><![CDATA[#[output application/java --- { orderId: vars.vOrderId, order: payload, attempts: 0, storedAt: now() as String }]]]></os:value>
-		</os:store>
+		<os:contains doc:name="Check Already Delivered" key="#[vars.vOrderId]" objectStore="eip-gd-delivered-store" target="vDelivered" />
+		<os:contains doc:name="Check Already Dead" key="#[vars.vOrderId]" objectStore="eip-gd-dead-store" target="vDead" />
+		<choice doc:name="Check Order Already Handled">
+			<when expression="#[vars.vDelivered or vars.vDead]">
+				<raise-error doc:name="Raise CONFLICT Error - Order already handled" type="APP:CONFLICT" description="Order already received" />
+			</when>
+		</choice>
+		<try doc:name="Try Persist New Order">
+			<os:store doc:name="Persist Order In Outbox" key="#[vars.vOrderId]" objectStore="eip-gd-outbox-store" failIfPresent="true">
+				<os:value><![CDATA[#[output application/java --- { orderId: vars.vOrderId, order: payload, attempts: 0, storedAt: now() as String }]]]></os:value>
+			</os:store>
+			<error-handler>
+				<on-error-propagate doc:name="On Error Propagate (orderId already in the outbox)" type="OS:KEY_ALREADY_EXISTS" logException="false">
+					<raise-error doc:name="Raise CONFLICT Error - Order already stored" type="APP:CONFLICT" description="Order already received" />
+				</on-error-propagate>
+			</error-handler>
+		</try>
 		<logger doc:name="INFO: Log order stored" level="INFO" message="#['Order ' ++ vars.vOrderId ++ ' persisted in the outbox, correlationId=' ++ correlationId]" />
 		<set-payload doc:name="Set Stored Response" value="#[output application/json --- { orderId: vars.vOrderId, status: 'STORED' }]" />
 	</flow>
@@ -83,28 +109,57 @@
 		<logger doc:name="INFO: Log forward run" level="INFO" message="#['Forwarder run over ' ++ sizeOf(vars.vStoredOrders) ++ ' stored orders, correlationId=' ++ correlationId]" />
 	</flow>
 
-	<sub-flow name="sf-forward-one-stored-order" doc:description="Sends one stored order to fulfilment; on success removes it from the outbox and records the delivery, on failure keeps it with one more attempt and the error.">
+	<sub-flow name="sf-forward-one-stored-order" doc:description="Sends one stored order to fulfilment; on success removes it from the outbox and records the delivery; on a 4xx, or a failure on the last allowed attempt, moves it to the dead store; on any other failure keeps it with one more attempt and the error. No failure leaves this sub-flow, so the pass goes on with the next order.">
 		<set-variable doc:name="SET vStored" variableName="vStored" value="#[payload]" />
-		<try doc:name="Try Forward To Fulfilment">
-			<http:request doc:name="POST Order To Fulfilment" config-ref="eip-self-http-request-config" method="POST" path="/eip/fulfilment/orders">
-				<http:body><![CDATA[#[output application/json --- vars.vStored.order]]]></http:body>
-			</http:request>
-			<os:store doc:name="Record Delivery" key="#[vars.vStored.orderId]" objectStore="eip-gd-delivered-store">
-				<os:value><![CDATA[#[output application/java --- { orderId: vars.vStored.orderId, status: 'DELIVERED', attempts: vars.vStored.attempts + 1, deliveredAt: now() as String }]]]></os:value>
-			</os:store>
-			<os:remove doc:name="Remove Order From Outbox" key="#[vars.vStored.orderId]" objectStore="eip-gd-outbox-store" />
+		<set-variable doc:name="SET vAttempt" variableName="vAttempt" value="#[vars.vStored.attempts + 1]" />
+		<try doc:name="Try Forward One Order">
+			<try doc:name="Try Forward To Fulfilment">
+				<http:request doc:name="POST Order To Fulfilment" config-ref="eip-self-http-request-config" method="POST" path="/eip/fulfilment/orders">
+					<http:body><![CDATA[#[output application/json --- vars.vStored.order]]]></http:body>
+				</http:request>
+				<os:store doc:name="Record Delivery" key="#[vars.vStored.orderId]" objectStore="eip-gd-delivered-store">
+					<os:value><![CDATA[#[output application/java --- { orderId: vars.vStored.orderId, status: 'DELIVERED', attempts: vars.vAttempt, deliveredAt: now() as String }]]]></os:value>
+				</os:store>
+				<os:remove doc:name="Remove Order From Outbox" key="#[vars.vStored.orderId]" objectStore="eip-gd-outbox-store" />
+				<error-handler>
+					<on-error-continue doc:name="On Error Continue (fulfilment rejected the order, move it aside)" type="HTTP:BAD_REQUEST, HTTP:UNAUTHORIZED, HTTP:FORBIDDEN, HTTP:NOT_FOUND, HTTP:METHOD_NOT_ALLOWED, HTTP:NOT_ACCEPTABLE, HTTP:UNSUPPORTED_MEDIA_TYPE" logException="false">
+						<set-variable doc:name="SET vReason" variableName="vReason" value="#['rejected by fulfilment: ' ++ error.errorType.namespace ++ ':' ++ error.errorType.identifier]" />
+						<flow-ref doc:name="Refer to sf-move-order-to-dead-store" name="sf-move-order-to-dead-store" />
+					</on-error-continue>
+					<on-error-continue doc:name="On Error Continue (any other failure, keep for redelivery up to the limit)" type="ANY" logException="false">
+						<set-variable doc:name="SET vLastError" variableName="vLastError" value="#[error.errorType.namespace ++ ':' ++ error.errorType.identifier]" />
+						<choice doc:name="Check Attempt Limit">
+							<when expression="#[vars.vAttempt &gt;= (p('eip.guaranteedDelivery.maxAttempts') as Number)]">
+								<set-variable doc:name="SET vReason" variableName="vReason" value="#['not delivered after ' ++ (vars.vAttempt as String) ++ ' attempts, last error ' ++ vars.vLastError]" />
+								<flow-ref doc:name="Refer to sf-move-order-to-dead-store" name="sf-move-order-to-dead-store" />
+							</when>
+							<otherwise>
+								<os:store doc:name="Keep Order In Outbox With Attempt" key="#[vars.vStored.orderId]" objectStore="eip-gd-outbox-store">
+									<os:value><![CDATA[#[output application/java --- vars.vStored ++ { attempts: vars.vAttempt, lastError: vars.vLastError }]]]></os:value>
+								</os:store>
+								<logger doc:name="WARN: Log delivery failed" level="WARN" message="#['Order ' ++ vars.vStored.orderId ++ ' not delivered, kept for redelivery: ' ++ vars.vLastError ++ ', correlationId=' ++ correlationId]" />
+							</otherwise>
+						</choice>
+					</on-error-continue>
+				</error-handler>
+			</try>
 			<error-handler>
-				<on-error-continue doc:name="On Error Continue (fulfilment unavailable, keep for redelivery)" type="HTTP:INTERNAL_SERVER_ERROR, HTTP:BAD_GATEWAY, HTTP:SERVICE_UNAVAILABLE, HTTP:GATEWAY_TIMEOUT, HTTP:CONNECTIVITY, HTTP:TIMEOUT" logException="false">
-					<os:store doc:name="Keep Order In Outbox With Attempt" key="#[vars.vStored.orderId]" objectStore="eip-gd-outbox-store">
-						<os:value><![CDATA[#[output application/java --- vars.vStored ++ { attempts: vars.vStored.attempts + 1, lastError: error.errorType.namespace ++ ':' ++ error.errorType.identifier }]]]></os:value>
-					</os:store>
-					<logger doc:name="WARN: Log delivery failed" level="WARN" message="#['Order ' ++ vars.vStored.orderId ++ ' not delivered, kept for redelivery: ' ++ error.errorType.identifier ++ ', correlationId=' ++ correlationId]" />
+				<on-error-continue doc:name="On Error Continue (bookkeeping failed, the order stays as it was)" type="ANY" logException="true">
+					<logger doc:name="ERROR: Log order left as it was" level="ERROR" message="#['Order ' ++ vars.vStored.orderId ++ ' left in the outbox as it was: ' ++ error.errorType.identifier ++ ', correlationId=' ++ correlationId]" />
 				</on-error-continue>
 			</error-handler>
 		</try>
 	</sub-flow>
 
-	<flow name="order-get-guaranteed-delivery-status" doc:description="GET /eip/orders/guaranteed/{orderId}: STORED while the order is in the outbox, DELIVERED once fulfilment accepted it, 404 otherwise.">
+	<sub-flow name="sf-move-order-to-dead-store" doc:description="Moves an order aside to the dead (quarantine) store with its attempts, last error and reason, then removes it from the outbox, so the forwarder stops sending it.">
+		<os:store doc:name="Store Order In Dead Store" key="#[vars.vStored.orderId]" objectStore="eip-gd-dead-store">
+			<os:value><![CDATA[#[output application/java --- vars.vStored ++ { status: 'DEAD', attempts: vars.vAttempt, lastError: error.errorType.namespace ++ ':' ++ error.errorType.identifier, reason: vars.vReason, deadAt: now() as String }]]]></os:value>
+		</os:store>
+		<os:remove doc:name="Remove Dead Order From Outbox" key="#[vars.vStored.orderId]" objectStore="eip-gd-outbox-store" />
+		<logger doc:name="WARN: Log order moved aside" level="WARN" message="#['Order ' ++ vars.vStored.orderId ++ ' moved to the dead store: ' ++ vars.vReason ++ ', correlationId=' ++ correlationId]" />
+	</sub-flow>
+
+	<flow name="order-get-guaranteed-delivery-status" doc:description="GET /eip/orders/guaranteed/{orderId}: STORED while the order is in the outbox, DELIVERED once fulfilment accepted it, DEAD once it was moved aside, 404 otherwise.">
 		<http:listener doc:name="GET /eip/orders/guaranteed/{orderId}" config-ref="http-listener-config" path="/eip/orders/guaranteed/{orderId}" allowedMethods="GET">
 			<http:response statusCode="#[vars.httpStatus default 200]" />
 		</http:listener>
@@ -115,12 +170,18 @@
 		<os:retrieve doc:name="Read Delivery" key="#[vars.vOrderId]" objectStore="eip-gd-delivered-store" target="vDelivered">
 			<os:default-value><![CDATA[#[output application/java --- {}]]]></os:default-value>
 		</os:retrieve>
+		<os:retrieve doc:name="Read Dead Entry" key="#[vars.vOrderId]" objectStore="eip-gd-dead-store" target="vDead">
+			<os:default-value><![CDATA[#[output application/java --- {}]]]></os:default-value>
+		</os:retrieve>
 		<choice doc:name="Check Order Known">
 			<when expression="#[not isEmpty(vars.vStored)]">
 				<set-payload doc:name="Set Stored Status" value="#[output application/json --- { orderId: vars.vOrderId, status: 'STORED', attempts: vars.vStored.attempts, (lastError: vars.vStored.lastError) if (vars.vStored.lastError != null) }]" />
 			</when>
 			<when expression="#[not isEmpty(vars.vDelivered)]">
 				<set-payload doc:name="Set Delivered Status" value="#[output application/json --- vars.vDelivered]" />
+			</when>
+			<when expression="#[not isEmpty(vars.vDead)]">
+				<set-payload doc:name="Set Dead Status" value="#[output application/json --- { orderId: vars.vOrderId, status: 'DEAD', attempts: vars.vDead.attempts, lastError: vars.vDead.lastError, reason: vars.vDead.reason }]" />
 			</when>
 			<otherwise>
 				<raise-error doc:name="Raise NOT_FOUND Error - Unknown order" type="APP:NOT_FOUND" description="Order not found" />
