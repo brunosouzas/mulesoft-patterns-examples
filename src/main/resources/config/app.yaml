@@ -45,3 +45,8 @@ eip:
   # Scatter-gather: the longest the order checks may take together before the routes still running fail.
   scatterGather:
     timeoutMillis: "10000"
+  # Claim check: how long a checked-in order document can be claimed before the store drops it (short, so
+  # the demo and the tests can show a claim expiring), and how often the store looks for expired entries.
+  claimCheck:
+    ttlSeconds: "3"
+    expirationIntervalSeconds: "1"

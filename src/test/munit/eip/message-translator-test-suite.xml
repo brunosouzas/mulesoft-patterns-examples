@@ -1,0 +1,72 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<mule xmlns="http://www.mulesoft.org/schema/mule/core"
+	xmlns:munit="http://www.mulesoft.org/schema/mule/munit"
+	xmlns:munit-tools="http://www.mulesoft.org/schema/mule/munit-tools"
+	xmlns:doc="http://www.mulesoft.org/schema/mule/documentation"
+	xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+	xsi:schemaLocation="http://www.mulesoft.org/schema/mule/core http://www.mulesoft.org/schema/mule/core/current/mule.xsd
+		http://www.mulesoft.org/schema/mule/munit http://www.mulesoft.org/schema/mule/munit/current/mule-munit.xsd
+		http://www.mulesoft.org/schema/mule/munit-tools http://www.mulesoft.org/schema/mule/munit-tools/current/mule-munit-tools.xsd">
+
+	<!--
+		Message translator: a partner order in CSV (one row per line) becomes this app's JSON order. The tests show the
+		three things the translation changes (structure, types, codes) and that an untranslatable row rejects the order.
+	-->
+	<munit:config name="message-translator-test-suite.xml" />
+
+	<munit:test name="mt-partner-csv-rows-become-one-order" description="Message translator: two CSV rows of partner order P-77 become one order with two items, numeric quantities, prices in units and this app's SKUs and ids">
+		<munit:execution>
+			<munit:set-event doc:name="Partner order P-77 as CSV">
+				<munit:payload value="#['partnerOrderRef,buyerCode,shipToCountry,productCode,qty,unitPriceCents\nP-77,B-100,br,BOOK-01,2,3000\nP-77,B-100,br,MUG-02,1,1250\n']" mediaType="application/csv" />
+			</munit:set-event>
+			<flow-ref doc:name="POST /eip/orders/translate" name="order-translate-partner-csv" />
+		</munit:execution>
+		<munit:validation>
+			<munit-tools:assert-that doc:name="200: no error status set" expression="#[vars.httpStatus]" is="#[MunitTools::nullValue()]" />
+			<munit-tools:assert-that doc:name="JSON out" expression="#[payload.^mimeType]" is="#[MunitTools::equalTo('application/json')]" />
+			<munit-tools:assert-that doc:name="Order id from partner ref" expression="#[payload.orderId]" is="#[MunitTools::equalTo('ORD-P-77')]" />
+			<munit-tools:assert-that doc:name="Customer id from buyer code" expression="#[payload.customerId]" is="#[MunitTools::equalTo('CUS-B-100')]" />
+			<munit-tools:assert-that doc:name="Country upper-cased" expression="#[payload.country]" is="#[MunitTools::equalTo('BR')]" />
+			<munit-tools:assert-that doc:name="Rows became items" expression="#[payload.items]" is="#[MunitTools::equalTo([{sku: 'SKU-BOOK', quantity: 2, unitPrice: 30}, {sku: 'SKU-MUG', quantity: 1, unitPrice: 12.5}])]" />
+			<munit-tools:assert-that doc:name="Quantity is a number, not the CSV string" expression="#[payload.items[0].quantity is Number]" is="#[MunitTools::equalTo(true)]" />
+		</munit:validation>
+	</munit:test>
+
+	<munit:test name="mt-unknown-product-code-rejects-the-whole-order" description="Message translator: a row whose product code has no SKU makes the order 400 naming the code, instead of an item with a null SKU">
+		<munit:execution>
+			<munit:set-event doc:name="Order with an unknown product">
+				<munit:payload value="#['partnerOrderRef,buyerCode,shipToCountry,productCode,qty,unitPriceCents\nP-78,B-100,BR,BOOK-01,1,3000\nP-78,B-100,BR,LAMP-99,1,5000\n']" mediaType="application/csv" />
+			</munit:set-event>
+			<flow-ref doc:name="POST /eip/orders/translate" name="order-translate-partner-csv" />
+		</munit:execution>
+		<munit:validation>
+			<munit-tools:assert-that doc:name="400" expression="#[vars.httpStatus as Number]" is="#[MunitTools::equalTo(400)]" />
+			<munit-tools:assert-that doc:name="Names the code" expression="#[payload.error]" is="#[MunitTools::equalTo('unknown product code: LAMP-99')]" />
+		</munit:validation>
+	</munit:test>
+
+	<munit:test name="mt-rows-of-two-orders-are-rejected" description="Message translator: rows of two partner orders in one request are rejected with 400, because they would be merged into one order">
+		<munit:execution>
+			<munit:set-event doc:name="Rows of P-79 and P-80">
+				<munit:payload value="#['partnerOrderRef,buyerCode,shipToCountry,productCode,qty,unitPriceCents\nP-79,B-100,BR,BOOK-01,1,3000\nP-80,B-200,BR,MUG-02,1,1250\n']" mediaType="application/csv" />
+			</munit:set-event>
+			<flow-ref doc:name="POST /eip/orders/translate" name="order-translate-partner-csv" />
+		</munit:execution>
+		<munit:validation>
+			<munit-tools:assert-that doc:name="400" expression="#[vars.httpStatus as Number]" is="#[MunitTools::equalTo(400)]" />
+			<munit-tools:assert-that doc:name="Reason" expression="#[payload.error]" is="#[MunitTools::equalTo('all rows of a request must belong to the same partnerOrderRef')]" />
+		</munit:validation>
+	</munit:test>
+
+	<munit:test name="mt-non-numeric-quantity-is-rejected" description="Message translator: a quantity that is not a whole number is rejected with 400 before the transform tries to read it as a number">
+		<munit:execution>
+			<munit:set-event doc:name="Order with qty 'two'">
+				<munit:payload value="#['partnerOrderRef,buyerCode,shipToCountry,productCode,qty,unitPriceCents\nP-81,B-100,BR,BOOK-01,two,3000\n']" mediaType="application/csv" />
+			</munit:set-event>
+			<flow-ref doc:name="POST /eip/orders/translate" name="order-translate-partner-csv" />
+		</munit:execution>
+		<munit:validation>
+			<munit-tools:assert-that doc:name="400" expression="#[vars.httpStatus as Number]" is="#[MunitTools::equalTo(400)]" />
+		</munit:validation>
+	</munit:test>
+</mule>

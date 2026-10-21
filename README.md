@@ -26,7 +26,7 @@ curl -s 'localhost:8081/lsp/before/orders/ORD-1001?provider=new'
 mvn clean test
 ```
 
-MUnit runs on the Mule Enterprise runtime, so Maven needs access to the MuleSoft Enterprise repository (credentials in `~/.m2/settings.xml`, as in any MuleSoft project). The build fails below 80% application coverage; the current suites cover 93 cases at about 99%.
+MUnit runs on the Mule Enterprise runtime, so Maven needs access to the MuleSoft Enterprise repository (credentials in `~/.m2/settings.xml`, as in any MuleSoft project). The build fails below 80% application coverage; the current suites cover 119 cases at about 99.7%.
 
 ## SOLID in MuleSoft
 
@@ -51,7 +51,7 @@ Notes:
 
 ## Enterprise Integration Patterns
 
-In progress. Patterns from Hohpe and Woolf's *Enterprise Integration Patterns*, implemented in Mule 4 around one scenario: an order is routed, charged and paid by a payment provider, its stock is reserved, and it is invoiced. Every runnable example uses HTTP and object stores only (plus the Aggregators module for the aggregator), so it needs no broker and no external system.
+In progress. Patterns from Hohpe and Woolf's *Enterprise Integration Patterns*, implemented in Mule 4 around one scenario: an order is routed, charged and paid by a payment provider, its stock is reserved, and it is invoiced. Every runnable example uses HTTP, DataWeave and object stores only (plus the Aggregators module for the aggregator), so it needs no broker and no external system.
 
 **Wave 1, messaging and reliability:**
 
@@ -73,6 +73,16 @@ In progress. Patterns from Hohpe and Woolf's *Enterprise Integration Patterns*, 
 | Recipient list | The recipients of a new order are computed from it (invoicing always; warehouse for physical items; digital delivery for digital items; customs for physical items shipped abroad), and a For Each sends the order to each one over HTTP, with the path looked up in configuration (`eip.recipientList.paths`). Each delivery is in its own Try, so one failing recipient is recorded `FAILED` and the others are still notified. A partial failure still answers 200, with `allDelivered: false`: each notification stands on its own, the ones delivered are done and the failed ones are reported for a retry. Scatter-gather answers 503 instead, because its decision cannot be made without every reply. In the book, Scatter-Gather is a Recipient List plus an Aggregator | [`eip/recipient-list/`](src/main/mule/eip/recipient-list) | `POST /eip/orders/notifications`, `POST /eip/recipients/{recipient}/orders` (simulated downstream systems), `GET /eip/orders/{orderId}/notifications` |
 | Scatter-gather | Before an order is accepted, a Scatter-Gather runs three checks in parallel against simulated services (pricing, stock, fraud) and combines them: `REJECTED` when an item is out of stock, `REVIEW` for a high-risk customer, else `ACCEPTED`. When one route fails, the others still finish and Scatter-Gather raises `MULE:COMPOSITE_ROUTING`; its `error.errorMessage.payload` holds the `results` of the successful routes and the `failures` of the failed one, by route key, and the endpoint answers 503 with that partial result (`INCOMPLETE`) | [`eip/scatter-gather/`](src/main/mule/eip/scatter-gather) | `POST /eip/orders/checks`, `POST /eip/services/{pricing\|stock\|fraud}` (simulated services) |
 
+**Wave 3, transformation:**
+
+| Pattern | Scenario | Code | Endpoints |
+|---|---|---|---|
+| Message translator | A partner sends an order as CSV, one row per line; a Transform Message (DataWeave) turns it into this app's JSON order. The translation changes the structure (rows become one order with an items array), the types (CSV strings become numbers, cents become units) and the codes (partner product codes become SKUs through a lookup module). A row whose product code has no SKU, or rows of two orders, make the request 400 instead of producing an order that looks valid and is wrong | [`eip/message-translator/`](src/main/mule/eip/message-translator) | `POST /eip/orders/translate` (`application/csv`) |
+| Canonical data model | Orders arrive from the marketplace (JSON) and from a partner (XML purchase order) and go to invoicing (JSON) and the warehouse (CSV pick list). Every source translates into one canonical order and every target from it: N + M translators, as DataWeave modules in [`src/main/resources/dwl/canonical/`](src/main/resources/dwl/canonical), instead of N × M. With two and two both are 4; the gain is the next one, since a third source needs one translator, not one per target. The canonical order is validated once, whatever the source | [`eip/canonical-data-model/`](src/main/mule/eip/canonical-data-model) | `POST /eip/canonical/orders/marketplace`, `POST /eip/canonical/orders/partner` (`application/xml`) |
+| Content filter | A paid order carries the card, contact details, item costs, suppliers and internal notes. Before it goes to the (simulated) invoicing system, a Transform keeps only what invoicing needs, flattened (`customerId`, `customerName`, `taxId`, `billingCountry`, `paymentReference`, `lines`). It selects and flattens and computes nothing: no total, which is invoicing's job. The filter is an allow list: a field the order gains later does not reach invoicing until someone adds it to the transform | [`eip/content-filter/`](src/main/mule/eip/content-filter) | `POST /eip/billing/invoice-requests`, `POST /eip/invoicing/invoices` and `GET /eip/invoicing/invoices/{orderId}` (simulated invoicing) |
+| Claim check | An order's document (base64) is checked in to an object store under a claim key; only `{ orderId, claimKey, fileName }` is sent to the (simulated) archive, which checks the document out with the key. Checking out does not remove it: the claim is valid until the store's `entryTtl` (`eip.claimCheck.ttlSeconds`, 3 seconds here) ends, and then the key gets 404 (`OS:KEY_NOT_FOUND` turned into `APP:NOT_FOUND`) | [`eip/claim-check/`](src/main/mule/eip/claim-check) | `POST /eip/orders/documents`, `GET /eip/orders/documents/{claimKey}`, `POST /eip/archive/documents` (simulated archive) |
+| Content enricher | An order with only a `customerId` gets the customer's name, tier and shipping address from a (simulated) CRM. Mule 4 has no enricher scope: the HTTP request stores the answer in a target variable (`target="vCustomer"`, `targetValue="#[payload.customer]"`), so the order is still the payload after the call and a Transform merges the two. When the CRM is down (503, unreachable or timed out) the target variable is not set and the order is not passed on: 503 with `enrichment: FAILED`. An unknown customer is 400 | [`eip/content-enricher/`](src/main/mule/eip/content-enricher) | `POST /eip/orders/enrich`, `GET /eip/services/customers/{customerId}` (simulated CRM; `CUS-DOWN...` answers 503) |
+
 The MUnit suites are in [`src/test/munit/eip/`](src/test/munit/eip), one per pattern. What the wave 1 suites show, observed on Mule 4.9.17 with MUnit 3.7.1:
 
 - With no `objectStore`, the idempotent validator keeps IDs in memory for 5 minutes (the defaults in the 4.9.17 runtime's `IdempotentMessageValidator`). Three different orders posted over HTTP from one For Each give `accepted,duplicate,duplicate`; with `idExpression="#[payload.orderId]"` they give `accepted,accepted,accepted`.
@@ -88,6 +98,14 @@ What the wave 2 suites show, observed on Mule 4.9.17 with MUnit 3.7.1 and Aggreg
 - The aggregator answers 202, 202, 201 to the three items of an order sent by the client, and groups interleaved items of two orders by `orderId`. The timeout test waits for the group to time out (5 seconds, checked by the module once a second), so the aggregator suite takes about 9 seconds.
 - With the fraud route failing (`HTTP:SERVICE_UNAVAILABLE`), the pricing and stock routes still run once each, and their results are read from the `MULE:COMPOSITE_ROUTING` error (`sg-failed-route-raises-composite-routing-with-the-other-results`). The 503 body names each failed check by error type only; the error description is logged, not returned.
 - In the recipient list, the simulated warehouse answers 503 to an order whose `orderId` starts with `ORD-WAREHOUSE-DOWN`: its delivery is recorded `FAILED` with `HTTP:SERVICE_UNAVAILABLE`, and the recipient after it is still notified (`rl-failed-recipient-does-not-stop-the-others`).
+
+What the wave 3 suites show, observed on Mule 4.9.17 with MUnit 3.7.1:
+
+- The message translator turns two CSV rows into one order with numeric quantities (`2`, not `"2"`) and prices in units (`1250` cents become `12.5`); an unknown product code is rejected by name (`unknown product code: LAMP-99`).
+- The same order sent by the marketplace as JSON and by a partner as XML gives the same canonical items and the same invoicing lines, total and warehouse rows; only the ids and `source` differ (`cdm-partner-xml-gives-the-same-target-documents`). The target translators are called with a canonical order alone, without any source, and they take the `CanonicalOrder` type, so an order without a currency fails at the call (`cdm-module-target-translator-rejects-an-order-that-is-not-canonical`). An order without a currency, or with lines in two currencies, gets 400; no currency is assumed.
+- What the simulated invoicing system received has exactly the seven allowed fields; the card number and the email do not appear anywhere in it, and neither does a `loyaltyCardNumber` added to the order (`cf-field-added-to-the-order-later-does-not-leak`).
+- For a 200,000-byte document the archive receives a message with three fields (`orderId`, `claimKey`, `fileName`) and still archives 200,000 bytes, fetched with the key. The same key works again after the archive has used it, and 5 seconds after check-in it gets 404 (`cc-claim-expires-after-its-time-to-live`), so the claim check suite takes about 6 seconds. Over real HTTP, check-in answers 202 and check-out answers 200 with the document as `application/json` (`cc-check-out-does-not-remove-the-document`).
+- In the content enricher, a spy before the merge sees the order as payload after the CRM call, and `vars.vCustomer` holds only the customer part of the answer (no `meta`), while the payload still has only the order's keys (`orderId`, `customerId`, `items`). When the CRM answers 503, a value that `vCustomer` held before the call is still there afterwards (`ce-crm-down-sets-no-target-variable-and-returns-503`), the merge does not run and the endpoint answers 503; `HTTP:CONNECTIVITY` and `HTTP:TIMEOUT` give the same 503 (`ce-crm-unreachable-returns-503`, `ce-crm-timeout-returns-503`).
 
 Notes:
 
@@ -130,7 +148,23 @@ src/main/mule/
     scatter-gather/
       scatter-gather.xml           parallel order checks, MULE:COMPOSITE_ROUTING handler
       scatter-gather-services.xml  simulated pricing, stock and fraud services
-src/main/resources/config/app.yaml   port, OCP payment routing, DIP repository choice, EIP self-call host, callback path and routing settings
+    message-translator/
+      message-translator.xml       partner CSV order lines translated into the app's order
+    canonical-data-model/
+      canonical-data-model.xml     two source flows, one canonical order, two target documents
+    content-filter/
+      content-filter.xml           paid order filtered down to an invoice request
+      content-filter-invoicing.xml simulated invoicing system that keeps what it received
+    claim-check/
+      claim-check.xml              check in, claim message, check out, store with a time to live
+      claim-check-archive.xml      simulated archive that checks the document out with the key
+    content-enricher/
+      content-enricher.xml         HTTP request with a target variable, merge, CRM-down handling
+      content-enricher-crm.xml     simulated customer service (CRM)
+src/main/resources/config/app.yaml   port, OCP payment routing, DIP repository choice, EIP self-call host, callback path, routing and claim check settings
+src/main/resources/dwl/
+  translator/PartnerProducts.dwl     partner product codes -> SKUs (message translator)
+  canonical/                         CanonicalOrder (type, validation), FromMarketplace, FromPartnerXml, ToInvoicing, ToWarehouse
 src/test/munit/
   solid/<principle>-test-suite.xml
   eip/<pattern>-test-suite.xml

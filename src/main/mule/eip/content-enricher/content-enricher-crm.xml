@@ -1,0 +1,39 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<mule xmlns="http://www.mulesoft.org/schema/mule/core"
+	xmlns:http="http://www.mulesoft.org/schema/mule/http"
+	xmlns:ee="http://www.mulesoft.org/schema/mule/ee/core"
+	xmlns:doc="http://www.mulesoft.org/schema/mule/documentation"
+	xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+	xsi:schemaLocation="http://www.mulesoft.org/schema/mule/core http://www.mulesoft.org/schema/mule/core/current/mule.xsd
+		http://www.mulesoft.org/schema/mule/http http://www.mulesoft.org/schema/mule/http/current/mule-http.xsd
+		http://www.mulesoft.org/schema/mule/ee/core http://www.mulesoft.org/schema/mule/ee/core/current/mule-ee.xsd">
+
+	<!--
+		CONTENT ENRICHER: the customer service (CRM), simulated on this application with synthetic customers.
+		GET /eip/services/customers/{customerId}
+		  -> 200 { customer: { id, name, tier, shippingAddress }, meta: { source, fetchedAt } }
+		  -> 404 for an unknown customer
+		  -> 503 for a customerId starting with CUS-DOWN, to show the enricher failing
+	-->
+	<flow name="service-get-customer" doc:description="Simulated CRM: GET /eip/services/customers/{customerId} returns a synthetic customer, 404 for an unknown one and 503 for CUS-DOWN... ids.">
+		<http:listener doc:name="GET /eip/services/customers/{customerId}" config-ref="http-listener-config" path="/eip/services/customers/{customerId}" allowedMethods="GET">
+			<http:response statusCode="#[vars.httpStatus default 200]" />
+		</http:listener>
+		<ee:transform doc:name="Look Up Customer (simulated)">
+			<ee:message>
+				<ee:set-payload><![CDATA[%dw 2.0
+output application/json
+var customers = {
+	"CUS-100": { name: "Ana Lima", tier: "GOLD", shippingAddress: { street: "Rua A, 1", city: "Sao Paulo", country: "BR" } },
+	"CUS-200": { name: "John Smith", tier: "STANDARD", shippingAddress: { street: "1 Main St", city: "Austin", country: "US" } }
+}
+var id = attributes.uriParams.customerId
+---
+if (id startsWith "CUS-DOWN") { error: "CRM unavailable" }
+else if (customers[id] == null) { error: "customer " ++ id ++ " not found" }
+else { customer: { id: id } ++ customers[id], meta: { source: "CRM", fetchedAt: now() as String } }]]></ee:set-payload>
+			</ee:message>
+		</ee:transform>
+		<set-variable doc:name="SET httpStatus" variableName="httpStatus" value="#[if (payload.customer != null) 200 else if (payload.error == 'CRM unavailable') 503 else 404]" />
+	</flow>
+</mule>
