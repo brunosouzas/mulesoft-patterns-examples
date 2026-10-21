@@ -2,11 +2,13 @@
 <mule xmlns="http://www.mulesoft.org/schema/mule/core"
 	xmlns:munit="http://www.mulesoft.org/schema/mule/munit"
 	xmlns:munit-tools="http://www.mulesoft.org/schema/mule/munit-tools"
+	xmlns:http="http://www.mulesoft.org/schema/mule/http"
 	xmlns:doc="http://www.mulesoft.org/schema/mule/documentation"
 	xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
 	xsi:schemaLocation="http://www.mulesoft.org/schema/mule/core http://www.mulesoft.org/schema/mule/core/current/mule.xsd
 		http://www.mulesoft.org/schema/mule/munit http://www.mulesoft.org/schema/mule/munit/current/mule-munit.xsd
-		http://www.mulesoft.org/schema/mule/munit-tools http://www.mulesoft.org/schema/mule/munit-tools/current/mule-munit-tools.xsd">
+		http://www.mulesoft.org/schema/mule/munit-tools http://www.mulesoft.org/schema/mule/munit-tools/current/mule-munit-tools.xsd
+		http://www.mulesoft.org/schema/mule/http http://www.mulesoft.org/schema/mule/http/current/mule-http.xsd">
 
 	<!--
 		Canonical data model: the same order sent by the marketplace (JSON) and by a partner (XML) becomes the same
@@ -116,6 +118,44 @@
 		<munit:validation>
 			<munit-tools:assert-that doc:name="400" expression="#[vars.httpStatus as Number]" is="#[MunitTools::equalTo(400)]" />
 			<munit-tools:assert-that doc:name="Item rule named" expression="#[payload.error]" is="#[MunitTools::equalTo('every item needs a sku, a quantity above zero and a unit price')]" />
+		</munit:validation>
+	</munit:test>
+	<munit:test name="cdm-over-http-errors-answer-400-and-success-200" description="Canonical data model over HTTP: both source listeners answer the status the error handler set, so an invalid marketplace or partner order is 400 in JSON, not 200; a valid one is 200">
+		<munit:enable-flow-sources>
+			<munit:enable-flow-source value="canonical-order-from-marketplace" />
+			<munit:enable-flow-source value="canonical-order-from-partner" />
+		</munit:enable-flow-sources>
+		<munit:execution>
+			<http:request doc:name="POST valid marketplace order" config-ref="eip-self-http-request-config" method="POST" path="/eip/canonical/orders/marketplace" target="vOk" targetValue="#[output application/java --- { status: attributes.statusCode, contentType: attributes.headers.'content-type' default '', body: payload }]">
+				<http:body><![CDATA[#[output application/json --- {id: 'MK-510', buyer: {accountId: 'A-9'}, shipping: {country: 'BR'}, lines: [{listing: {sku: 'SKU-BOOK'}, units: 1, price: {amount: '30.00', currency: 'BRL'}}]}]]]></http:body>
+				<http:headers><![CDATA[#[{ 'Content-Type': 'application/json' }]]]></http:headers>
+				<http:response-validator>
+					<http:success-status-code-validator values="200..599" />
+				</http:response-validator>
+			</http:request>
+			<http:request doc:name="POST marketplace order without buyer" config-ref="eip-self-http-request-config" method="POST" path="/eip/canonical/orders/marketplace" target="vNoBuyer" targetValue="#[output application/java --- { status: attributes.statusCode, contentType: attributes.headers.'content-type' default '', body: payload }]">
+				<http:body><![CDATA[#[output application/json --- {id: 'MK-511', shipping: {country: 'BR'}, lines: [{listing: {sku: 'SKU-BOOK'}, units: 1, price: {amount: '30.00', currency: 'BRL'}}]}]]]></http:body>
+				<http:headers><![CDATA[#[{ 'Content-Type': 'application/json' }]]]></http:headers>
+				<http:response-validator>
+					<http:success-status-code-validator values="200..599" />
+				</http:response-validator>
+			</http:request>
+			<http:request doc:name="POST partner order without currency" config-ref="eip-self-http-request-config" method="POST" path="/eip/canonical/orders/partner" target="vNoCurrency" targetValue="#[output application/java --- { status: attributes.statusCode, contentType: attributes.headers.'content-type' default '', body: payload }]">
+				<http:body><![CDATA[#[output application/xml --- {PurchaseOrder @(number: 'PO-81'): {Customer @(code: 'A-9'): null, ShipTo @(country: 'BR'): null, Lines: {Line @(sku: 'SKU-BOOK', quantity: '1', unitPrice: '30.00'): null}}}]]]></http:body>
+				<http:headers><![CDATA[#[{ 'Content-Type': 'application/xml' }]]]></http:headers>
+				<http:response-validator>
+					<http:success-status-code-validator values="200..599" />
+				</http:response-validator>
+			</http:request>
+		</munit:execution>
+		<munit:validation>
+			<munit-tools:assert-that doc:name="Valid 200" expression="#[vars.vOk.status]" is="#[MunitTools::equalTo(200)]" />
+			<munit-tools:assert-that doc:name="Canonical order id" expression="#[vars.vOk.body.canonicalOrder.orderId]" is="#[MunitTools::equalTo('ORD-MK-510')]" />
+			<munit-tools:assert-that doc:name="Marketplace 400" expression="#[vars.vNoBuyer.status]" is="#[MunitTools::equalTo(400)]" />
+			<munit-tools:assert-that doc:name="JSON" expression="#[vars.vNoBuyer.contentType]" is="#[MunitTools::startsWith('application/json')]" />
+			<munit-tools:assert-that doc:name="Canonical field named" expression="#[vars.vNoBuyer.body.error]" is="#[MunitTools::equalTo('customerId is required')]" />
+			<munit-tools:assert-that doc:name="Partner 400" expression="#[vars.vNoCurrency.status]" is="#[MunitTools::equalTo(400)]" />
+			<munit-tools:assert-that doc:name="Currency rule named" expression="#[vars.vNoCurrency.body.error]" is="#[MunitTools::equalTo('currency is required')]" />
 		</munit:validation>
 	</munit:test>
 </mule>

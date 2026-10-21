@@ -22,7 +22,9 @@
 
 	<!-- Callee: reports the header it received and the correlationId its own event got. -->
 	<flow name="mule-correlation-id-echo">
-		<http:listener doc:name="GET /eip/correlation-id/echo" config-ref="http-listener-config" path="/eip/correlation-id/echo" allowedMethods="GET" />
+		<http:listener doc:name="GET /eip/correlation-id/echo" config-ref="http-listener-config" path="/eip/correlation-id/echo" allowedMethods="GET">
+			<http:response statusCode="#[vars.httpStatus default 200]" />
+		</http:listener>
 		<ee:transform doc:name="What arrived">
 			<ee:message>
 				<ee:set-payload><![CDATA[%dw 2.0
@@ -35,7 +37,9 @@ output application/json
 
 	<!-- Caller with the default (sendCorrelationId AUTO): the callee receives this flow's correlationId. -->
 	<flow name="mule-correlation-id-call-default">
-		<http:listener doc:name="GET /eip/correlation-id/call/default" config-ref="http-listener-config" path="/eip/correlation-id/call/default" allowedMethods="GET" />
+		<http:listener doc:name="GET /eip/correlation-id/call/default" config-ref="http-listener-config" path="/eip/correlation-id/call/default" allowedMethods="GET">
+			<http:response statusCode="#[vars.httpStatus default 200]" />
+		</http:listener>
 		<http:request doc:name="Call echo (default)" config-ref="eip-self-http-request-config" method="GET" path="/eip/correlation-id/echo" />
 		<ee:transform doc:name="Compare IDs">
 			<ee:message>
@@ -49,7 +53,9 @@ output application/json
 
 	<!-- Caller with sendCorrelationId="NEVER": no header, so the callee gets a new correlationId. -->
 	<flow name="mule-correlation-id-call-never">
-		<http:listener doc:name="GET /eip/correlation-id/call/never" config-ref="http-listener-config" path="/eip/correlation-id/call/never" allowedMethods="GET" />
+		<http:listener doc:name="GET /eip/correlation-id/call/never" config-ref="http-listener-config" path="/eip/correlation-id/call/never" allowedMethods="GET">
+			<http:response statusCode="#[vars.httpStatus default 200]" />
+		</http:listener>
 		<http:request doc:name="Call echo (NEVER)" config-ref="eip-self-http-request-config" method="GET" path="/eip/correlation-id/echo" sendCorrelationId="NEVER" />
 		<ee:transform doc:name="Compare IDs">
 			<ee:message>
