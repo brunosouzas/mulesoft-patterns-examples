@@ -21,12 +21,15 @@
 		    items: [ { sku, quantity, unitPrice, unitCost, supplier } ], internalNotes }
 		-> to invoicing:
 		  { orderId, customerId, customerName, taxId, billingCountry, paymentReference,
-		    lines: [ { sku, quantity, unitPrice } ], total }
+		    lines: [ { sku, quantity, unitPrice } ] }
 
 		The filter is written as an allow list: the output names every field it keeps. Removing the known
 		sensitive fields instead (payload - "payment") would also pass on any field added to the order later, such
 		as a new card or loyalty number, without anyone deciding that invoicing should have it. With the allow list,
 		a new field reaches invoicing only when it is added to the transform.
+
+		The filter only selects and flattens: it computes nothing. The invoice total is not sent; working it out
+		from the lines is the invoicing system's job, not the filter's.
 
 		The invoicing system is simulated on this application (content-filter-invoicing.xml) and keeps the last
 		request it received for each order, so the tests read what actually arrived there.
@@ -54,8 +57,7 @@ output application/json
 	billingCountry: payload.customer.address.country,
 	// The authorization code identifies the payment; the card itself stays here.
 	paymentReference: payload.payment.authorizationCode,
-	lines: payload.items map ((item) -> { sku: item.sku, quantity: item.quantity, unitPrice: item.unitPrice }),
-	total: sum(payload.items map ($.quantity * $.unitPrice))
+	lines: payload.items map ((item) -> { sku: item.sku, quantity: item.quantity, unitPrice: item.unitPrice })
 }]]></ee:set-payload>
 			</ee:message>
 		</ee:transform>
