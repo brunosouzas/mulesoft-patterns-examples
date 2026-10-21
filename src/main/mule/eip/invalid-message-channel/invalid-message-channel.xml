@@ -17,16 +17,19 @@
 		one that is not JSON, is malformed JSON, or misses a required field goes to the invalid-message store with
 		the reason, the content type and the body as received, and is never invoiced.
 		POST /eip/invoices/requests               202 ACCEPTED for a valid request; 400 for an invalid one, which
-		                                         is kept in the invalid message channel
+		                                         is kept in the invalid message channel; 409 for a valid one
+		                                         whose orderId was already accepted
 		GET  /eip/invoices/requests/{orderId}     the accepted request, 404 when there is none
 		GET  /eip/invoices/invalid-messages       what landed in the invalid message channel
 
-		Not the dead letter channel (wave 1): a dead letter channel receives a valid message that could not be
+		Not the dead letter channel (the Dead Letter Channel page of the series): a dead letter channel receives a valid message that could not be
 		delivered or processed (for example after the maximum number of deliveries); the invalid message channel
 		receives a message that is wrong in itself and would fail again however often it is retried. Anypoint MQ has
 		dead-letter queues (https://docs.mulesoft.com/mq/mq-queues) and nothing for invalid messages: the consumer
 		has to recognise them and publish them to a queue of their own.
 
+		The content type is compared in lower case: media types are case-insensitive (RFC 9110, section 8.3.1),
+		so Application/JSON is JSON.
 		The HTTP Listener does not parse the body; DataWeave parses it when the flow first reads it. The flow
 		parses it explicitly, inside a Try, so a malformed body is caught at one place and keeps its raw text
 		(DataWeave JSON format: https://docs.mulesoft.com/dataweave/latest/dataweave-formats-json). The required
@@ -37,14 +40,14 @@
 	<os:object-store name="eip-imc-invoice-requests-store" doc:name="Invoice Requests Object Store" persistent="false" />
 	<os:object-store name="eip-imc-invalid-messages-store" doc:name="Invalid Message Channel Object Store" persistent="false" />
 
-	<flow name="invoice-receive-request" doc:description="Invalid message channel: accepts a valid invoice request; a request that is not JSON, is malformed or misses a field is kept in the invalid message channel with the reason and answered 400.">
+	<flow name="invoice-receive-request" doc:description="Invalid message channel: accepts a valid invoice request (409 when its orderId was already accepted); a request that is not JSON, is malformed or misses a field is kept in the invalid message channel with the reason and answered 400.">
 		<http:listener doc:name="POST /eip/invoices/requests" config-ref="http-listener-config" path="/eip/invoices/requests" allowedMethods="POST">
 			<http:response statusCode="#[vars.httpStatus default 202]" />
 		</http:listener>
 		<set-variable doc:name="SET vContentType" variableName="vContentType" value="#[attributes.headers.'content-type' default '']" />
 		<set-variable doc:name="SET vRawBody" variableName="vRawBody" value="#[if (payload.^raw == null) '' else read(payload.^raw, 'text/plain') as String]" />
 		<choice doc:name="Check Content Type">
-			<when expression="#[not (vars.vContentType startsWith 'application/json')]">
+			<when expression="#[not (lower(vars.vContentType) startsWith 'application/json')]">
 				<set-variable doc:name="SET vReason" variableName="vReason" value="#['unsupported content type: ' ++ (if (isEmpty(vars.vContentType)) 'none' else vars.vContentType)]" />
 			</when>
 			<otherwise>
@@ -86,6 +89,12 @@ else [
 				<flow-ref doc:name="Refer to sf-send-to-invalid-message-channel" name="sf-send-to-invalid-message-channel" />
 			</when>
 			<otherwise>
+				<os:contains doc:name="Check Order Already Accepted" key="#[vars.vRequest.orderId]" objectStore="eip-imc-invoice-requests-store" target="vAlreadyAccepted" />
+				<choice doc:name="Check Not Accepted Already">
+					<when expression="#[vars.vAlreadyAccepted]">
+						<raise-error doc:name="Raise CONFLICT Error - Already accepted" type="APP:CONFLICT" description="Invoice request for this orderId already accepted" />
+					</when>
+				</choice>
 				<os:store doc:name="Store Invoice Request" key="#[vars.vRequest.orderId]" objectStore="eip-imc-invoice-requests-store">
 					<os:value><![CDATA[#[output application/java --- vars.vRequest]]]></os:value>
 				</os:store>

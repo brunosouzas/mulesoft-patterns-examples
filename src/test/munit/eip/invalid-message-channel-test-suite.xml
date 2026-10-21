@@ -175,4 +175,70 @@
 		</munit:validation>
 	</munit:test>
 
+	<munit:test name="imc-content-type-is-matched-in-any-case" description="Invalid message channel: a valid request sent as Application/JSON; charset=UTF-8 is JSON (media types are case-insensitive): 202 ACCEPTED, nothing in the invalid channel">
+		<munit:enable-flow-sources>
+			<munit:enable-flow-source value="invoice-receive-request" />
+			<munit:enable-flow-source value="invoice-get-request" />
+			<munit:enable-flow-source value="invoice-get-invalid-messages" />
+		</munit:enable-flow-sources>
+		<munit:execution>
+			<http:request doc:name="POST mixed-case content type" config-ref="eip-self-http-request-config" method="POST" path="/eip/invoices/requests" target="vPosted" targetValue="#[output application/java --- { status: attributes.statusCode, contentType: attributes.headers.'content-type' default '', body: payload }]">
+				<http:body><![CDATA[#[output text/plain --- '{"orderId":"ORD-IMC-CASE","amount":10,"currency":"EUR"}']]]></http:body>
+				<http:headers><![CDATA[#[output application/java --- { 'Content-Type': 'Application/JSON; charset=UTF-8' }]]]></http:headers>
+				<http:response-validator>
+					<http:success-status-code-validator values="200..599" />
+				</http:response-validator>
+			</http:request>
+			<http:request doc:name="GET invalid messages" config-ref="eip-self-http-request-config" method="GET" path="/eip/invoices/invalid-messages" target="vInvalid" targetValue="#[output application/java --- { status: attributes.statusCode, contentType: attributes.headers.'content-type' default '', body: payload }]">
+				<http:response-validator>
+					<http:success-status-code-validator values="200..599" />
+				</http:response-validator>
+			</http:request>
+		</munit:execution>
+		<munit:validation>
+			<munit-tools:assert-that doc:name="202" expression="#[vars.vPosted.status]" is="#[MunitTools::equalTo(202)]" />
+			<munit-tools:assert-that doc:name="Accepted" expression="#[vars.vPosted.body.status]" is="#[MunitTools::equalTo('ACCEPTED')]" />
+			<munit-tools:assert-that doc:name="Invalid channel empty" expression="#[sizeOf(vars.vInvalid.body)]" is="#[MunitTools::equalTo(0)]" />
+		</munit:validation>
+	</munit:test>
+
+	<munit:test name="imc-repeated-order-id-is-refused" description="Invalid message channel: a valid request whose orderId was already accepted gets 409 in JSON, the first request is kept, and nothing goes to the invalid channel">
+		<munit:enable-flow-sources>
+			<munit:enable-flow-source value="invoice-receive-request" />
+			<munit:enable-flow-source value="invoice-get-request" />
+			<munit:enable-flow-source value="invoice-get-invalid-messages" />
+		</munit:enable-flow-sources>
+		<munit:execution>
+			<http:request doc:name="POST first" config-ref="eip-self-http-request-config" method="POST" path="/eip/invoices/requests" target="vFirst" targetValue="#[output application/java --- { status: attributes.statusCode, contentType: attributes.headers.'content-type' default '', body: payload }]">
+				<http:body><![CDATA[#[output application/json --- { orderId: 'ORD-IMC-DUP', amount: 10, currency: 'EUR' }]]]></http:body>
+				<http:response-validator>
+					<http:success-status-code-validator values="200..599" />
+				</http:response-validator>
+			</http:request>
+			<http:request doc:name="POST again" config-ref="eip-self-http-request-config" method="POST" path="/eip/invoices/requests" target="vAgain" targetValue="#[output application/java --- { status: attributes.statusCode, contentType: attributes.headers.'content-type' default '', body: payload }]">
+				<http:body><![CDATA[#[output application/json --- { orderId: 'ORD-IMC-DUP', amount: 99, currency: 'USD' }]]]></http:body>
+				<http:response-validator>
+					<http:success-status-code-validator values="200..599" />
+				</http:response-validator>
+			</http:request>
+			<http:request doc:name="GET request" config-ref="eip-self-http-request-config" method="GET" path="/eip/invoices/requests/ORD-IMC-DUP" target="vStored" targetValue="#[output application/java --- { status: attributes.statusCode, contentType: attributes.headers.'content-type' default '', body: payload }]">
+				<http:response-validator>
+					<http:success-status-code-validator values="200..599" />
+				</http:response-validator>
+			</http:request>
+			<http:request doc:name="GET invalid messages" config-ref="eip-self-http-request-config" method="GET" path="/eip/invoices/invalid-messages" target="vInvalid" targetValue="#[output application/java --- { status: attributes.statusCode, contentType: attributes.headers.'content-type' default '', body: payload }]">
+				<http:response-validator>
+					<http:success-status-code-validator values="200..599" />
+				</http:response-validator>
+			</http:request>
+		</munit:execution>
+		<munit:validation>
+			<munit-tools:assert-that doc:name="First 202" expression="#[vars.vFirst.status]" is="#[MunitTools::equalTo(202)]" />
+			<munit-tools:assert-that doc:name="Again 409" expression="#[vars.vAgain.status]" is="#[MunitTools::equalTo(409)]" />
+			<munit-tools:assert-that doc:name="JSON" expression="#[vars.vAgain.contentType]" is="#[MunitTools::startsWith('application/json')]" />
+			<munit-tools:assert-that doc:name="Says why" expression="#[vars.vAgain.body.error]" is="#[MunitTools::equalTo('Invoice request for this orderId already accepted')]" />
+			<munit-tools:assert-that doc:name="First kept" expression="#[vars.vStored.body.amount]" is="#[MunitTools::equalTo(10)]" />
+			<munit-tools:assert-that doc:name="Invalid channel empty" expression="#[sizeOf(vars.vInvalid.body)]" is="#[MunitTools::equalTo(0)]" />
+		</munit:validation>
+	</munit:test>
 </mule>
