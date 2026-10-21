@@ -1,0 +1,88 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<mule xmlns="http://www.mulesoft.org/schema/mule/core"
+	xmlns:munit="http://www.mulesoft.org/schema/mule/munit"
+	xmlns:munit-tools="http://www.mulesoft.org/schema/mule/munit-tools"
+	xmlns:doc="http://www.mulesoft.org/schema/mule/documentation"
+	xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+	xsi:schemaLocation="http://www.mulesoft.org/schema/mule/core http://www.mulesoft.org/schema/mule/core/current/mule.xsd
+		http://www.mulesoft.org/schema/mule/munit http://www.mulesoft.org/schema/mule/munit/current/mule-munit.xsd
+		http://www.mulesoft.org/schema/mule/munit-tools http://www.mulesoft.org/schema/mule/munit-tools/current/mule-munit-tools.xsd">
+
+	<!--
+		Canonical data model: the same order sent by the marketplace (JSON) and by a partner (XML) becomes the same
+		canonical order, and from it the same invoicing and warehouse documents. The target translators are tested
+		alone with a canonical order, which shows they need no knowledge of any source.
+	-->
+	<munit:config name="canonical-data-model-test-suite.xml" />
+
+	<munit:test name="cdm-marketplace-order-becomes-canonical-and-both-targets" description="Canonical data model: a marketplace JSON order becomes the canonical order, an invoicing request with the total and a warehouse CSV pick list">
+		<munit:execution>
+			<munit:set-event doc:name="Marketplace order MK-501">
+				<munit:payload value="#[output application/json --- {id: 'MK-501', buyer: {accountId: 'A-9'}, shipping: {country: 'br'}, lines: [{listing: {sku: 'SKU-BOOK'}, units: 2, price: {amount: '30.00', currency: 'BRL'}}, {listing: {sku: 'SKU-MUG'}, units: 1, price: {amount: '12.50', currency: 'BRL'}}]}]" mediaType="application/json" />
+			</munit:set-event>
+			<flow-ref doc:name="POST /eip/canonical/orders/marketplace" name="canonical-order-from-marketplace" />
+		</munit:execution>
+		<munit:validation>
+			<munit-tools:assert-that doc:name="Canonical order" expression="#[payload.canonicalOrder]" is="#[MunitTools::equalTo({orderId: 'ORD-MK-501', source: 'MARKETPLACE', customerId: 'CUS-A-9', country: 'BR', currency: 'BRL', items: [{sku: 'SKU-BOOK', quantity: 2, unitPrice: 30}, {sku: 'SKU-MUG', quantity: 1, unitPrice: 12.5}]})]" />
+			<munit-tools:assert-that doc:name="Invoicing total" expression="#[payload.targets.invoicing.total]" is="#[MunitTools::equalTo(72.5)]" />
+			<munit-tools:assert-that doc:name="Invoicing lines" expression="#[payload.targets.invoicing.lines]" is="#[MunitTools::equalTo([{sku: 'SKU-BOOK', qty: 2, amount: 60}, {sku: 'SKU-MUG', qty: 1, amount: 12.5}])]" />
+			<munit-tools:assert-that doc:name="Warehouse CSV rows" expression="#[read(payload.targets.warehouse, 'application/csv') map ($.sku ++ ' x' ++ $.quantity ++ ' to ' ++ $.shipTo)]" is="#[MunitTools::equalTo(['SKU-BOOK x2 to BR', 'SKU-MUG x1 to BR'])]" />
+		</munit:validation>
+	</munit:test>
+
+	<munit:test name="cdm-partner-xml-gives-the-same-target-documents" description="Canonical data model: the same order as a partner XML purchase order gives the same canonical items and the same target documents; only the ids and the source differ">
+		<munit:execution>
+			<munit:set-event doc:name="Partner purchase order PO-77">
+				<munit:payload value="#[output application/xml --- {PurchaseOrder @(number: 'PO-77', currency: 'BRL'): {Customer @(code: 'A-9'): null, ShipTo @(country: 'BR'): null, Lines: {Line @(sku: 'SKU-BOOK', quantity: '2', unitPrice: '30.00'): null, Line @(sku: 'SKU-MUG', quantity: '1', unitPrice: '12.50'): null}}}]" mediaType="application/xml" />
+			</munit:set-event>
+			<flow-ref doc:name="POST /eip/canonical/orders/partner" name="canonical-order-from-partner" />
+		</munit:execution>
+		<munit:validation>
+			<munit-tools:assert-that doc:name="Source" expression="#[payload.canonicalOrder.source]" is="#[MunitTools::equalTo('PARTNER')]" />
+			<munit-tools:assert-that doc:name="Order id" expression="#[payload.canonicalOrder.orderId]" is="#[MunitTools::equalTo('ORD-PO-77')]" />
+			<munit-tools:assert-that doc:name="Same canonical items as the marketplace order" expression="#[payload.canonicalOrder.items]" is="#[MunitTools::equalTo([{sku: 'SKU-BOOK', quantity: 2, unitPrice: 30}, {sku: 'SKU-MUG', quantity: 1, unitPrice: 12.5}])]" />
+			<munit-tools:assert-that doc:name="Same invoicing lines and total" expression="#[payload.targets.invoicing - 'invoiceFor']" is="#[MunitTools::equalTo({customer: 'CUS-A-9', currency: 'BRL', lines: [{sku: 'SKU-BOOK', qty: 2, amount: 60}, {sku: 'SKU-MUG', qty: 1, amount: 12.5}], total: 72.5})]" />
+			<munit-tools:assert-that doc:name="Same warehouse rows" expression="#[read(payload.targets.warehouse, 'application/csv') map ($.sku ++ ' x' ++ $.quantity ++ ' to ' ++ $.shipTo)]" is="#[MunitTools::equalTo(['SKU-BOOK x2 to BR', 'SKU-MUG x1 to BR'])]" />
+		</munit:validation>
+	</munit:test>
+
+	<munit:test name="cdm-target-translators-need-only-the-canonical-order" description="Canonical data model: the invoicing and warehouse translators are called with a canonical order alone, with no source format involved">
+		<munit:execution>
+			<munit:set-event doc:name="A canonical order">
+				<munit:payload value="#[output application/java --- {orderId: 'ORD-C-1', source: 'ANY', customerId: 'CUS-1', country: 'PT', currency: 'EUR', items: [{sku: 'SKU-EBOOK', quantity: 3, unitPrice: 9}]}]" />
+			</munit:set-event>
+			<set-variable doc:name="SET vInvoice" variableName="vInvoice" value="#[dwl::canonical::ToInvoicing::fromCanonical(payload)]" />
+			<set-variable doc:name="SET vPickList" variableName="vPickList" value="#[dwl::canonical::ToWarehouse::fromCanonical(payload)]" />
+		</munit:execution>
+		<munit:validation>
+			<munit-tools:assert-that doc:name="Invoice" expression="#[vars.vInvoice]" is="#[MunitTools::equalTo({invoiceFor: 'ORD-C-1', customer: 'CUS-1', currency: 'EUR', lines: [{sku: 'SKU-EBOOK', qty: 3, amount: 27}], total: 27})]" />
+			<munit-tools:assert-that doc:name="Pick list" expression="#[vars.vPickList]" is="#[MunitTools::equalTo([{orderId: 'ORD-C-1', sku: 'SKU-EBOOK', quantity: 3, shipTo: 'PT'}])]" />
+		</munit:validation>
+	</munit:test>
+
+	<munit:test name="cdm-marketplace-order-without-buyer-returns-400" description="Canonical data model: a marketplace order without buyer fails the canonical validation with 400, and the message names the canonical field">
+		<munit:execution>
+			<munit:set-event doc:name="Marketplace order without buyer">
+				<munit:payload value="#[output application/json --- {id: 'MK-502', shipping: {country: 'BR'}, lines: [{listing: {sku: 'SKU-BOOK'}, units: 1, price: {amount: '30.00', currency: 'BRL'}}]}]" mediaType="application/json" />
+			</munit:set-event>
+			<flow-ref doc:name="POST /eip/canonical/orders/marketplace" name="canonical-order-from-marketplace" />
+		</munit:execution>
+		<munit:validation>
+			<munit-tools:assert-that doc:name="400" expression="#[vars.httpStatus as Number]" is="#[MunitTools::equalTo(400)]" />
+			<munit-tools:assert-that doc:name="Canonical field named" expression="#[payload.error]" is="#[MunitTools::equalTo('customerId is required')]" />
+		</munit:validation>
+	</munit:test>
+
+	<munit:test name="cdm-partner-line-with-bad-quantity-returns-400" description="Canonical data model: a partner line whose quantity is not a number is caught by the same canonical validation, with 400">
+		<munit:execution>
+			<munit:set-event doc:name="Partner order with quantity 'two'">
+				<munit:payload value="#[output application/xml --- {PurchaseOrder @(number: 'PO-78'): {Customer @(code: 'A-9'): null, ShipTo @(country: 'BR'): null, Lines: {Line @(sku: 'SKU-BOOK', quantity: 'two', unitPrice: '30.00'): null}}}]" mediaType="application/xml" />
+			</munit:set-event>
+			<flow-ref doc:name="POST /eip/canonical/orders/partner" name="canonical-order-from-partner" />
+		</munit:execution>
+		<munit:validation>
+			<munit-tools:assert-that doc:name="400" expression="#[vars.httpStatus as Number]" is="#[MunitTools::equalTo(400)]" />
+			<munit-tools:assert-that doc:name="Item rule named" expression="#[payload.error]" is="#[MunitTools::equalTo('every item needs a sku, a quantity above zero and a unit price')]" />
+		</munit:validation>
+	</munit:test>
+</mule>
