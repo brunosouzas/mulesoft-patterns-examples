@@ -26,10 +26,15 @@
 		its routes are fixed in the XML and all of them always run.
 
 		Each delivery is in its own Try. Without it, For Each stops at the first recipient that fails and the
-		recipients after it are never told. With it, a failed delivery is recorded (FAILED, with the error type)
-		and the others still go out; the response says which ones failed (allDelivered false), so the caller
-		can retry just those. For Each delivers one recipient after the other; Parallel For Each would deliver
-		them at the same time.
+		recipients after it are never told ("If one of the elements in a collection throws an exception, the For
+		Each scope stops processing that collection and invokes the error handler":
+		https://docs.mulesoft.com/mule-runtime/latest/for-each-scope-concept). With it, a failed delivery is
+		recorded (FAILED, with the error type: HTTP:SERVICE_UNAVAILABLE when the recipient answers 503) and the
+		others still go out; the response says which ones failed (allDelivered false). There is no way to retry
+		only those: a retry of the request sends the order to every recipient again, so the recipients must be
+		idempotent. The simulated ones are: each inbox entry is keyed recipient|orderId, so a repeat overwrites
+		it. For Each delivers one recipient after the other; Parallel For Each would deliver them at the same
+		time.
 
 		In the book, Scatter-Gather is a Recipient List (or a broadcast) followed by an Aggregator that combines
 		the replies into one message. Here the replies are only delivery statuses, collected in vars.vDeliveries;
