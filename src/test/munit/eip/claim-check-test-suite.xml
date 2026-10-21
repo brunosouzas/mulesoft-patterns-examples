@@ -2,59 +2,62 @@
 <mule xmlns="http://www.mulesoft.org/schema/mule/core"
 	xmlns:munit="http://www.mulesoft.org/schema/mule/munit"
 	xmlns:munit-tools="http://www.mulesoft.org/schema/mule/munit-tools"
+	xmlns:http="http://www.mulesoft.org/schema/mule/http"
 	xmlns:doc="http://www.mulesoft.org/schema/mule/documentation"
 	xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
 	xsi:schemaLocation="http://www.mulesoft.org/schema/mule/core http://www.mulesoft.org/schema/mule/core/current/mule.xsd
 		http://www.mulesoft.org/schema/mule/munit http://www.mulesoft.org/schema/mule/munit/current/mule-munit.xsd
-		http://www.mulesoft.org/schema/mule/munit-tools http://www.mulesoft.org/schema/mule/munit-tools/current/mule-munit-tools.xsd">
+		http://www.mulesoft.org/schema/mule/munit-tools http://www.mulesoft.org/schema/mule/munit-tools/current/mule-munit-tools.xsd
+		http://www.mulesoft.org/schema/mule/http http://www.mulesoft.org/schema/mule/http/current/mule-http.xsd">
 
 	<!--
 		Claim check: a 200 KB order document is checked in, only the claim key travels to the archive, the archive
 		and later callers check the document out with the key, and after the store's time to live (3 seconds in
-		app.yaml) the claim is gone. The expiry test waits 5 seconds, longer than the TTL plus the 1-second
+		app.yaml) the claim is gone. The first two tests call the endpoints over real HTTP, so they check the status codes
+		and that the stored document is answered as JSON. The expiry test waits 5 seconds, longer than the TTL plus the 1-second
 		expiration interval.
 	-->
 	<munit:config name="claim-check-test-suite.xml" />
 
-	<munit:test name="cc-only-the-claim-travels-and-the-archive-checks-the-document-out" description="Claim check: the archive receives orderId, claimKey and fileName only, and still archives the whole 200,000-byte document it fetched with the key">
+	<munit:test name="cc-only-the-claim-travels-and-the-archive-checks-the-document-out" description="Claim check, over real HTTP: POST /eip/orders/documents answers 202; the archive receives orderId, claimKey and fileName only, and still archives the whole 200,000-byte document it fetched with the key">
 		<munit:enable-flow-sources>
+			<munit:enable-flow-source value="order-check-in-document" />
 			<munit:enable-flow-source value="archive-store-order-document" />
 		</munit:enable-flow-sources>
 		<munit:execution>
-			<munit:set-event doc:name="Order ORD-CC-1 with a 200 KB document">
-				<munit:payload value="#[output application/json --- {orderId: 'ORD-CC-1', document: {fileName: 'po-ORD-CC-1.pdf', mediaType: 'application/pdf', contentBase64: dw::core::Binaries::toBase64(dw::core::Strings::repeat('PDF-', 50000) as Binary)}}]" mediaType="application/json" />
-			</munit:set-event>
-			<flow-ref doc:name="POST /eip/orders/documents" name="order-check-in-document" />
-			<set-variable doc:name="SET vCheckIn" variableName="vCheckIn" value="#[payload]" />
+			<http:request doc:name="POST /eip/orders/documents (200 KB document)" config-ref="eip-self-http-request-config" method="POST" path="/eip/orders/documents" target="vCheckIn" targetValue="#[output application/java --- { status: attributes.statusCode, mimeType: payload.^mimeType, body: payload }]">
+				<http:body><![CDATA[#[output application/json --- {orderId: 'ORD-CC-1', document: {fileName: 'po-ORD-CC-1.pdf', mediaType: 'application/pdf', contentBase64: dw::core::Binaries::toBase64(dw::core::Strings::repeat('PDF-', 50000) as Binary)}}]]]></http:body>
+			</http:request>
 		</munit:execution>
 		<munit:validation>
-			<munit-tools:assert-that doc:name="202: no error status set" expression="#[vars.httpStatus]" is="#[MunitTools::nullValue()]" />
-			<munit-tools:assert-that doc:name="Claim key issued" expression="#[payload.claimKey startsWith 'CLM-']" is="#[MunitTools::equalTo(true)]" />
-			<munit-tools:assert-that doc:name="Archive received only the claim" expression="#[payload.archive.receivedFields]" is="#[MunitTools::equalTo(['orderId', 'claimKey', 'fileName'])]" />
-			<munit-tools:assert-that doc:name="Archive got the whole document with the key" expression="#[payload.archive.sizeBytes]" is="#[MunitTools::equalTo(200000)]" />
-			<munit-tools:assert-that doc:name="Archived file" expression="#[payload.archive.fileName]" is="#[MunitTools::equalTo('po-ORD-CC-1.pdf')]" />
+			<munit-tools:assert-that doc:name="202" expression="#[vars.vCheckIn.status]" is="#[MunitTools::equalTo(202)]" />
+			<munit-tools:assert-that doc:name="Claim key issued" expression="#[vars.vCheckIn.body.claimKey startsWith 'CLM-']" is="#[MunitTools::equalTo(true)]" />
+			<munit-tools:assert-that doc:name="Archive received only the claim" expression="#[vars.vCheckIn.body.archive.receivedFields]" is="#[MunitTools::equalTo(['orderId', 'claimKey', 'fileName'])]" />
+			<munit-tools:assert-that doc:name="Archive got the whole document with the key" expression="#[vars.vCheckIn.body.archive.sizeBytes]" is="#[MunitTools::equalTo(200000)]" />
+			<munit-tools:assert-that doc:name="Archived file" expression="#[vars.vCheckIn.body.archive.fileName]" is="#[MunitTools::equalTo('po-ORD-CC-1.pdf')]" />
 		</munit:validation>
 	</munit:test>
 
-	<munit:test name="cc-check-out-does-not-remove-the-document" description="Claim check: after the archive has checked the document out, the same claim key still returns it to another caller, unchanged">
+	<munit:test name="cc-check-out-does-not-remove-the-document" description="Claim check, over real HTTP: after the archive has checked the document out, GET with the same claim key still answers 200 with it as JSON, unchanged">
 		<munit:enable-flow-sources>
+			<munit:enable-flow-source value="order-check-in-document" />
 			<munit:enable-flow-source value="archive-store-order-document" />
+			<munit:enable-flow-source value="order-check-out-document" />
 		</munit:enable-flow-sources>
 		<munit:execution>
-			<munit:set-event doc:name="Order ORD-CC-2 with a 200 KB document">
-				<munit:payload value="#[output application/json --- {orderId: 'ORD-CC-2', document: {fileName: 'po-ORD-CC-2.pdf', mediaType: 'application/pdf', contentBase64: dw::core::Binaries::toBase64(dw::core::Strings::repeat('PDF-', 50000) as Binary)}}]" mediaType="application/json" />
-			</munit:set-event>
-			<flow-ref doc:name="POST /eip/orders/documents" name="order-check-in-document" />
-			<set-variable doc:name="SET vCheckIn" variableName="vCheckIn" value="#[payload]" />
-			<munit:set-event cloneOriginalEvent="true" doc:name="GET the document by its claim key">
-				<munit:attributes value="#[{uriParams: {claimKey: vars.vCheckIn.claimKey}}]" />
-			</munit:set-event>
-			<flow-ref doc:name="GET /eip/orders/documents/{claimKey}" name="order-check-out-document" />
+			<http:request doc:name="POST /eip/orders/documents (200 KB document)" config-ref="eip-self-http-request-config" method="POST" path="/eip/orders/documents" target="vCheckIn" targetValue="#[output application/java --- { status: attributes.statusCode, mimeType: payload.^mimeType, body: payload }]">
+				<http:body><![CDATA[#[output application/json --- {orderId: 'ORD-CC-2', document: {fileName: 'po-ORD-CC-2.pdf', mediaType: 'application/pdf', contentBase64: dw::core::Binaries::toBase64(dw::core::Strings::repeat('PDF-', 50000) as Binary)}}]]]></http:body>
+			</http:request>
+			<http:request doc:name="GET /eip/orders/documents/{claimKey}" config-ref="eip-self-http-request-config" method="GET" path="/eip/orders/documents/{claimKey}" target="vCheckOut" targetValue="#[output application/java --- { status: attributes.statusCode, mimeType: payload.^mimeType, body: payload }]">
+				<http:uri-params><![CDATA[#[{ claimKey: vars.vCheckIn.body.claimKey }]]]></http:uri-params>
+			</http:request>
 		</munit:execution>
 		<munit:validation>
-			<munit-tools:assert-that doc:name="200: no error status set" expression="#[vars.httpStatus]" is="#[MunitTools::nullValue()]" />
-			<munit-tools:assert-that doc:name="Same order" expression="#[payload.orderId]" is="#[MunitTools::equalTo('ORD-CC-2')]" />
-			<munit-tools:assert-that doc:name="Same content" expression="#[payload.contentBase64 == dw::core::Binaries::toBase64(dw::core::Strings::repeat('PDF-', 50000) as Binary)]" is="#[MunitTools::equalTo(true)]" />
+			<munit-tools:assert-that doc:name="Archived first" expression="#[vars.vCheckIn.body.archive.sizeBytes]" is="#[MunitTools::equalTo(200000)]" />
+			<munit-tools:assert-that doc:name="200" expression="#[vars.vCheckOut.status]" is="#[MunitTools::equalTo(200)]" />
+			<munit-tools:assert-that doc:name="Answered as JSON" expression="#[vars.vCheckOut.mimeType]" is="#[MunitTools::equalTo('application/json')]" />
+			<munit-tools:assert-that doc:name="Same order" expression="#[vars.vCheckOut.body.orderId]" is="#[MunitTools::equalTo('ORD-CC-2')]" />
+			<munit-tools:assert-that doc:name="Same content" expression="#[vars.vCheckOut.body.contentBase64 == dw::core::Binaries::toBase64(dw::core::Strings::repeat('PDF-', 50000) as Binary)]" is="#[MunitTools::equalTo(true)]" />
 		</munit:validation>
 	</munit:test>
 

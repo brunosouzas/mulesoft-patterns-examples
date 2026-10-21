@@ -21,7 +21,7 @@
 		  2. the message sent on to the archive is { orderId, claimKey, fileName }, without the content;
 		  3. the archive (claim-check-archive.xml, simulated on this app) checks the document out with the key.
 		  -> 202 { orderId, claimKey, archive: <the archive's reply> }
-		GET /eip/orders/documents/{claimKey}   checks a document out: 200 with it, or 404 when the key is
+		GET /eip/orders/documents/{claimKey}   checks a document out: 200 with it as JSON, or 404 when the key is
 		                                       unknown or the claim has expired.
 
 		Checking out does not remove the document: it stays claimable by other components until its time to
@@ -86,6 +86,15 @@ output application/json
 		</http:listener>
 		<set-variable doc:name="SET vClaimKey" variableName="vClaimKey" value="#[attributes.uriParams.claimKey]" />
 		<flow-ref doc:name="Refer to sf-check-out-document" name="sf-check-out-document" />
+		<!-- The store holds a Java map (os:value is output application/java); the HTTP answer is written as JSON. -->
+		<ee:transform doc:name="Build Document Response">
+			<ee:message>
+				<ee:set-payload><![CDATA[%dw 2.0
+output application/json
+---
+payload]]></ee:set-payload>
+			</ee:message>
+		</ee:transform>
 	</flow>
 
 	<sub-flow name="sf-check-out-document" doc:description="Retrieves the document stored under vars.vClaimKey into the payload; raises APP:NOT_FOUND when the claim is unknown or has expired. Does not remove the document.">
