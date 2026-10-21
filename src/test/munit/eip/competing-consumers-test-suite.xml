@@ -14,7 +14,8 @@
 
 	<!--
 		Competing consumers: several consumers take items from one work list in an object store; an atomic claim
-		(os:store failIfPresent) makes each item go to one consumer. Every call goes over HTTP to this app.
+		(os:store failIfPresent) makes each item go to one consumer. Every call goes over HTTP to this app, except in
+		cc-failed-item-is-processed-on-the-next-run, which calls the consumer flow with a flow-ref.
 	-->
 	<munit:config name="competing-consumers-test-suite.xml" />
 
@@ -50,6 +51,9 @@
 			<munit-tools:assert-that doc:name="JSON" expression="#[vars.vRuns.contentType]" is="#[MunitTools::startsWith('application/json')]" />
 			<munit-tools:assert-that doc:name="Three consumers ran" expression="#[vars.vRuns.body.consumers map $.consumer]" is="#[MunitTools::equalTo(['consumer-1', 'consumer-2', 'consumer-3'])]" />
 			<munit-tools:assert-that doc:name="Every item processed" expression="#[flatten(vars.vRuns.body.consumers map ($.processed filter ($ startsWith 'ORD-CC-ITEM-'))) orderBy $]" is="#[MunitTools::equalTo(['ORD-CC-ITEM-1','ORD-CC-ITEM-2','ORD-CC-ITEM-3','ORD-CC-ITEM-4','ORD-CC-ITEM-5','ORD-CC-ITEM-6','ORD-CC-ITEM-7','ORD-CC-ITEM-8','ORD-CC-ITEM-9'])]" />
+			<!-- Evidence, not proof, of concurrency: consumers that ran one after the other would leave all items to the first one. -->
+			<munit-tools:assert-that doc:name="Work spread over more than one consumer" expression="#[sizeOf(vars.vRuns.body.consumers filter (not isEmpty($.processed filter ($ startsWith 'ORD-CC-ITEM-'))))]" is="#[MunitTools::greaterThan(1)]" />
+			<munit-tools:assert-that doc:name="Consumers met each other's claims" expression="#[sum(vars.vRuns.body.consumers map $.alreadyClaimed)]" is="#[MunitTools::greaterThan(0)]" />
 			<munit-tools:assert-that doc:name="No item processed twice" expression="#[sizeOf(flatten(vars.vRuns.body.consumers map ($.processed filter ($ startsWith 'ORD-CC-ITEM-'))) distinctBy $)]" is="#[MunitTools::equalTo(9)]" />
 			<munit-tools:assert-that doc:name="Item 5 invoiced once" expression="#[vars.vItem5.body.invoicesIssued]" is="#[MunitTools::equalTo(1)]" />
 			<munit-tools:assert-that doc:name="Item 5 claimed by the consumer that processed it" expression="#[vars.vItem5.body.claimedBy]" is="#[MunitTools::equalTo((vars.vRuns.body.consumers filter ($.processed contains 'ORD-CC-ITEM-5'))[0].consumer)]" />
@@ -143,6 +147,76 @@
 			<munit-tools:assert-that doc:name="JSON" expression="#[vars.vBad.contentType]" is="#[MunitTools::startsWith('application/json')]" />
 			<munit-tools:assert-that doc:name="Too many consumers 400" expression="#[vars.vTooMany.status]" is="#[MunitTools::equalTo(400)]" />
 			<munit-tools:assert-that doc:name="404" expression="#[vars.vUnknown.status]" is="#[MunitTools::equalTo(404)]" />
+		</munit:validation>
+	</munit:test>
+
+	<!-- Stands in for "Store Issued Count" in cc-failed-item-is-processed-on-the-next-run: fails for vars.vFailOrderId, stores as the real one otherwise. -->
+	<flow name="test-cc-issue-invoice-or-fail">
+		<choice doc:name="Check Failing Order">
+			<when expression="#[vars.vOrderId == vars.vFailOrderId]">
+				<raise-error doc:name="Raise TEST:INVOICING_DOWN Error" type="TEST:INVOICING_DOWN" description="Invoicing down" />
+			</when>
+		</choice>
+		<os:store doc:name="Store Issued Count (test)" key="#[vars.vOrderId]" objectStore="eip-invoice-work-issued-store">
+			<os:value><![CDATA[#[(vars.vIssued as Number) + 1]]]></os:value>
+		</os:store>
+		<error-handler>
+			<on-error-propagate doc:name="On Error Propagate (not the app's default handler)" logException="false" />
+		</error-handler>
+	</flow>
+
+	<munit:test name="cc-failed-item-is-processed-on-the-next-run" description="Competing consumers: when invoicing a claimed item fails, the consumer releases the claim, so the next run claims and invoices the item">
+		<munit:enable-flow-sources>
+			<munit:enable-flow-source value="invoice-work-add-items" />
+			<munit:enable-flow-source value="invoice-work-get-item" />
+		</munit:enable-flow-sources>
+		<munit:behavior>
+			<munit-tools:mock-when doc:name="Invoicing fails for vFailOrderId" processor="os:store">
+				<munit-tools:with-attributes>
+					<munit-tools:with-attribute attributeName="doc:name" whereValue="Store Issued Count" />
+				</munit-tools:with-attributes>
+				<munit-tools:then-call flow="test-cc-issue-invoice-or-fail" />
+			</munit-tools:mock-when>
+		</munit:behavior>
+		<munit:execution>
+			<http:request doc:name="POST failing work item" config-ref="eip-self-http-request-config" method="POST" path="/eip/invoice-work/items" target="vAdded" targetValue="#[output application/java --- { status: attributes.statusCode, contentType: attributes.headers.'content-type' default '', body: payload }]">
+				<http:body><![CDATA[#[output application/json --- {orderIds: ['ORD-CC-FAILS-ONCE']}]]]></http:body>
+				<http:response-validator>
+					<http:success-status-code-validator values="200..499" />
+				</http:response-validator>
+			</http:request>
+			<munit:set-event doc:name="Run of consumer-1, invoicing down for ORD-CC-FAILS-ONCE">
+				<munit:attributes value="#[{ uriParams: { consumerId: 'consumer-1' } }]" />
+				<munit:variables>
+					<munit:variable key="vFailOrderId" value="ORD-CC-FAILS-ONCE" />
+				</munit:variables>
+			</munit:set-event>
+			<!-- The error ends the run; the flow's (global) error handler answers 500, so the flow-ref returns. -->
+			<flow-ref doc:name="Refer to invoice-work-consumer (run 1 fails)" name="invoice-work-consumer" />
+			<set-variable doc:name="SET vRun1Status" variableName="vRun1Status" value="#[vars.httpStatus]" />
+			<os:contains doc:name="Claim left after the failure?" key="ORD-CC-FAILS-ONCE" objectStore="eip-invoice-work-claims-store" target="vClaimLeft" />
+			<munit:set-event doc:name="Run of consumer-2, invoicing back" cloneOriginalEvent="true">
+				<munit:attributes value="#[{ uriParams: { consumerId: 'consumer-2' } }]" />
+			</munit:set-event>
+			<remove-variable doc:name="Remove vFailOrderId" variableName="vFailOrderId" />
+			<flow-ref doc:name="Refer to invoice-work-consumer (run 2)" name="invoice-work-consumer" target="vRun2" />
+			<http:request doc:name="GET item" config-ref="eip-self-http-request-config" method="GET" path="/eip/invoice-work/items/ORD-CC-FAILS-ONCE" target="vItem" targetValue="#[output application/java --- { status: attributes.statusCode, contentType: attributes.headers.'content-type' default '', body: payload }]">
+				<http:response-validator>
+					<http:success-status-code-validator values="200..499" />
+				</http:response-validator>
+			</http:request>
+		</munit:execution>
+		<munit:validation>
+			<munit-tools:assert-that doc:name="Run 1 failed with 500" expression="#[vars.vRun1Status as Number]" is="#[MunitTools::equalTo(500)]" />
+			<munit-tools:assert-that doc:name="Claim released" expression="#[vars.vClaimLeft]" is="#[MunitTools::equalTo(false)]" />
+			<munit-tools:assert-that doc:name="Run 2 processed it" expression="#[vars.vRun2.processed contains 'ORD-CC-FAILS-ONCE']" is="#[MunitTools::equalTo(true)]" />
+			<munit-tools:assert-that doc:name="Claimed by consumer-2" expression="#[vars.vItem.body.claimedBy]" is="#[MunitTools::equalTo('consumer-2')]" />
+			<munit-tools:assert-that doc:name="Invoiced once" expression="#[vars.vItem.body.invoicesIssued]" is="#[MunitTools::equalTo(1)]" />
+			<munit-tools:verify-call doc:name="Claim released once" processor="os:remove" times="1">
+				<munit-tools:with-attributes>
+					<munit-tools:with-attribute attributeName="doc:name" whereValue="Release Claim" />
+				</munit-tools:with-attributes>
+			</munit-tools:verify-call>
 		</munit:validation>
 	</munit:test>
 </mule>

@@ -12,7 +12,9 @@
 
 	<!--
 		COMPETING CONSUMERS (Hohpe and Woolf): several consumers take work from one shared source, so the work is
-		spread among them, and each message is processed by exactly one of them. Here: invoices to issue are put on
+		spread among them, and each message goes to one of them. In the book the consumers are receivers on one
+		point-to-point channel and the messaging system delivers each message to only one; without a broker, the
+		claims store below stands in for that single delivery. Here: invoices to issue are put on
 		a shared work list, and several invoicing consumers run at the same time and take items from it.
 		POST /eip/invoice-work/items                        puts orders on the work list
 		POST /eip/invoice-work/runs                         starts N consumers at once (default eip.competingConsumers.consumers)
@@ -29,6 +31,10 @@
 		set to true, then an OS:KEY_ALREADY_EXISTS error is thrown instead", and the store "is synchronized on the
 		key level" (https://docs.mulesoft.com/object-store-connector/latest/object-store-connector-reference): the
 		first consumer to store the key owns the item; the others get OS:KEY_ALREADY_EXISTS and move on.
+		If invoicing a claimed item fails, the consumer removes its claim (os:remove) and the error ends its run,
+		so a later run claims and invoices the item again (cc-failed-item-is-processed-on-the-next-run). The
+		release runs only in the error handler: nothing here frees the claim of a consumer that stops between
+		claim and invoice (a broker would redeliver its message).
 		The same page warns that across nodes this holds only when the runtime is clustered: "Running the same
 		application with store operations across multiple nodes without clustering enabled might lead to
 		inconsistent results due to the absence of coordinated locking."
@@ -89,7 +95,7 @@ var runs = payload map $.payload
 		</ee:transform>
 	</flow>
 
-	<flow name="invoice-work-consumer" maxConcurrency="${eip.competingConsumers.consumers}" doc:description="Competing consumer: walks the shared work list, claims each item atomically (os:store failIfPresent) and issues the invoice only for the items it claimed.">
+	<flow name="invoice-work-consumer" maxConcurrency="${eip.competingConsumers.consumers}" doc:description="Competing consumer: walks the shared work list, claims each item atomically (os:store failIfPresent) and issues the invoice only for the items it claimed; a failed invoice releases the claim.">
 		<http:listener doc:name="POST /eip/invoice-work/consumers/{consumerId}/runs" config-ref="http-listener-config" path="/eip/invoice-work/consumers/{consumerId}/runs" allowedMethods="POST">
 			<http:response statusCode="#[vars.httpStatus default 200]" />
 		</http:listener>
@@ -109,6 +115,10 @@ var runs = payload map $.payload
 					<on-error-continue doc:name="On Error Continue (claimed by another consumer)" type="OS:KEY_ALREADY_EXISTS" logException="false">
 						<set-variable doc:name="SET vAlreadyClaimed" variableName="vAlreadyClaimed" value="#[vars.vAlreadyClaimed + 1]" />
 					</on-error-continue>
+					<on-error-propagate doc:name="On Error Propagate (invoicing failed, release the claim)">
+						<os:remove doc:name="Release Claim" key="#[vars.vOrderId]" objectStore="eip-invoice-work-claims-store" />
+						<logger doc:name="WARN: Log claim released" level="WARN" message="#['Consumer ' ++ vars.vConsumerId ++ ' released ' ++ vars.vOrderId ++ ' after ' ++ error.errorType.namespace ++ ':' ++ error.errorType.identifier ++ ', correlationId=' ++ correlationId]" />
+					</on-error-propagate>
 				</error-handler>
 			</try>
 		</foreach>
