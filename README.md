@@ -26,7 +26,7 @@ curl -s 'localhost:8081/lsp/before/orders/ORD-1001?provider=new'
 mvn clean test
 ```
 
-MUnit runs on the Mule Enterprise runtime, so Maven needs access to the MuleSoft Enterprise repository (credentials in `~/.m2/settings.xml`, as in any MuleSoft project). The build fails below 80% application coverage; the current suites cover 150 cases at about 99.8%.
+MUnit runs on the Mule Enterprise runtime, so Maven needs access to the MuleSoft Enterprise repository (credentials in `~/.m2/settings.xml`, as in any MuleSoft project). The build fails below 80% application coverage; the current suites cover 171 cases at about 99.6%.
 
 ## SOLID in MuleSoft
 
@@ -94,6 +94,16 @@ In progress. Patterns from Hohpe and Woolf's *Enterprise Integration Patterns*, 
 | Competing consumers | Several consumers (Parallel For Each; consumer flow `maxConcurrency` = `eip.competingConsumers.consumers`, 3) walk one shared invoice work list; each item is claimed with `os:store failIfPresent="true"`, so the first consumer owns it and the others get `OS:KEY_ALREADY_EXISTS` and skip it; a failed invoice releases the claim, so a later run retries the item. In the book the consumers share one point-to-point channel and the messaging system delivers each message to one of them; here the claims store stands in for that single delivery | [`eip/competing-consumers/`](src/main/mule/eip/competing-consumers) | `POST /eip/invoice-work/items`, `POST /eip/invoice-work/runs`, `POST /eip/invoice-work/consumers/{consumerId}/runs`, `GET /eip/invoice-work/items/{orderId}` |
 | Channel adapter | The HTTP Request connector reads an order from a simulated legacy ERP that answers `;`-separated CSV with cents and one-letter status codes, and DataWeave turns it into the order message (`amount`, `status` `PAID`/`PAYMENT_DECLINED`/`REFUNDED`, else `UNKNOWN` with `legacyStatusCode`). The legacy plain-text 404 becomes the app's JSON 404; a legacy 5xx or connection failure becomes 503. A connector can act as a source or as an operation; here it is an operation | [`eip/channel-adapter/`](src/main/mule/eip/channel-adapter) | `GET /eip/adapters/legacy-orders/{orderId}`, `GET /eip/legacy/orders/{orderId}` (simulated legacy ERP) |
 
+**Wave 5, reliability:**
+
+| Pattern | Scenario | Code | Endpoints |
+|---|---|---|---|
+| Guaranteed delivery | A new order is written to a **persistent** object store (the outbox, `persistent="true"`) and only then answered 202 `STORED`. A forwarder started by a Scheduler (`eip.guaranteedDelivery.forwardFrequencyMillis`, 1000 ms) sends each stored order to a simulated fulfilment system and removes it from the outbox only after a 2xx; while fulfilment answers 503 the order stays stored with its `attempts` and `lastError` and is sent again on the next run. Delivery is at least once: a failure after fulfilment accepted the order and before it left the outbox sends it again. With Anypoint MQ (unacknowledged messages go back to the queue) or a persistent VM queue the broker does this; no broker is simulated here | [`eip/guaranteed-delivery/`](src/main/mule/eip/guaranteed-delivery) | `POST /eip/orders/guaranteed`, `GET /eip/orders/guaranteed/{orderId}`; simulated fulfilment: `POST /eip/fulfilment/orders`, `PUT /eip/fulfilment/availability`, `GET /eip/fulfilment/orders/{orderId}` |
+| Transactional client | A payment writes a ledger debit and marks the order `PAID`: both or neither. **Before:** the two writes inside a Try with `transactionalAction="ALWAYS_BEGIN"`; the Object Store does not support transactions, so when the second write fails the caller gets 500 and the debit stays. **After:** the same writes with a compensation: the debit is undone and the caller gets 503. Real transactions need a transactional connector (JMS, VM, Database; XA across them); this app has none, so the compensation is what is left, and it is not atomic | [`eip/transactional-client/`](src/main/mule/eip/transactional-client) | `POST /eip/payments/transactional/before`, `POST /eip/payments/transactional/after`, `GET /eip/payments/transactional/{orderId}` |
+| Message expiration | A stock reservation request carries `expiresAt` and waits in a queue (an object store) until a consumer started by a Scheduler (`eip.messageExpiration.consumerFrequencyMillis`, 1000 ms) takes it: a request still valid is `RESERVED`, an expired one is moved to the expired requests (`EXPIRED`, with the reason) and reserves nothing. Expiry is checked when the message is consumed, so a request valid when sent can expire while it waits. Anypoint MQ's queue-level message TTL is the broker equivalent | [`eip/message-expiration/`](src/main/mule/eip/message-expiration) | `POST /eip/stock/expiring-requests`, `GET /eip/stock/expiring-requests/{orderId}` |
+| Invalid message channel | Invoice requests that are not JSON, are malformed JSON, are not an object or miss a field (`orderId`, positive `amount`, 3-letter `currency`) are kept in an invalid-message store with the reason, content type and body as received, never invoiced, and answered 400 naming the invalid message. A valid one is 202 `ACCEPTED`. Not the dead letter channel: that one receives valid messages that could not be delivered | [`eip/invalid-message-channel/`](src/main/mule/eip/invalid-message-channel) | `POST /eip/invoices/requests`, `GET /eip/invoices/requests/{orderId}`, `GET /eip/invoices/invalid-messages` |
+| Point-to-point channel | Documented with Anypoint MQ configuration in the wiki, not runnable here: one queue, each message consumed by one receiver, is a broker feature; in this app it would mean simulating a broker with VM queues. The one-receiver-per-message effect over a shared work list is shown by competing consumers (wave 4) | — | — |
+
 The MUnit suites are in [`src/test/munit/eip/`](src/test/munit/eip), one per pattern. What the wave 1 suites show, observed on Mule 4.9.17 with MUnit 3.7.1:
 
 - With no `objectStore`, the idempotent validator keeps IDs in memory for 5 minutes (the defaults in the 4.9.17 runtime's `IdempotentMessageValidator`). Three different orders posted over HTTP from one For Each give `accepted,duplicate,duplicate`; with `idExpression="#[payload.orderId]"` they give `accepted,accepted,accepted`.
@@ -127,9 +137,16 @@ What the wave 4 suites show, observed on Mule 4.9.17 with MUnit 3.7.1 (most call
 - Competing consumers: three consumers over nine items process all nine, none twice, nine invoices issued, each claimed by the consumer that reports it. More than one consumer processes items and their runs meet each other's claims, which is evidence, not proof, that they ran concurrently; the skipped-item test pre-seeds the claim so the `OS:KEY_ALREADY_EXISTS` path is deterministic. An item already claimed in the claims store is skipped and not invoiced. When invoicing fails, the claim is released and the next run claims and invoices the item once. The claim is atomic per key on one worker; across workers only in a Mule cluster (Object Store connector reference).
 - Channel adapter: the legacy endpoint answers `application/csv` (`ORD-LEGACY-1001;4250;BRL;P`), the adapter answers `application/json` `{ orderId, amount: 42.5, currency, status: PAID, source }`. A legacy 500, 503 or connection failure (mocked) gives 503 `{ error: "Legacy ERP unavailable" }`.
 
+What the wave 5 suites show, observed on Mule 4.9.17 with MUnit 3.7.1 (calls go over HTTP to the app; the Scheduler-started flows run one pass at a time with a flow-ref, and one test per Scheduler enables the source):
+
+- Guaranteed delivery: the 202 comes back with the whole order already in the persistent outbox (read directly with `os:retrieve`) and not yet at fulfilment (404). With fulfilment down two passes leave it `STORED`, `attempts` 2, `lastError` `HTTP:SERVICE_UNAVAILABLE`; the pass after fulfilment is back delivers it (`attempts` 3, received once). When removing it from the outbox fails after delivery (mocked, as a crash at that point would), the next pass sends it again and fulfilment receives it twice. A restart itself cannot run inside MUnit; the tests show what a restart would find.
+- Transactional client: with the second write mocked to fail with `OS:STORE_NOT_AVAILABLE`, the Try with `ALWAYS_BEGIN` answers 500 and leaves the 50.00 debit with the order unpaid; the compensated version answers 503 and leaves neither record.
+- Message expiration: a request that expires in a minute is `QUEUED` until the consumer runs and then `RESERVED`; one sent already expired becomes `EXPIRED` with the reason and no reservation; one sent with 1 second left, consumed 1.5 seconds later, is `EXPIRED` while one sent with a minute left in the same pass is `RESERVED`.
+- Invalid message channel: malformed JSON, a schema violation (all three listed in the reason), an XML body and a JSON array each get 400 and one entry in the invalid channel with the reason and the body as received; the 400 names the same invalid-message id, and the request is not stored. A valid request is 202 and leaves the channel empty.
+
 Notes:
 
-- Object stores are in memory so every run starts clean. In production use a persistent, shared store (Object Store v2 on CloudHub): an in-memory store is lost on restart and is not shared between replicas.
+- Object stores are in memory so every run starts clean, except the guaranteed delivery outbox, which is persistent because surviving a restart is the point (its suite clears it before each test). In production use a persistent, shared store (Object Store v2 on CloudHub): an in-memory store is lost on restart and is not shared between replicas.
 - VM queues are not used to stand in for a broker: the VM connector is an in-application queue, not a message broker.
 - The aggregator keeps its groups in an object store too. In production, and always in a cluster, use a persistent, shared store, or a group whose items reach different workers never completes.
 
@@ -137,7 +154,7 @@ Notes:
 
 ```
 src/main/mule/
-  global.xml                 shared: HTTP listener, properties, error handler (400/404 as JSON)
+  global.xml                 shared: HTTP listener, properties, error handler (400/404/409/503 as JSON)
   solid/                     SOLID in MuleSoft
     srp/ ocp/ lsp/ isp/ dip/
       <principle>-before.xml
@@ -195,7 +212,16 @@ src/main/mule/
     channel-adapter/
       channel-adapter.xml          HTTP Request + DataWeave adapter from legacy CSV to the order message
       legacy-erp.xml               simulated legacy ERP answering CSV
-src/main/resources/config/app.yaml   port, OCP payment routing, DIP repository choice, EIP self-call host, callback path, routing, claim check, request-reply, polling and competing consumers settings
+    guaranteed-delivery/
+      guaranteed-delivery.xml      persistent outbox, Scheduler forwarder with redelivery, status
+      guaranteed-delivery-fulfilment.xml  simulated fulfilment that can be switched off
+    transactional-client/
+      transactional-client.xml     Try with ALWAYS_BEGIN (no rollback) vs compensation
+    message-expiration/
+      message-expiration.xml       queued requests with expiresAt, Scheduler consumer, expired requests
+    invalid-message-channel/
+      invalid-message-channel.xml  parse and field checks, invalid-message store with the reason
+src/main/resources/config/app.yaml   port, OCP payment routing, DIP repository choice, EIP self-call host, callback path, routing, claim check, request-reply, polling and competing consumers, guaranteed delivery and message expiration settings
 src/main/resources/dwl/
   translator/PartnerProducts.dwl     partner product codes -> SKUs (message translator)
   canonical/                         CanonicalOrder (type, validation), FromMarketplace, FromPartnerXml, ToInvoicing, ToWarehouse
