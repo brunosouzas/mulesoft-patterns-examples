@@ -1,0 +1,257 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<mule xmlns="http://www.mulesoft.org/schema/mule/core"
+	xmlns:http="http://www.mulesoft.org/schema/mule/http"
+	xmlns:os="http://www.mulesoft.org/schema/mule/os"
+	xmlns:ee="http://www.mulesoft.org/schema/mule/ee/core"
+	xmlns:doc="http://www.mulesoft.org/schema/mule/documentation"
+	xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+	xsi:schemaLocation="http://www.mulesoft.org/schema/mule/core http://www.mulesoft.org/schema/mule/core/current/mule.xsd
+		http://www.mulesoft.org/schema/mule/http http://www.mulesoft.org/schema/mule/http/current/mule-http.xsd
+		http://www.mulesoft.org/schema/mule/os http://www.mulesoft.org/schema/mule/os/current/mule-os.xsd
+		http://www.mulesoft.org/schema/mule/ee/core http://www.mulesoft.org/schema/mule/ee/core/current/mule-ee.xsd">
+
+	<!--
+		PROCESS MANAGER (Hohpe and Woolf): "Use a central processing unit, a Process Manager, to maintain the
+		state of the sequence and determine the next processing step based on intermediate results."
+		(https://www.enterpriseintegrationpatterns.com/patterns/messaging/ProcessManager.html)
+		A Routing Slip fixes the steps up front and they run in a line; here the next step depends on the
+		reply to the last one, so the sequence is decided while it runs, by one unit that keeps the state.
+
+		The order process: PAYMENT, then STOCK (reservation), then INVOICE. Each step is a simulated service on
+		this app (process-manager-services.xml) that answers 202 and replies later, asynchronously, by POSTing
+		to the manager's reply endpoint with the processId: the processId is the Correlation Identifier
+		(wave 1), the reply endpoint the reply channel of an asynchronous Request-Reply (wave 4).
+		POST /eip/process-manager/orders                 the trigger message: starts a process, 202 RUNNING
+		POST /eip/process-manager/replies                a step's reply; the manager decides the next step
+		GET  /eip/process-manager/processes/{processId}  the process state: status, currentStep, history
+
+		The decision, on each reply:
+		  PAYMENT APPROVED  -> STOCK                          PAYMENT DECLINED -> end FAILED
+		  STOCK RESERVED    -> INVOICE                        STOCK UNAVAILABLE -> REFUND (compensation), COMPENSATING
+		  INVOICE ISSUED    -> end COMPLETED                  REFUND REFUNDED   -> end CANCELLED
+		Replies: unknown processId 404; a process already ended (COMPLETED, FAILED, CANCELLED, SUSPENDED) 409,
+		late or repeated replies included; a reply for a step the process is not waiting for 409; a repeated
+		reply for the step it is waiting for, while a race is still possible, 200 DUPLICATE and nothing changes.
+		A reply is applied once per process and step: os:store with failIfPresent="true" on a receipts store
+		claims processId:step, and "If the parameter is set to true, then an OS:KEY_ALREADY_EXISTS error is
+		thrown instead" (https://docs.mulesoft.com/object-store-connector/latest/object-store-connector-reference),
+		so of two copies arriving together only one moves the process on. Across workers that holds only in a
+		Mule cluster (same page).
+
+		The state lives in Object Stores declared persistent="true", so a process that waits for a reply for
+		hours survives a restart (the connector's guarantee, not shown by MUnit). There is no timeout here: a
+		reply that never comes leaves the process waiting at its step; a real manager needs a Scheduler that
+		looks for processes waiting too long. A step command that cannot be sent leaves the process SUSPENDED
+		with the error and answers 503.
+
+		WHEN IT IS OVERKILL: if every step answers synchronously within one request, a single flow that calls
+		payment, stock and invoice in sequence, with a Choice on each result and a Try for the refund, is the
+		orchestration, and its state is the event itself; no store, no reply endpoint, no correlation. Use a
+		Process Manager when the steps reply asynchronously or take long, when the process must survive a
+		restart between steps, or when the next step depends on results in ways a fixed sequence (Routing Slip)
+		cannot express.
+
+		Mule components: HTTP Listener (https://docs.mulesoft.com/http-connector/latest/http-listener-ref),
+		HTTP Request (https://docs.mulesoft.com/http-connector/latest/http-request-ref), Object Store
+		(https://docs.mulesoft.com/object-store-connector/latest/object-store-connector-reference), Choice
+		(https://docs.mulesoft.com/mule-runtime/latest/choice-router-concept), Try
+		(https://docs.mulesoft.com/mule-runtime/latest/try-scope-concept), Flow Reference
+		(https://docs.mulesoft.com/mule-runtime/latest/flowref-about).
+		No broker is simulated: the commands and the replies are HTTP calls to this app.
+	-->
+	<os:object-store name="eip-pm-process-store" doc:name="Process Manager State Object Store" persistent="true" />
+	<os:object-store name="eip-pm-receipts-store" doc:name="Process Manager Reply Receipts Object Store" persistent="true" />
+
+	<flow name="process-manager-start-order" doc:description="Process manager trigger: validates the order, creates the process state (RUNNING, history) in the persistent store and sends the first step, PAYMENT; 202 with the processId.">
+		<http:listener doc:name="POST /eip/process-manager/orders" config-ref="http-listener-config" path="/eip/process-manager/orders" allowedMethods="POST">
+			<http:response statusCode="#[vars.httpStatus default 202]" />
+		</http:listener>
+		<choice doc:name="Validate Order">
+			<when expression="#[(not (payload is Object)) or isEmpty(payload.orderId) or isEmpty(payload.sku) or (not (payload.amount is Number)) or (payload.amount &lt;= 0) or (not (payload.quantity is Number)) or (payload.quantity &lt;= 0) or ((payload.quantity mod 1) != 0)]">
+				<raise-error doc:name="Raise BAD_REQUEST Error - Invalid order" type="APP:BAD_REQUEST" description="orderId, sku, a positive amount and a positive integer quantity are required" />
+			</when>
+		</choice>
+		<ee:transform doc:name="Create Process State">
+			<ee:variables>
+				<ee:set-variable variableName="vState"><![CDATA[%dw 2.0
+output application/java
+---
+{
+	processId: "PM-" ++ uuid(),
+	orderId: payload.orderId,
+	order: { amount: payload.amount, sku: payload.sku, quantity: payload.quantity },
+	status: "RUNNING",
+	currentStep: "PAYMENT",
+	history: [],
+	startedAt: now() as String
+}]]></ee:set-variable>
+			</ee:variables>
+		</ee:transform>
+		<logger doc:name="INFO: Log process started" level="INFO" message="#['Process ' ++ vars.vState.processId ++ ' started for orderId=' ++ vars.vState.orderId ++ ', correlationId=' ++ correlationId]" />
+		<flow-ref doc:name="Refer to sf-send-step-command" name="sf-send-step-command" />
+		<set-payload doc:name="Set Started Response" value="#[output application/json --- vars.vState filterObject ((v, k) -> (k as String) != 'history')]" />
+	</flow>
+
+	<flow name="process-manager-receive-reply" doc:description="Process manager reply endpoint: correlates a step's reply by processId, applies it once per process and step, decides the next step (or the end) from the outcome, stores the state and sends the next command; 404 unknown process, 409 ended process or unexpected step, 200 DUPLICATE for a repeat.">
+		<http:listener doc:name="POST /eip/process-manager/replies" config-ref="http-listener-config" path="/eip/process-manager/replies" allowedMethods="POST">
+			<http:response statusCode="#[vars.httpStatus default 200]" />
+		</http:listener>
+		<choice doc:name="Validate Reply">
+			<when expression="#[(not (payload is Object)) or isEmpty(payload.processId) or isEmpty(payload.step) or isEmpty(payload.outcome)]">
+				<raise-error doc:name="Raise BAD_REQUEST Error - Invalid reply" type="APP:BAD_REQUEST" description="processId, step and outcome are required" />
+			</when>
+		</choice>
+		<set-variable doc:name="SET vReply" variableName="vReply" value="#[output application/java --- payload]" />
+		<os:retrieve doc:name="Read Process State" key="#[vars.vReply.processId]" objectStore="eip-pm-process-store" target="vState">
+			<os:default-value><![CDATA[#[output application/java --- { status: null }]]]></os:default-value>
+		</os:retrieve>
+		<choice doc:name="Check Process Can Take The Reply">
+			<when expression="#[vars.vState.status == null]">
+				<raise-error doc:name="Raise NOT_FOUND Error - Unknown process" type="APP:NOT_FOUND" description="No process with this processId" />
+			</when>
+			<when expression="#[not (['RUNNING', 'COMPENSATING'] contains vars.vState.status)]">
+				<raise-error doc:name="Raise CONFLICT Error - Process ended" type="APP:CONFLICT" description="#['Process already ended ' ++ vars.vState.status]" />
+			</when>
+		</choice>
+		<os:contains doc:name="Check Reply Received" key="#[vars.vReply.processId ++ ':' ++ vars.vReply.step]" objectStore="eip-pm-receipts-store" target="vReceived" />
+		<choice doc:name="Check Expected Step">
+			<when expression="#[vars.vReceived]">
+				<set-variable doc:name="SET vDuplicate" variableName="vDuplicate" value="#[true]" />
+			</when>
+			<when expression="#[vars.vReply.step != vars.vState.currentStep]">
+				<raise-error doc:name="Raise CONFLICT Error - Unexpected step" type="APP:CONFLICT" description="#['Process is waiting for ' ++ vars.vState.currentStep ++ ', not ' ++ vars.vReply.step]" />
+			</when>
+			<otherwise>
+				<flow-ref doc:name="Refer to sf-decide-next-step" name="sf-decide-next-step" />
+				<try doc:name="Try Claim Reply">
+					<os:store doc:name="Claim Reply Receipt" key="#[vars.vReply.processId ++ ':' ++ vars.vReply.step]" objectStore="eip-pm-receipts-store" failIfPresent="true">
+						<os:value><![CDATA[#[output application/java --- { outcome: vars.vReply.outcome, receivedAt: now() as String }]]]></os:value>
+					</os:store>
+					<error-handler>
+						<on-error-continue doc:name="On Error Continue (a copy was applied first)" type="OS:KEY_ALREADY_EXISTS" logException="false">
+							<set-variable doc:name="SET vDuplicate" variableName="vDuplicate" value="#[true]" />
+						</on-error-continue>
+					</error-handler>
+				</try>
+				<choice doc:name="Check Claimed">
+					<when expression="#[not (vars.vDuplicate default false)]">
+						<flow-ref doc:name="Refer to sf-apply-reply" name="sf-apply-reply" />
+					</when>
+				</choice>
+			</otherwise>
+		</choice>
+		<choice doc:name="Check Duplicate">
+			<when expression="#[vars.vDuplicate default false]">
+				<logger doc:name="INFO: Log duplicate reply" level="INFO" message="#['Duplicate ' ++ vars.vReply.step ++ ' reply for process ' ++ vars.vReply.processId ++ ' ignored, correlationId=' ++ correlationId]" />
+				<set-payload doc:name="Set Duplicate Response" value="#[output application/json --- { processId: vars.vReply.processId, step: vars.vReply.step, result: 'DUPLICATE', status: vars.vState.status, currentStep: vars.vState.currentStep }]" />
+			</when>
+			<otherwise>
+				<set-payload doc:name="Set Applied Response" value="#[output application/json --- { processId: vars.vState.processId, step: vars.vReply.step, result: 'APPLIED', status: vars.vState.status, currentStep: vars.vState.currentStep }]" />
+			</otherwise>
+		</choice>
+	</flow>
+
+	<sub-flow name="sf-decide-next-step" doc:description="The manager's rules: from the step and its outcome, the next step and the process status; an outcome the step does not have is 400.">
+		<ee:transform doc:name="Decide Next Step">
+			<ee:variables>
+				<ee:set-variable variableName="vDecision"><![CDATA[%dw 2.0
+output application/java
+---
+(vars.vReply.step ++ ":" ++ vars.vReply.outcome) match {
+	case "PAYMENT:APPROVED" -> { status: "RUNNING", nextStep: "STOCK" }
+	case "PAYMENT:DECLINED" -> { status: "FAILED", nextStep: null }
+	case "STOCK:RESERVED" -> { status: "RUNNING", nextStep: "INVOICE" }
+	case "STOCK:UNAVAILABLE" -> { status: "COMPENSATING", nextStep: "REFUND" }
+	case "INVOICE:ISSUED" -> { status: "COMPLETED", nextStep: null }
+	case "REFUND:REFUNDED" -> { status: "CANCELLED", nextStep: null }
+	else -> null
+}]]></ee:set-variable>
+			</ee:variables>
+		</ee:transform>
+		<choice doc:name="Check Known Outcome">
+			<when expression="#[vars.vDecision == null]">
+				<raise-error doc:name="Raise BAD_REQUEST Error - Unknown outcome" type="APP:BAD_REQUEST" description="#['Unknown outcome ' ++ vars.vReply.outcome ++ ' for step ' ++ vars.vReply.step]" />
+			</when>
+		</choice>
+	</sub-flow>
+
+	<sub-flow name="sf-apply-reply" doc:description="Records the reply in the history, moves the process to the decided status and step, stores it, and sends the next command when there is one.">
+		<ee:transform doc:name="Apply Reply To State">
+			<ee:variables>
+				<ee:set-variable variableName="vState"><![CDATA[%dw 2.0
+output application/java
+var ended = vars.vDecision.nextStep == null
+---
+vars.vState ++ {
+	status: vars.vDecision.status,
+	currentStep: vars.vDecision.nextStep,
+	history: vars.vState.history << {
+		step: vars.vReply.step,
+		event: "REPLY",
+		outcome: vars.vReply.outcome,
+		reference: vars.vReply.reference,
+		at: now() as String
+	}
+} ++ (if (ended) { endedAt: now() as String } else {})]]></ee:set-variable>
+			</ee:variables>
+		</ee:transform>
+		<logger doc:name="INFO: Log decision" level="INFO" message="#['Process ' ++ vars.vState.processId ++ ': ' ++ vars.vReply.step ++ ' ' ++ vars.vReply.outcome ++ ' -> ' ++ vars.vState.status ++ ' ' ++ (vars.vState.currentStep default 'end') ++ ', correlationId=' ++ correlationId]" />
+		<choice doc:name="Check Next Step">
+			<when expression="#[vars.vState.currentStep != null]">
+				<flow-ref doc:name="Refer to sf-send-step-command" name="sf-send-step-command" />
+			</when>
+			<otherwise>
+				<os:store doc:name="Store Ended Process" key="#[vars.vState.processId]" objectStore="eip-pm-process-store">
+					<os:value><![CDATA[#[output application/java --- vars.vState]]]></os:value>
+				</os:store>
+			</otherwise>
+		</choice>
+	</sub-flow>
+
+	<sub-flow name="sf-send-step-command" doc:description="Records the command for vars.vState.currentStep in the history, stores the state before sending (the reply can come back before the 202 does), and POSTs the command to the step's service; when it cannot be sent the process is stored SUSPENDED and the caller gets 503.">
+		<ee:transform doc:name="Record Command Sent">
+			<ee:variables>
+				<ee:set-variable variableName="vState"><![CDATA[%dw 2.0
+output application/java
+---
+vars.vState ++ { history: vars.vState.history << { step: vars.vState.currentStep, event: "SENT", at: now() as String } }]]></ee:set-variable>
+			</ee:variables>
+		</ee:transform>
+		<os:store doc:name="Store Process State" key="#[vars.vState.processId]" objectStore="eip-pm-process-store">
+			<os:value><![CDATA[#[output application/java --- vars.vState]]]></os:value>
+		</os:store>
+		<try doc:name="Try Send Step Command">
+			<http:request doc:name="POST Step Command To Service" config-ref="eip-self-http-request-config" method="POST" path="#['/eip/process-manager/services/' ++ lower(vars.vState.currentStep)]">
+				<http:body><![CDATA[#[output application/json --- { processId: vars.vState.processId, step: vars.vState.currentStep, orderId: vars.vState.orderId } ++ vars.vState.order]]]></http:body>
+			</http:request>
+			<error-handler>
+				<on-error-continue doc:name="On Error Continue (command not sent, suspend)" type="ANY" logException="false">
+					<logger doc:name="WARN: Log command not sent" level="WARN" message="#['Process ' ++ vars.vState.processId ++ ' could not send ' ++ vars.vState.currentStep ++ ' (' ++ error.errorType.namespace ++ ':' ++ error.errorType.identifier ++ '), suspended, correlationId=' ++ correlationId]" />
+					<set-variable doc:name="SET vState" variableName="vState" value="#[output application/java --- vars.vState ++ { status: 'SUSPENDED', lastError: error.errorType.namespace ++ ':' ++ error.errorType.identifier }]" />
+					<os:store doc:name="Store Suspended Process" key="#[vars.vState.processId]" objectStore="eip-pm-process-store">
+						<os:value><![CDATA[#[output application/java --- vars.vState]]]></os:value>
+					</os:store>
+				</on-error-continue>
+			</error-handler>
+		</try>
+		<choice doc:name="Check Command Sent">
+			<when expression="#[vars.vState.status == 'SUSPENDED']">
+				<raise-error doc:name="Raise SERVICE_UNAVAILABLE Error - Step not sent" type="APP:SERVICE_UNAVAILABLE" description="#['Step ' ++ vars.vState.currentStep ++ ' could not be sent; process ' ++ vars.vState.processId ++ ' is SUSPENDED']" />
+			</when>
+		</choice>
+	</sub-flow>
+
+	<flow name="process-manager-get-process" doc:description="GET /eip/process-manager/processes/{processId}: the process state (status, currentStep, history); 404 for an unknown processId.">
+		<http:listener doc:name="GET /eip/process-manager/processes/{processId}" config-ref="http-listener-config" path="/eip/process-manager/processes/{processId}" allowedMethods="GET">
+			<http:response statusCode="#[vars.httpStatus default 200]" />
+		</http:listener>
+		<os:contains doc:name="Check Known Process" key="#[attributes.uriParams.processId]" objectStore="eip-pm-process-store" target="vKnown" />
+		<choice doc:name="Check Found">
+			<when expression="#[not vars.vKnown]">
+				<raise-error doc:name="Raise NOT_FOUND Error - Unknown process" type="APP:NOT_FOUND" description="No process with this processId" />
+			</when>
+		</choice>
+		<os:retrieve doc:name="Read Process State" key="#[attributes.uriParams.processId]" objectStore="eip-pm-process-store" />
+		<set-payload doc:name="Set State As JSON" value="#[output application/json --- payload]" />
+	</flow>
+</mule>

@@ -71,3 +71,8 @@ eip:
   # Message expiration: how often the consumer reads the queued stock reservation requests.
   messageExpiration:
     consumerFrequencyMillis: "1000"
+  # Process manager: payments above this amount are declined by the simulated payment service, and the
+  # manager's reply endpoint, where the simulated services post their asynchronous replies.
+  processManager:
+    paymentLimit: "1000"
+    replyPath: "/eip/process-manager/replies"
