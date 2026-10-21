@@ -1,0 +1,91 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<mule xmlns="http://www.mulesoft.org/schema/mule/core"
+	xmlns:munit="http://www.mulesoft.org/schema/mule/munit"
+	xmlns:munit-tools="http://www.mulesoft.org/schema/mule/munit-tools"
+	xmlns:doc="http://www.mulesoft.org/schema/mule/documentation"
+	xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+	xsi:schemaLocation="http://www.mulesoft.org/schema/mule/core http://www.mulesoft.org/schema/mule/core/current/mule.xsd
+		http://www.mulesoft.org/schema/mule/munit http://www.mulesoft.org/schema/mule/munit/current/mule-munit.xsd
+		http://www.mulesoft.org/schema/mule/munit-tools http://www.mulesoft.org/schema/mule/munit-tools/current/mule-munit-tools.xsd">
+
+	<!--
+		Content filter: a paid order with card, contact and cost data goes to the simulated invoicing system over
+		HTTP. Each test reads back what invoicing received, not what the transform was meant to produce.
+	-->
+	<munit:config name="content-filter-test-suite.xml" />
+
+	<munit:test name="cf-invoicing-receives-only-the-fields-it-needs" description="Content filter: invoicing receives exactly the allowed fields, flattened, with the total; the card, contact details, costs, suppliers and notes stay behind">
+		<munit:enable-flow-sources>
+			<munit:enable-flow-source value="invoicing-create-invoice" />
+		</munit:enable-flow-sources>
+		<munit:execution>
+			<munit:set-event doc:name="Paid order ORD-CF-1">
+				<munit:payload value="#[output application/json --- {orderId: 'ORD-CF-1', customer: {id: 'CUS-100', name: 'Ana Lima', email: 'ana@example.com', phone: '+55 11 99999-0000', taxId: '123.456.789-09', address: {street: 'Rua A, 1', city: 'Sao Paulo', country: 'BR'}}, payment: {method: 'CARD', authorizationCode: 'AUTH-777', card: {number: '4111111111111111', holder: 'ANA LIMA', expiry: '12/29'}}, items: [{sku: 'SKU-BOOK', quantity: 2, unitPrice: 30, unitCost: 18, supplier: 'SUP-1'}, {sku: 'SKU-MUG', quantity: 1, unitPrice: 12.5, unitCost: 4, supplier: 'SUP-2'}], internalNotes: 'VIP, call before shipping'}]" mediaType="application/json" />
+			</munit:set-event>
+			<flow-ref doc:name="POST /eip/billing/invoice-requests" name="billing-request-invoice" />
+			<set-variable doc:name="SET vInvoiceResponse" variableName="vInvoiceResponse" value="#[payload]" />
+			<munit:set-event cloneOriginalEvent="true" doc:name="GET received request for ORD-CF-1">
+				<munit:attributes value="#[{uriParams: {orderId: 'ORD-CF-1'}}]" />
+			</munit:set-event>
+			<flow-ref doc:name="GET /eip/invoicing/invoices/{orderId}" name="invoicing-get-received-request" />
+		</munit:execution>
+		<munit:validation>
+			<munit-tools:assert-that doc:name="Invoicing answered" expression="#[vars.vInvoiceResponse.invoiceId]" is="#[MunitTools::equalTo('INV-ORD-CF-1')]" />
+			<munit-tools:assert-that doc:name="Exactly the allowed fields" expression="#[keysOf(payload) map ($ as String)]" is="#[MunitTools::equalTo(['orderId', 'customerId', 'customerName', 'taxId', 'billingCountry', 'paymentReference', 'lines', 'total'])]" />
+			<munit-tools:assert-that doc:name="Flattened customer and payment" expression="#[[payload.customerId, payload.customerName, payload.billingCountry, payload.paymentReference]]" is="#[MunitTools::equalTo(['CUS-100', 'Ana Lima', 'BR', 'AUTH-777'])]" />
+			<munit-tools:assert-that doc:name="Lines without cost or supplier" expression="#[payload.lines]" is="#[MunitTools::equalTo([{sku: 'SKU-BOOK', quantity: 2, unitPrice: 30}, {sku: 'SKU-MUG', quantity: 1, unitPrice: 12.5}])]" />
+			<munit-tools:assert-that doc:name="Total" expression="#[payload.total]" is="#[MunitTools::equalTo(72.5)]" />
+			<munit-tools:assert-that doc:name="Card number nowhere in what arrived" expression="#[write(payload, 'application/json') contains '4111111111111111']" is="#[MunitTools::equalTo(false)]" />
+			<munit-tools:assert-that doc:name="Email nowhere in what arrived" expression="#[write(payload, 'application/json') contains 'ana@example.com']" is="#[MunitTools::equalTo(false)]" />
+		</munit:validation>
+	</munit:test>
+
+	<munit:test name="cf-field-added-to-the-order-later-does-not-leak" description="Content filter: a field the order gains later (a loyalty card number) does not reach invoicing, because the filter lists what it keeps instead of what it removes">
+		<munit:enable-flow-sources>
+			<munit:enable-flow-source value="invoicing-create-invoice" />
+		</munit:enable-flow-sources>
+		<munit:execution>
+			<munit:set-event doc:name="Paid order ORD-CF-2 with a new field">
+				<munit:payload value="#[output application/json --- {orderId: 'ORD-CF-2', customer: {id: 'CUS-100', name: 'Ana Lima', email: 'ana@example.com', phone: '+55 11 99999-0000', taxId: '123.456.789-09', address: {street: 'Rua A, 1', city: 'Sao Paulo', country: 'BR'}}, payment: {method: 'CARD', authorizationCode: 'AUTH-777', card: {number: '4111111111111111', holder: 'ANA LIMA', expiry: '12/29'}}, items: [{sku: 'SKU-BOOK', quantity: 2, unitPrice: 30, unitCost: 18, supplier: 'SUP-1'}, {sku: 'SKU-MUG', quantity: 1, unitPrice: 12.5, unitCost: 4, supplier: 'SUP-2'}], internalNotes: 'VIP, call before shipping', loyaltyCardNumber: 'LOY-5555-0001'}]" mediaType="application/json" />
+			</munit:set-event>
+			<flow-ref doc:name="POST /eip/billing/invoice-requests" name="billing-request-invoice" />
+			<munit:set-event cloneOriginalEvent="true" doc:name="GET received request for ORD-CF-2">
+				<munit:attributes value="#[{uriParams: {orderId: 'ORD-CF-2'}}]" />
+			</munit:set-event>
+			<flow-ref doc:name="GET /eip/invoicing/invoices/{orderId}" name="invoicing-get-received-request" />
+		</munit:execution>
+		<munit:validation>
+			<munit-tools:assert-that doc:name="New field not received" expression="#[write(payload, 'application/json') contains 'LOY-5555-0001']" is="#[MunitTools::equalTo(false)]" />
+			<munit-tools:assert-that doc:name="Order still received" expression="#[payload.orderId]" is="#[MunitTools::equalTo('ORD-CF-2')]" />
+		</munit:validation>
+	</munit:test>
+
+	<munit:test name="cf-order-without-authorization-returns-400-and-nothing-is-sent" description="Content filter: an order without a payment authorization code is rejected with 400 and invoicing is not called">
+		<munit:execution>
+			<munit:set-event doc:name="Order without authorization">
+				<munit:payload value="#[output application/json --- {orderId: 'ORD-CF-3', customer: {id: 'CUS-100'}, payment: {method: 'CARD'}, items: [{sku: 'SKU-BOOK', quantity: 1, unitPrice: 30}]}]" mediaType="application/json" />
+			</munit:set-event>
+			<flow-ref doc:name="POST /eip/billing/invoice-requests" name="billing-request-invoice" />
+		</munit:execution>
+		<munit:validation>
+			<munit-tools:assert-that doc:name="400" expression="#[vars.httpStatus as Number]" is="#[MunitTools::equalTo(400)]" />
+			<munit-tools:verify-call doc:name="Invoicing called 0x" processor="http:request" times="0">
+				<munit-tools:with-attributes>
+					<munit-tools:with-attribute attributeName="doc:name" whereValue="Send Invoice Request To Invoicing" />
+				</munit-tools:with-attributes>
+			</munit-tools:verify-call>
+		</munit:validation>
+	</munit:test>
+
+	<munit:test name="cf-invoicing-has-no-request-for-an-unknown-order" description="Content filter: the simulated invoicing system answers 404 for an order it received no request for">
+		<munit:execution>
+			<munit:set-event cloneOriginalEvent="true" doc:name="GET received request for ORD-CF-NONE">
+				<munit:attributes value="#[{uriParams: {orderId: 'ORD-CF-NONE'}}]" />
+			</munit:set-event>
+			<flow-ref doc:name="GET /eip/invoicing/invoices/{orderId}" name="invoicing-get-received-request" />
+		</munit:execution>
+		<munit:validation>
+			<munit-tools:assert-that doc:name="404" expression="#[vars.httpStatus as Number]" is="#[MunitTools::equalTo(404)]" />
+		</munit:validation>
+	</munit:test>
+</mule>

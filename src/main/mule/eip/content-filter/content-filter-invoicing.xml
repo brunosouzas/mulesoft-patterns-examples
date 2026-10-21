@@ -1,0 +1,50 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<mule xmlns="http://www.mulesoft.org/schema/mule/core"
+	xmlns:http="http://www.mulesoft.org/schema/mule/http"
+	xmlns:os="http://www.mulesoft.org/schema/mule/os"
+	xmlns:ee="http://www.mulesoft.org/schema/mule/ee/core"
+	xmlns:doc="http://www.mulesoft.org/schema/mule/documentation"
+	xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+	xsi:schemaLocation="http://www.mulesoft.org/schema/mule/core http://www.mulesoft.org/schema/mule/core/current/mule.xsd
+		http://www.mulesoft.org/schema/mule/http http://www.mulesoft.org/schema/mule/http/current/mule-http.xsd
+		http://www.mulesoft.org/schema/mule/os http://www.mulesoft.org/schema/mule/os/current/mule-os.xsd
+		http://www.mulesoft.org/schema/mule/ee/core http://www.mulesoft.org/schema/mule/ee/core/current/mule-ee.xsd">
+
+	<!--
+		CONTENT FILTER: the invoicing system, simulated on this application with an in-memory store.
+		POST /eip/invoicing/invoices            -> 201 { invoiceId, orderId }; keeps the request as received
+		GET  /eip/invoicing/invoices/{orderId}  -> the request invoicing received for the order, or 404
+	-->
+	<os:object-store name="eip-invoicing-requests-store" doc:name="Invoicing Requests Object Store" persistent="false" />
+
+	<flow name="invoicing-create-invoice" doc:description="Simulated invoicing system: POST /eip/invoicing/invoices records the invoice request exactly as received and answers 201 with an invoice id.">
+		<http:listener doc:name="POST /eip/invoicing/invoices" config-ref="http-listener-config" path="/eip/invoicing/invoices" allowedMethods="POST">
+			<http:response statusCode="201" />
+		</http:listener>
+		<os:store doc:name="Record Received Invoice Request" key="#[payload.orderId]" objectStore="eip-invoicing-requests-store">
+			<os:value><![CDATA[#[output application/json --- payload]]]></os:value>
+		</os:store>
+		<ee:transform doc:name="Build Invoice Created Response">
+			<ee:message>
+				<ee:set-payload><![CDATA[%dw 2.0
+output application/json
+---
+{ invoiceId: "INV-" ++ payload.orderId, orderId: payload.orderId }]]></ee:set-payload>
+			</ee:message>
+		</ee:transform>
+	</flow>
+
+	<flow name="invoicing-get-received-request" doc:description="Simulated invoicing system: GET /eip/invoicing/invoices/{orderId} returns the invoice request it received for an order, so callers can see what reached it.">
+		<http:listener doc:name="GET /eip/invoicing/invoices/{orderId}" config-ref="http-listener-config" path="/eip/invoicing/invoices/{orderId}" allowedMethods="GET">
+			<http:response statusCode="#[vars.httpStatus default 200]" />
+		</http:listener>
+		<set-variable doc:name="SET vInvoicingOrderId" variableName="vInvoicingOrderId" value="#[attributes.uriParams.orderId]" />
+		<os:contains doc:name="Check Request Received" key="#[vars.vInvoicingOrderId]" objectStore="eip-invoicing-requests-store" target="vRequestReceived" />
+		<choice doc:name="Validate Request Received">
+			<when expression="#[not vars.vRequestReceived]">
+				<raise-error doc:name="Raise NOT_FOUND Error - No invoice request" type="APP:NOT_FOUND" description="#['no invoice request received for ' ++ vars.vInvoicingOrderId]" />
+			</when>
+		</choice>
+		<os:retrieve doc:name="Read Received Invoice Request" key="#[vars.vInvoicingOrderId]" objectStore="eip-invoicing-requests-store" />
+	</flow>
+</mule>

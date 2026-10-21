@@ -1,0 +1,65 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<mule xmlns="http://www.mulesoft.org/schema/mule/core"
+	xmlns:http="http://www.mulesoft.org/schema/mule/http"
+	xmlns:os="http://www.mulesoft.org/schema/mule/os"
+	xmlns:ee="http://www.mulesoft.org/schema/mule/ee/core"
+	xmlns:doc="http://www.mulesoft.org/schema/mule/documentation"
+	xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+	xsi:schemaLocation="http://www.mulesoft.org/schema/mule/core http://www.mulesoft.org/schema/mule/core/current/mule.xsd
+		http://www.mulesoft.org/schema/mule/http http://www.mulesoft.org/schema/mule/http/current/mule-http.xsd
+		http://www.mulesoft.org/schema/mule/os http://www.mulesoft.org/schema/mule/os/current/mule-os.xsd
+		http://www.mulesoft.org/schema/mule/ee/core http://www.mulesoft.org/schema/mule/ee/core/current/mule-ee.xsd">
+
+	<!--
+		CONTENT FILTER (Hohpe and Woolf): removes unimportant data items from a message, leaving only the important
+		ones, and can flatten a deep structure into a simpler one. Here a paid order carries much more than the
+		invoicing system needs, including the card used to pay. Before the order is sent to invoicing, a Transform
+		builds the invoice request from the fields invoicing needs, flattened:
+		POST /eip/billing/invoice-requests
+		  { orderId, customer: { id, name, email, phone, taxId, address: { street, city, country } },
+		    payment: { method, authorizationCode, card: { number, holder, expiry } },
+		    items: [ { sku, quantity, unitPrice, unitCost, supplier } ], internalNotes }
+		-> to invoicing:
+		  { orderId, customerId, customerName, taxId, billingCountry, paymentReference,
+		    lines: [ { sku, quantity, unitPrice } ], total }
+
+		The filter is written as an allow list: the output names every field it keeps. Removing the known
+		sensitive fields instead (payload - "payment") would also pass on any field added to the order later, such
+		as a new card or loyalty number, without anyone deciding that invoicing should have it. With the allow list,
+		a new field reaches invoicing only when it is added to the transform.
+
+		The invoicing system is simulated on this application (content-filter-invoicing.xml) and keeps the last
+		request it received for each order, so the tests read what actually arrived there.
+	-->
+	<flow name="billing-request-invoice" doc:description="Content filter: POST /eip/billing/invoice-requests filters a paid order down to the fields invoicing needs, with no card or contact data, and sends it to the simulated invoicing system.">
+		<http:listener doc:name="POST /eip/billing/invoice-requests" config-ref="http-listener-config" path="/eip/billing/invoice-requests" allowedMethods="POST">
+			<http:response statusCode="#[vars.httpStatus default 201]" />
+		</http:listener>
+		<logger doc:name="INFO: Log invoice request" level="INFO" message="#['Invoice requested for orderId=' ++ (payload.orderId default 'none') ++ ', correlationId=' ++ correlationId]" />
+		<choice doc:name="Validate Paid Order">
+			<when expression="#[(not (payload is Object)) or isEmpty(payload.orderId) or isEmpty(payload.customer.id) or isEmpty(payload.payment.authorizationCode) or (not (payload.items is Array)) or isEmpty(payload.items)]">
+				<raise-error doc:name="Raise BAD_REQUEST Error - Missing order fields" type="APP:BAD_REQUEST" description="orderId, customer.id, payment.authorizationCode and a non-empty items array are required" />
+			</when>
+		</choice>
+		<ee:transform doc:name="Filter Order To Invoice Request">
+			<ee:message>
+				<ee:set-payload><![CDATA[%dw 2.0
+output application/json
+---
+{
+	orderId: payload.orderId,
+	customerId: payload.customer.id,
+	customerName: payload.customer.name,
+	taxId: payload.customer.taxId,
+	billingCountry: payload.customer.address.country,
+	// The authorization code identifies the payment; the card itself stays here.
+	paymentReference: payload.payment.authorizationCode,
+	lines: payload.items map ((item) -> { sku: item.sku, quantity: item.quantity, unitPrice: item.unitPrice }),
+	total: sum(payload.items map ($.quantity * $.unitPrice))
+}]]></ee:set-payload>
+			</ee:message>
+		</ee:transform>
+		<http:request doc:name="Send Invoice Request To Invoicing" config-ref="eip-self-http-request-config" method="POST" path="/eip/invoicing/invoices" />
+		<logger doc:name="INFO: Log invoice created" level="INFO" message="#['Invoice ' ++ payload.invoiceId ++ ' created, correlationId=' ++ correlationId]" />
+	</flow>
+</mule>
