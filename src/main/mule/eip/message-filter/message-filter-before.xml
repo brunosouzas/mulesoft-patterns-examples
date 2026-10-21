@@ -13,12 +13,17 @@
 		POST /eip/stock/before/reservations { orderId, status, items }
 
 		Only paid orders may reserve stock. The Choice sees that the order is not PAID, logs it as discarded and
-		sets the result DISCARDED. But a Choice is a router, not a filter: when its route ends, the flow goes on
-		with the next processor. The reservation after the Choice runs for every order, paid or not, and the
-		caller is told DISCARDED while the warehouse holds stock for an order nobody paid for.
+		sets the result DISCARDED. In the book a Message Filter is a special Content-Based Router with a single
+		output channel: a message that does not qualify goes nowhere. A Mule Choice does not work that way: when
+		its route ends, the flow goes on with the next processor. The reservation after the Choice runs for every
+		order, paid or not, and the caller is told DISCARDED while the warehouse holds stock for an order nobody
+		paid for.
 
-		Mule 3 had filters that stopped the message; Mule 4 has none. Nothing after a Choice is skipped unless
-		the Choice puts it inside a route, or something raises an error. See message-filter-after.xml.
+		Mule 3 filters ended the flow silently. In Mule 4 they are replaced by the Validation module
+		(validation:is-true and the other validators), which raises a VALIDATION error when the message does not
+		qualify, so the flow stops and its error handling decides the answer:
+		https://docs.mulesoft.com/mule-runtime/4.3/migration-filters. Nothing after a Choice is skipped unless the
+		Choice puts it inside a route, or something raises an error. See message-filter-after.xml.
 	-->
 	<flow name="stock-before-reserve-paid-orders" doc:description="Message filter, before: meant to reserve stock only for PAID orders, but reserves it for every order because the reservation sits after the Choice that should have discarded the others.">
 		<http:listener doc:name="POST /eip/stock/before/reservations" config-ref="http-listener-config" path="/eip/stock/before/reservations" allowedMethods="POST">

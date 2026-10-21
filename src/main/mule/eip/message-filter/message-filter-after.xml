@@ -17,10 +17,13 @@
 		- anything else: discard it (log it and answer DISCARDED), nothing is reserved.
 		The answer is 200 in both cases: for the sender a discarded order is a normal outcome, not an error.
 
-		Another way to stop the flow is to raise an error when the message does not qualify and handle it with
-		on-error-continue (in a Try, or in the flow's error handler). It ends the flow right there, but it
-		uses errors for normal control flow and every discarded message passes through the error handling.
-		Keep the filter in a Choice when the discarded path is short, as here.
+		The other way, and the one MuleSoft documents as the Mule 4 replacement for filters, is to raise an error
+		when the message does not qualify: a Validation module validator (validation:is-true and the others,
+		which raise VALIDATION errors; https://docs.mulesoft.com/mule-runtime/4.3/migration-filters) or a
+		raise-error, handled with on-error-continue (in a Try, or in the flow's error handler). It ends the flow
+		right there, but it uses errors for normal control flow and every discarded message passes through the
+		error handling. This project keeps the filter in a Choice, because the discarded path is short and the
+		Validation module is not a dependency here.
 	-->
 	<flow name="stock-after-reserve-paid-orders" doc:description="Message filter, after: reserves stock only for PAID orders; any other order is discarded inside the Choice and nothing after the Choice depends on the filter.">
 		<http:listener doc:name="POST /eip/stock/after/reservations" config-ref="http-listener-config" path="/eip/stock/after/reservations" allowedMethods="POST">
