@@ -1,0 +1,187 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<mule xmlns="http://www.mulesoft.org/schema/mule/core"
+	xmlns:http="http://www.mulesoft.org/schema/mule/http"
+	xmlns:os="http://www.mulesoft.org/schema/mule/os"
+	xmlns:aggregators="http://www.mulesoft.org/schema/mule/aggregators"
+	xmlns:ee="http://www.mulesoft.org/schema/mule/ee/core"
+	xmlns:doc="http://www.mulesoft.org/schema/mule/documentation"
+	xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+	xsi:schemaLocation="http://www.mulesoft.org/schema/mule/core http://www.mulesoft.org/schema/mule/core/current/mule.xsd
+		http://www.mulesoft.org/schema/mule/http http://www.mulesoft.org/schema/mule/http/current/mule-http.xsd
+		http://www.mulesoft.org/schema/mule/os http://www.mulesoft.org/schema/mule/os/current/mule-os.xsd
+		http://www.mulesoft.org/schema/mule/aggregators http://www.mulesoft.org/schema/mule/aggregators/current/mule-aggregators.xsd
+		http://www.mulesoft.org/schema/mule/ee/core http://www.mulesoft.org/schema/mule/ee/core/current/mule-ee.xsd">
+
+	<!--
+		AGGREGATOR (Hohpe and Woolf): collects related messages until a set is complete and then publishes one
+		message built from them. Here the warehouse confirms an order's items one at a time, each in its own HTTP
+		request, and the invoice is issued once every item of the order has arrived.
+		POST /eip/invoices/items { orderId, itemCount, sku, quantity, unitPrice }   one item of an order
+		GET  /eip/invoices/{orderId}                                                 the invoice (ISSUED or INCOMPLETE)
+
+		The group-based aggregator of the Aggregators module answers the book's three questions:
+		- Correlation, which messages belong together: groupId="#[payload.orderId]". The defaults
+		  (groupId #[correlationId], groupSize #[itemSequenceInfo.sequenceSize]) only fit an aggregator placed
+		  inside the For Each that split the message, where the sequence information exists. Items that arrive
+		  as separate requests carry no sequence information, and every request sent from one flow carries that
+		  flow's correlationId (see the idempotent receiver), so both are set from the business data.
+		- Completeness, when the set is done: groupSize="#[payload.itemCount]", sent with every item. Every item
+		  of a group must carry the same itemCount; only the first one counts.
+		- Aggregation, what is published: the aggregation-complete route builds the invoice from the list of
+		  aggregated items (in arrival order: HTTP requests carry no sequence numbers to sort them by).
+
+		The aggregator is a pass-through scope: the payload after it is the item that came in. Variables set in
+		its routes do come out, which is how the endpoint knows whether this item completed the invoice
+		(201 with the invoice) or not yet (202 with the progress).
+
+		The content is stored in an object store, so it must be serializable: the content expression has output application/java, so it stores a
+		plain map, not the request's JSON stream.
+
+		Groups that never complete: after eip.invoice.groupTimeoutSeconds the group times out; the listener flow
+		below (includeTimedOutGroups="true") records the invoice as INCOMPLETE with the items that did arrive.
+		A finished group (completed or timed out) is remembered for eip.invoice.groupEvictionMinutes: an item
+		that arrives for it in that window raises AGGREGATORS:GROUP_COMPLETED or AGGREGATORS:GROUP_TIMED_OUT
+		(answered 409). After eviction the same orderId would start a new group. The aggregator does not
+		deduplicate either: the same item sent twice counts twice towards itemCount; put an idempotent receiver
+		in front when the sender can repeat itself.
+
+		The stores are in memory so every run starts clean. In production, and always in a cluster, the
+		aggregator needs a persistent, shared object store, or a group split across workers never completes.
+	-->
+	<os:object-store name="eip-invoice-aggregation-store" doc:name="Invoice Aggregation Object Store" persistent="false" />
+	<os:object-store name="eip-invoices-store" doc:name="Invoices Object Store" persistent="false" />
+
+	<flow name="invoice-aggregate-order-items" doc:description="Aggregator: receives one item of an order per request on POST /eip/invoices/items and, once every item of the order has arrived, issues the order's invoice.">
+		<http:listener doc:name="POST /eip/invoices/items" config-ref="http-listener-config" path="/eip/invoices/items" allowedMethods="POST">
+			<http:response statusCode="#[vars.httpStatus default 200]" />
+		</http:listener>
+		<logger doc:name="INFO: Log item received" level="INFO" message="#['Invoice item ' ++ (payload.sku default 'none') ++ ' for orderId=' ++ (payload.orderId default 'none') ++ ', correlationId=' ++ correlationId]" />
+		<flow-ref doc:name="Refer to sf-validate-invoice-item" name="sf-validate-invoice-item" />
+		<set-variable doc:name="SET vOrderId" variableName="vOrderId" value="#[payload.orderId]" />
+		<try doc:name="Try Aggregate Item Into Its Order">
+			<aggregators:group-based-aggregator doc:name="Aggregate Items By orderId" name="invoice-items-by-order-aggregator"
+				groupId="#[payload.orderId]" groupSize="#[payload.itemCount]"
+				timeout="${eip.invoice.groupTimeoutSeconds}" timeoutUnit="SECONDS"
+				evictionTime="${eip.invoice.groupEvictionMinutes}" evictionTimeUnit="MINUTES"
+				objectStore="eip-invoice-aggregation-store">
+				<aggregators:content><![CDATA[#[output application/java --- { sku: payload.sku, quantity: payload.quantity, unitPrice: payload.unitPrice, itemCount: payload.itemCount }]]]></aggregators:content>
+				<aggregators:incremental-aggregation>
+					<set-variable doc:name="SET vReceivedItems" variableName="vReceivedItems" value="#[sizeOf(payload)]" />
+				</aggregators:incremental-aggregation>
+				<aggregators:aggregation-complete>
+					<flow-ref doc:name="Refer to sf-issue-invoice" name="sf-issue-invoice" />
+				</aggregators:aggregation-complete>
+			</aggregators:group-based-aggregator>
+			<error-handler>
+				<on-error-continue doc:name="On Error Continue (group already invoiced)" type="AGGREGATORS:GROUP_COMPLETED" logException="false">
+					<set-variable doc:name="SET vRejectedReason" variableName="vRejectedReason" value="GROUP_COMPLETED" />
+				</on-error-continue>
+				<on-error-continue doc:name="On Error Continue (group timed out)" type="AGGREGATORS:GROUP_TIMED_OUT" logException="false">
+					<set-variable doc:name="SET vRejectedReason" variableName="vRejectedReason" value="GROUP_TIMED_OUT" />
+				</on-error-continue>
+			</error-handler>
+		</try>
+		<choice doc:name="Choose Item Response">
+			<when expression="#[vars.vRejectedReason != null]">
+				<logger doc:name="WARN: Log late item" level="WARN" message="#['Item ' ++ payload.sku ++ ' arrived after order ' ++ vars.vOrderId ++ ' was closed (' ++ vars.vRejectedReason ++ '), correlationId=' ++ correlationId]" />
+				<set-variable doc:name="SET httpStatus" variableName="httpStatus" value="409" />
+				<ee:transform doc:name="Build Rejected Item Response">
+					<ee:message>
+						<ee:set-payload><![CDATA[%dw 2.0
+output application/json
+---
+{ orderId: vars.vOrderId, sku: payload.sku, result: "REJECTED", reason: vars.vRejectedReason }]]></ee:set-payload>
+					</ee:message>
+				</ee:transform>
+			</when>
+			<when expression="#[vars.vInvoice != null]">
+				<set-variable doc:name="SET httpStatus" variableName="httpStatus" value="201" />
+				<set-payload doc:name="Set Invoice As Response" value="#[output application/json --- vars.vInvoice]" />
+			</when>
+			<otherwise>
+				<set-variable doc:name="SET httpStatus" variableName="httpStatus" value="202" />
+				<ee:transform doc:name="Build Waiting Response">
+					<ee:message>
+						<ee:set-payload><![CDATA[%dw 2.0
+output application/json
+---
+{ orderId: vars.vOrderId, result: "WAITING", receivedItems: vars.vReceivedItems, expectedItems: payload.itemCount }]]></ee:set-payload>
+					</ee:message>
+				</ee:transform>
+			</otherwise>
+		</choice>
+	</flow>
+
+	<sub-flow name="sf-validate-invoice-item" doc:description="Validates one invoice item: orderId, sku, a positive itemCount and numeric quantity and unitPrice are required.">
+		<choice doc:name="Validate Invoice Item">
+			<when expression="#[(not (payload is Object)) or isEmpty(payload.orderId) or isEmpty(payload.sku) or (not (payload.itemCount is Number)) or (payload.itemCount default 0) &lt; 1 or (not (payload.quantity is Number)) or (not (payload.unitPrice is Number))]">
+				<raise-error doc:name="Raise BAD_REQUEST Error - Missing item fields" type="APP:BAD_REQUEST" description="orderId, sku, itemCount (1 or more), quantity and unitPrice (numbers) are required" />
+			</when>
+		</choice>
+	</sub-flow>
+
+	<sub-flow name="sf-issue-invoice" doc:description="Called by the aggregation-complete route with the list of the order's items: builds the invoice, stores it and leaves it in vars.vInvoice.">
+		<ee:transform doc:name="Build Invoice From Aggregated Items">
+			<ee:variables>
+				<ee:set-variable variableName="vInvoice"><![CDATA[%dw 2.0
+output application/java
+var lines = payload map { sku: $.sku, quantity: $.quantity, unitPrice: $.unitPrice, lineTotal: $.quantity * $.unitPrice }
+---
+{
+	invoiceId: "INV-" ++ uuid(),
+	orderId: vars.vOrderId,
+	status: "ISSUED",
+	lines: lines,
+	total: sum(lines map $.lineTotal),
+	issuedAt: now() as String
+}]]></ee:set-variable>
+			</ee:variables>
+		</ee:transform>
+		<os:store doc:name="Store Invoice" key="#[vars.vOrderId]" objectStore="eip-invoices-store">
+			<os:value><![CDATA[#[vars.vInvoice]]]></os:value>
+		</os:store>
+		<logger doc:name="INFO: Log invoice issued" level="INFO" message="#['Invoice ' ++ vars.vInvoice.invoiceId ++ ' issued for orderId=' ++ vars.vOrderId ++ ', correlationId=' ++ correlationId]" />
+	</sub-flow>
+
+	<!--
+		Listener for the aggregator above. It is called for every group the aggregator releases; with
+		includeTimedOutGroups="true" that includes groups released by the timeout, with
+		attributes.isAggregationComplete false. Completed groups were already invoiced by the aggregation-complete
+		route, so only timed-out ones are handled here. The listener runs in its own flow: it cannot see the
+		variables of the request that last touched the group, only the aggregated items and the attributes.
+	-->
+	<flow name="invoice-record-incomplete-order" doc:description="Aggregator listener: when an order's items stop arriving and its group times out, records the invoice as INCOMPLETE with the items that did arrive.">
+		<aggregators:aggregator-listener doc:name="On Group Released By invoice-items-by-order-aggregator" aggregatorName="invoice-items-by-order-aggregator" includeTimedOutGroups="true" />
+		<choice doc:name="Check Group Timed Out">
+			<when expression="#[not attributes.isAggregationComplete]">
+				<os:store doc:name="Store Incomplete Invoice" key="#[attributes.aggregationId]" objectStore="eip-invoices-store">
+					<os:value><![CDATA[#[output application/java --- {
+	orderId: attributes.aggregationId,
+	status: "INCOMPLETE",
+	receivedItems: sizeOf(payload),
+	expectedItems: payload[0].itemCount,
+	receivedSkus: payload map $.sku
+}]]]></os:value>
+				</os:store>
+				<logger doc:name="WARN: Log incomplete order" level="WARN" message="#['Order ' ++ attributes.aggregationId ++ ' timed out with ' ++ sizeOf(payload) ++ ' of ' ++ payload[0].itemCount ++ ' items; invoice INCOMPLETE']" />
+			</when>
+			<otherwise>
+				<logger doc:name="DEBUG: Log group already invoiced" level="DEBUG" message="#['Order ' ++ attributes.aggregationId ++ ' completed; invoiced by the aggregation-complete route']" />
+			</otherwise>
+		</choice>
+	</flow>
+
+	<flow name="invoice-get" doc:description="GET /eip/invoices/{orderId}: the order's invoice, ISSUED or INCOMPLETE; 404 when there is none.">
+		<http:listener doc:name="GET /eip/invoices/{orderId}" config-ref="http-listener-config" path="/eip/invoices/{orderId}" allowedMethods="GET">
+			<http:response statusCode="#[vars.httpStatus default 200]" />
+		</http:listener>
+		<os:contains doc:name="Check Invoice Exists" key="#[attributes.uriParams.orderId]" objectStore="eip-invoices-store" target="vInvoiceExists" />
+		<choice doc:name="Check Invoice Found">
+			<when expression="#[not vars.vInvoiceExists]">
+				<raise-error doc:name="Raise NOT_FOUND Error - No invoice" type="APP:NOT_FOUND" description="No invoice for this order" />
+			</when>
+		</choice>
+		<os:retrieve doc:name="Read Invoice" key="#[attributes.uriParams.orderId]" objectStore="eip-invoices-store" />
+		<set-payload doc:name="Set Invoice As JSON" value="#[output application/json --- payload]" />
+	</flow>
+</mule>
