@@ -1,0 +1,69 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<mule xmlns="http://www.mulesoft.org/schema/mule/core"
+	xmlns:http="http://www.mulesoft.org/schema/mule/http"
+	xmlns:os="http://www.mulesoft.org/schema/mule/os"
+	xmlns:doc="http://www.mulesoft.org/schema/mule/documentation"
+	xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+	xsi:schemaLocation="http://www.mulesoft.org/schema/mule/core http://www.mulesoft.org/schema/mule/core/current/mule.xsd
+		http://www.mulesoft.org/schema/mule/http http://www.mulesoft.org/schema/mule/http/current/mule-http.xsd
+		http://www.mulesoft.org/schema/mule/os http://www.mulesoft.org/schema/mule/os/current/mule-os.xsd">
+
+	<!--
+		Simulated fulfilment system for the guaranteed delivery example. It can be switched off (PUT
+		/eip/fulfilment/availability { "available": false }), then it answers 503 to every order, so the forwarder's
+		redelivery can be shown. It counts how many times it received each order (timesReceived).
+	-->
+	<os:object-store name="eip-gd-fulfilment-store" doc:name="Simulated Fulfilment Object Store" persistent="false" />
+
+	<flow name="fulfilment-receive-order" doc:description="Simulated fulfilment: accepts an order (200) while available and counts the receipt; answers 503 while switched off.">
+		<http:listener doc:name="POST /eip/fulfilment/orders" config-ref="http-listener-config" path="/eip/fulfilment/orders" allowedMethods="POST">
+			<http:response statusCode="#[vars.httpStatus default 200]" />
+		</http:listener>
+		<os:retrieve doc:name="Read Availability" key="available" objectStore="eip-gd-fulfilment-store" target="vAvailable">
+			<os:default-value><![CDATA[#[true]]]></os:default-value>
+		</os:retrieve>
+		<choice doc:name="Check Fulfilment Available">
+			<when expression="#[not (vars.vAvailable as Boolean)]">
+				<raise-error doc:name="Raise SERVICE_UNAVAILABLE Error - Fulfilment down" type="APP:SERVICE_UNAVAILABLE" description="Fulfilment unavailable" />
+			</when>
+		</choice>
+		<set-variable doc:name="SET vOrderId" variableName="vOrderId" value="#[payload.orderId]" />
+		<os:retrieve doc:name="Read Previous Receipts" key="#['order-' ++ vars.vOrderId]" objectStore="eip-gd-fulfilment-store" target="vPrevious">
+			<os:default-value><![CDATA[#[output application/java --- { timesReceived: 0 }]]]></os:default-value>
+		</os:retrieve>
+		<os:store doc:name="Record Receipt" key="#['order-' ++ vars.vOrderId]" objectStore="eip-gd-fulfilment-store">
+			<os:value><![CDATA[#[output application/java --- { orderId: vars.vOrderId, timesReceived: vars.vPrevious.timesReceived + 1 }]]]></os:value>
+		</os:store>
+		<set-payload doc:name="Set Received Response" value="#[output application/json --- { orderId: vars.vOrderId, status: 'RECEIVED' }]" />
+	</flow>
+
+	<flow name="fulfilment-set-availability" doc:description="Simulated fulfilment: switches the system on or off, to show the forwarder's redelivery.">
+		<http:listener doc:name="PUT /eip/fulfilment/availability" config-ref="http-listener-config" path="/eip/fulfilment/availability" allowedMethods="PUT">
+			<http:response statusCode="#[vars.httpStatus default 200]" />
+		</http:listener>
+		<choice doc:name="Validate Availability">
+			<when expression="#[(not (payload is Object)) or (not (payload.available is Boolean))]">
+				<raise-error doc:name="Raise BAD_REQUEST Error - available not boolean" type="APP:BAD_REQUEST" description="available must be true or false" />
+			</when>
+		</choice>
+		<os:store doc:name="Store Availability" key="available" objectStore="eip-gd-fulfilment-store">
+			<os:value><![CDATA[#[payload.available]]]></os:value>
+		</os:store>
+		<set-payload doc:name="Set Availability Response" value="#[output application/json --- { available: payload.available }]" />
+	</flow>
+
+	<flow name="fulfilment-get-order" doc:description="Simulated fulfilment: how many times an order was received, 404 when never.">
+		<http:listener doc:name="GET /eip/fulfilment/orders/{orderId}" config-ref="http-listener-config" path="/eip/fulfilment/orders/{orderId}" allowedMethods="GET">
+			<http:response statusCode="#[vars.httpStatus default 200]" />
+		</http:listener>
+		<os:retrieve doc:name="Read Receipts" key="#['order-' ++ attributes.uriParams.orderId]" objectStore="eip-gd-fulfilment-store">
+			<os:default-value><![CDATA[#[output application/java --- {}]]]></os:default-value>
+		</os:retrieve>
+		<choice doc:name="Check Order Received">
+			<when expression="#[isEmpty(payload)]">
+				<raise-error doc:name="Raise NOT_FOUND Error - Never received" type="APP:NOT_FOUND" description="Order never received by fulfilment" />
+			</when>
+		</choice>
+		<set-payload doc:name="Set Receipts As JSON" value="#[output application/json --- payload]" />
+	</flow>
+</mule>

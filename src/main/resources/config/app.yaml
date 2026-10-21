@@ -63,3 +63,9 @@ eip:
   competingConsumers:
     consumers: "3"
     workMillis: "50"
+  # Guaranteed delivery: how often the forwarder sends the orders still in the persistent outbox.
+  guaranteedDelivery:
+    forwardFrequencyMillis: "1000"
+  # Message expiration: how often the consumer reads the queued stock reservation requests.
+  messageExpiration:
+    consumerFrequencyMillis: "1000"
