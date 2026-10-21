@@ -179,4 +179,55 @@
 			</munit-tools:verify-call>
 		</munit:validation>
 	</munit:test>
+
+	<munit:test name="rr-second-reply-is-rejected-with-409" description="Request-reply: once a reply is recorded for an order, another reply for it gets 409 and does not overwrite the first">
+		<munit:enable-flow-sources>
+			<munit:enable-flow-source value="stock-reserve-request-reply-async" />
+			<munit:enable-flow-source value="stock-receive-reservation-reply" />
+			<munit:enable-flow-source value="stock-get-reservation-reply" />
+		</munit:enable-flow-sources>
+		<munit:behavior>
+			<munit-tools:mock-when doc:name="Warehouse accepts and never replies" processor="http:request">
+				<munit-tools:with-attributes>
+					<munit-tools:with-attribute attributeName="doc:name" whereValue="POST Reservation Request To Warehouse" />
+				</munit-tools:with-attributes>
+				<munit-tools:then-return>
+					<munit-tools:attributes value="#[{ statusCode: 202 }]" />
+				</munit-tools:then-return>
+			</munit-tools:mock-when>
+		</munit:behavior>
+		<munit:execution>
+			<http:request doc:name="POST async request" config-ref="eip-self-http-request-config" method="POST" path="/eip/stock/reservations/async" target="vRequest" targetValue="#[output application/java --- { status: attributes.statusCode, contentType: attributes.headers.'content-type' default '', body: payload }]">
+				<http:body><![CDATA[#[output application/json --- {orderId: 'ORD-RR-TWICE', sku: 'SKU-MUG', quantity: 1}]]]></http:body>
+				<http:response-validator>
+					<http:success-status-code-validator values="200..499" />
+				</http:response-validator>
+			</http:request>
+			<http:request doc:name="POST first reply" config-ref="eip-self-http-request-config" method="POST" path="/eip/stock/reservation-replies" target="vFirst" targetValue="#[output application/java --- { status: attributes.statusCode, contentType: attributes.headers.'content-type' default '', body: payload }]">
+				<http:body><![CDATA[#[output application/json --- {orderId: 'ORD-RR-TWICE', status: 'RESERVED', reservationId: 'RSV-FIRST'}]]]></http:body>
+				<http:response-validator>
+					<http:success-status-code-validator values="200..499" />
+				</http:response-validator>
+			</http:request>
+			<http:request doc:name="POST second reply" config-ref="eip-self-http-request-config" method="POST" path="/eip/stock/reservation-replies" target="vSecond" targetValue="#[output application/java --- { status: attributes.statusCode, contentType: attributes.headers.'content-type' default '', body: payload }]">
+				<http:body><![CDATA[#[output application/json --- {orderId: 'ORD-RR-TWICE', status: 'RESERVED', reservationId: 'RSV-SECOND'}]]]></http:body>
+				<http:response-validator>
+					<http:success-status-code-validator values="200..499" />
+				</http:response-validator>
+			</http:request>
+			<http:request doc:name="GET reply" config-ref="eip-self-http-request-config" method="GET" path="/eip/stock/reservation-replies/ORD-RR-TWICE" target="vReply" targetValue="#[output application/java --- { status: attributes.statusCode, contentType: attributes.headers.'content-type' default '', body: payload }]">
+				<http:response-validator>
+					<http:success-status-code-validator values="200..499" />
+				</http:response-validator>
+			</http:request>
+		</munit:execution>
+		<munit:validation>
+			<munit-tools:assert-that doc:name="Request 202" expression="#[vars.vRequest.status]" is="#[MunitTools::equalTo(202)]" />
+			<munit-tools:assert-that doc:name="First reply 200" expression="#[vars.vFirst.status]" is="#[MunitTools::equalTo(200)]" />
+			<munit-tools:assert-that doc:name="Second reply 409" expression="#[vars.vSecond.status]" is="#[MunitTools::equalTo(409)]" />
+			<munit-tools:assert-that doc:name="JSON" expression="#[vars.vSecond.contentType]" is="#[MunitTools::startsWith('application/json')]" />
+			<munit-tools:assert-that doc:name="Says why" expression="#[vars.vSecond.body.error]" is="#[MunitTools::equalTo('A reply for this orderId was already received')]" />
+			<munit-tools:assert-that doc:name="First reply kept" expression="#[vars.vReply.body.reservationId]" is="#[MunitTools::equalTo('RSV-FIRST')]" />
+		</munit:validation>
+	</munit:test>
 </mule>

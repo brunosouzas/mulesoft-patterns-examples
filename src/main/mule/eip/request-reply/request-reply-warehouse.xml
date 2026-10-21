@@ -17,6 +17,9 @@
 		POST /eip/warehouse/reservations           synchronous: replies 201 with the reservation, after the delay
 		POST /eip/warehouse/reservation-requests   asynchronous: answers 202 at once and POSTs the reservation to the
 		                                           requestor's reply channel (eip.requestReply.replyChannelPath) later
+		The reply POST runs in the Async scope after the 202 is sent, so nobody waits for it: if it fails, the
+		reply is lost and the request stays PENDING. There is no timeout or retry here; a real requestor needs one
+		(a timeout on PENDING requests, or a replier that retries the reply).
 	-->
 	<flow name="warehouse-reserve-sync" doc:description="Simulated warehouse, synchronous replier: makes the reservation and replies with it in the HTTP response.">
 		<http:listener doc:name="POST /eip/warehouse/reservations" config-ref="http-listener-config" path="/eip/warehouse/reservations" allowedMethods="POST">

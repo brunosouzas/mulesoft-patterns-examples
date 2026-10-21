@@ -82,7 +82,7 @@ output application/json
 		<set-payload doc:name="Set Pending Response" value="#[output application/json --- { mode: 'ASYNC', orderId: vars.vRequest.orderId, status: 'PENDING', replyChannel: p('eip.requestReply.replyChannelPath') }]" />
 	</flow>
 
-	<flow name="stock-receive-reservation-reply" doc:description="Request-reply reply channel: receives the warehouse's asynchronous reservation reply and records it for the order that is waiting for it; 404 when no request is pending.">
+	<flow name="stock-receive-reservation-reply" doc:description="Request-reply reply channel: receives the warehouse's asynchronous reservation reply and records it for the order that is waiting for it; 404 when no request was sent, 409 when a reply was already received.">
 		<http:listener doc:name="POST /eip/stock/reservation-replies" config-ref="http-listener-config" path="/eip/stock/reservation-replies" allowedMethods="POST">
 			<http:response statusCode="#[vars.httpStatus default 200]" />
 		</http:listener>
@@ -92,10 +92,16 @@ output application/json
 			</when>
 		</choice>
 		<set-variable doc:name="SET vReply" variableName="vReply" value="#[output application/java --- payload]" />
-		<os:contains doc:name="Check Pending Request" key="#[vars.vReply.orderId]" objectStore="eip-reservation-replies-store" target="vKnown" />
-		<choice doc:name="Check Request Was Sent">
-			<when expression="#[not vars.vKnown]">
+		<os:retrieve doc:name="Read Pending Request" key="#[vars.vReply.orderId]" objectStore="eip-reservation-replies-store" target="vPending">
+			<os:default-value><![CDATA[#[output application/java --- { status: null }]]]></os:default-value>
+		</os:retrieve>
+		<!-- One reply per request: a second reply for the same order is rejected (409) and does not overwrite the first. -->
+		<choice doc:name="Check Request Is Pending">
+			<when expression="#[vars.vPending.status == null]">
 				<raise-error doc:name="Raise NOT_FOUND Error - No request" type="APP:NOT_FOUND" description="No reservation request for this orderId" />
+			</when>
+			<when expression="#[vars.vPending.status != 'PENDING']">
+				<raise-error doc:name="Raise CONFLICT Error - Already replied" type="APP:CONFLICT" description="A reply for this orderId was already received" />
 			</when>
 		</choice>
 		<os:store doc:name="Store Reply" key="#[vars.vReply.orderId]" objectStore="eip-reservation-replies-store">
