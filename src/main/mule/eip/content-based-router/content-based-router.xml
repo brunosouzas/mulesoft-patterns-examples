@@ -21,7 +21,8 @@
 		Choice evaluates the <when> expressions top to bottom and runs only the first that is true, so the order of
 		the rules is part of the routing: a high-value international order goes to review, never to international
 		fulfilment. The <otherwise> makes the router total: every valid order goes somewhere. Without it, an order
-		no rule matches passes through the Choice untouched and the caller gets its own request back.
+		no rule matches passes through the Choice untouched and the caller gets its own request back (MUnit test
+		cbr-without-otherwise-unmatched-order-comes-back-unchanged).
 
 		Routing data comes from configuration (app.yaml), not from the XML, so the threshold and the home country
 		can change per environment. When the set of handlers itself keeps growing, look the handler up in
