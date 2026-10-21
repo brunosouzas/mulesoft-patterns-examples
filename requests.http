@@ -156,3 +156,53 @@ POST {{base}}/eip/orders/checks
 Content-Type: application/json
 
 { "orderId": "ORD-3501", "customerId": "CUS-100", "items": [ { "sku": "SKU-BOOK", "quantity": 2, "unitPrice": 30 }, { "sku": "SKU-MUG", "quantity": 1, "unitPrice": 12.5 } ] }
+
+### EIP message translator — a partner order as CSV becomes this app's order
+POST {{base}}/eip/orders/translate
+Content-Type: application/csv
+
+partnerOrderRef,buyerCode,shipToCountry,productCode,qty,unitPriceCents
+P-77,B-100,BR,BOOK-01,2,3000
+P-77,B-100,BR,MUG-02,1,1250
+
+### EIP canonical data model — a marketplace JSON order: canonical order, invoicing request, warehouse CSV
+POST {{base}}/eip/canonical/orders/marketplace
+Content-Type: application/json
+
+{ "id": "MK-501", "buyer": { "accountId": "A-9" }, "shipping": { "country": "BR" }, "lines": [ { "listing": { "sku": "SKU-BOOK" }, "units": 2, "price": { "amount": "30.00", "currency": "BRL" } }, { "listing": { "sku": "SKU-MUG" }, "units": 1, "price": { "amount": "12.50", "currency": "BRL" } } ] }
+
+### ...the same order as a partner XML purchase order gives the same target documents
+POST {{base}}/eip/canonical/orders/partner
+Content-Type: application/xml
+
+<PurchaseOrder number="PO-77" currency="BRL"><Customer code="A-9"/><ShipTo country="BR"/><Lines><Line sku="SKU-BOOK" quantity="2" unitPrice="30.00"/><Line sku="SKU-MUG" quantity="1" unitPrice="12.50"/></Lines></PurchaseOrder>
+
+### EIP content filter — invoicing gets only what it needs (no card, contact or cost data)
+POST {{base}}/eip/billing/invoice-requests
+Content-Type: application/json
+
+{ "orderId": "ORD-3601", "customer": { "id": "CUS-100", "name": "Ana Lima", "email": "ana@example.com", "phone": "+55 11 99999-0000", "taxId": "123.456.789-09", "address": { "street": "Rua A, 1", "city": "Sao Paulo", "country": "BR" } }, "payment": { "method": "CARD", "authorizationCode": "AUTH-777", "card": { "number": "4111111111111111", "holder": "ANA LIMA", "expiry": "12/29" } }, "items": [ { "sku": "SKU-BOOK", "quantity": 2, "unitPrice": 30, "unitCost": 18, "supplier": "SUP-1" } ], "internalNotes": "VIP" }
+
+### What invoicing received
+GET {{base}}/eip/invoicing/invoices/ORD-3601
+
+### EIP claim check — check a document in; the archive gets only the claim key (the claim expires after 3 seconds)
+POST {{base}}/eip/orders/documents
+Content-Type: application/json
+
+{ "orderId": "ORD-3701", "document": { "fileName": "po-3701.pdf", "mediaType": "application/pdf", "contentBase64": "JVBERi0xLjQKJcfsj6IKMSAwIG9iago8PC9UeXBlL0NhdGFsb2c+PgplbmRvYmoK" } }
+
+### Check the document out: replace the key with the claimKey above (404 once it has expired)
+GET {{base}}/eip/orders/documents/CLM-replace-with-the-claim-key
+
+### EIP content enricher — the order gains the customer from the CRM
+POST {{base}}/eip/orders/enrich
+Content-Type: application/json
+
+{ "orderId": "ORD-3801", "customerId": "CUS-100", "items": [ { "sku": "SKU-BOOK", "quantity": 2, "unitPrice": 30 } ] }
+
+### The CRM is down for CUS-DOWN... customers: 503, enrichment FAILED
+POST {{base}}/eip/orders/enrich
+Content-Type: application/json
+
+{ "orderId": "ORD-3802", "customerId": "CUS-DOWN-1", "items": [ { "sku": "SKU-BOOK", "quantity": 2, "unitPrice": 30 } ] }
