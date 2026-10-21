@@ -1,0 +1,191 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<mule xmlns="http://www.mulesoft.org/schema/mule/core"
+	xmlns:munit="http://www.mulesoft.org/schema/mule/munit"
+	xmlns:munit-tools="http://www.mulesoft.org/schema/mule/munit-tools"
+	xmlns:http="http://www.mulesoft.org/schema/mule/http"
+	xmlns:os="http://www.mulesoft.org/schema/mule/os"
+	xmlns:doc="http://www.mulesoft.org/schema/mule/documentation"
+	xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+	xsi:schemaLocation="http://www.mulesoft.org/schema/mule/core http://www.mulesoft.org/schema/mule/core/current/mule.xsd
+		http://www.mulesoft.org/schema/mule/munit http://www.mulesoft.org/schema/mule/munit/current/mule-munit.xsd
+		http://www.mulesoft.org/schema/mule/munit-tools http://www.mulesoft.org/schema/mule/munit-tools/current/mule-munit-tools.xsd
+		http://www.mulesoft.org/schema/mule/http http://www.mulesoft.org/schema/mule/http/current/mule-http.xsd
+		http://www.mulesoft.org/schema/mule/os http://www.mulesoft.org/schema/mule/os/current/mule-os.xsd">
+
+	<!--
+		Channel adapter: the HTTP Request connector reads an order from the simulated legacy ERP (CSV) and DataWeave
+		turns it into the app's order message. Every call goes over HTTP to this app; the 5xx tests mock the
+		legacy call.
+	-->
+	<munit:config name="channel-adapter-test-suite.xml" />
+
+	<munit:test name="ca-legacy-csv-becomes-the-order-message" description="Channel adapter: the legacy ERP answers CSV with cents and a status code; the adapter answers the order message as JSON">
+		<munit:enable-flow-sources>
+			<munit:enable-flow-source value="order-read-through-legacy-adapter" />
+			<munit:enable-flow-source value="legacy-erp-get-order" />
+		</munit:enable-flow-sources>
+		<munit:execution>
+			<http:request doc:name="GET legacy ERP directly" config-ref="eip-self-http-request-config" method="GET" path="/eip/legacy/orders/ORD-LEGACY-1001" target="vLegacy" targetValue="#[output application/java --- { status: attributes.statusCode, contentType: attributes.headers.'content-type' default '', text: read(payload.^raw, 'text/plain') }]">
+				<http:response-validator>
+					<http:success-status-code-validator values="200..499" />
+				</http:response-validator>
+			</http:request>
+			<http:request doc:name="GET through the adapter" config-ref="eip-self-http-request-config" method="GET" path="/eip/adapters/legacy-orders/ORD-LEGACY-1001" target="vAdapted" targetValue="#[output application/java --- { status: attributes.statusCode, contentType: attributes.headers.'content-type' default '', body: payload }]">
+				<http:response-validator>
+					<http:success-status-code-validator values="200..499" />
+				</http:response-validator>
+			</http:request>
+		</munit:execution>
+		<munit:validation>
+			<munit-tools:assert-that doc:name="Legacy speaks CSV" expression="#[vars.vLegacy.contentType]" is="#[MunitTools::startsWith('application/csv')]" />
+			<munit-tools:assert-that doc:name="Legacy CSV with ; separator" expression="#[vars.vLegacy.text]" is="#[MunitTools::containsString('ORDER_ID;TOTAL_CENTS;CURRENCY;STATUS_CODE')]" />
+			<munit-tools:assert-that doc:name="Legacy row" expression="#[vars.vLegacy.text]" is="#[MunitTools::containsString('ORD-LEGACY-1001;4250;BRL;P')]" />
+			<munit-tools:assert-that doc:name="Adapter 200" expression="#[vars.vAdapted.status]" is="#[MunitTools::equalTo(200)]" />
+			<munit-tools:assert-that doc:name="Adapter JSON" expression="#[vars.vAdapted.contentType]" is="#[MunitTools::startsWith('application/json')]" />
+			<munit-tools:assert-that doc:name="Order message" expression="#[vars.vAdapted.body]" is="#[MunitTools::equalTo({ orderId: 'ORD-LEGACY-1001', amount: 42.5, currency: 'BRL', status: 'PAID', source: 'legacy-erp' })]" />
+		</munit:validation>
+	</munit:test>
+
+	<munit:test name="ca-status-codes-are-translated" description="Channel adapter: legacy status D becomes PAYMENT_DECLINED and R REFUNDED; an unknown code becomes UNKNOWN and keeps the legacy code">
+		<munit:enable-flow-sources>
+			<munit:enable-flow-source value="order-read-through-legacy-adapter" />
+			<munit:enable-flow-source value="legacy-erp-get-order" />
+		</munit:enable-flow-sources>
+		<munit:execution>
+			<http:request doc:name="GET declined" config-ref="eip-self-http-request-config" method="GET" path="/eip/adapters/legacy-orders/ORD-LEGACY-1002" target="vDeclined" targetValue="#[output application/java --- { status: attributes.statusCode, contentType: attributes.headers.'content-type' default '', body: payload }]">
+				<http:response-validator>
+					<http:success-status-code-validator values="200..499" />
+				</http:response-validator>
+			</http:request>
+			<http:request doc:name="GET refunded" config-ref="eip-self-http-request-config" method="GET" path="/eip/adapters/legacy-orders/ORD-LEGACY-1003" target="vRefunded" targetValue="#[output application/java --- { status: attributes.statusCode, contentType: attributes.headers.'content-type' default '', body: payload }]">
+				<http:response-validator>
+					<http:success-status-code-validator values="200..499" />
+				</http:response-validator>
+			</http:request>
+			<http:request doc:name="GET unknown code" config-ref="eip-self-http-request-config" method="GET" path="/eip/adapters/legacy-orders/ORD-LEGACY-1004" target="vUnknown" targetValue="#[output application/java --- { status: attributes.statusCode, contentType: attributes.headers.'content-type' default '', body: payload }]">
+				<http:response-validator>
+					<http:success-status-code-validator values="200..499" />
+				</http:response-validator>
+			</http:request>
+		</munit:execution>
+		<munit:validation>
+			<munit-tools:assert-that doc:name="Declined" expression="#[vars.vDeclined.body.status]" is="#[MunitTools::equalTo('PAYMENT_DECLINED')]" />
+			<munit-tools:assert-that doc:name="Cents to amount" expression="#[vars.vDeclined.body.amount]" is="#[MunitTools::equalTo(19.99)]" />
+			<munit-tools:assert-that doc:name="Refunded" expression="#[vars.vRefunded.body.status]" is="#[MunitTools::equalTo('REFUNDED')]" />
+			<munit-tools:assert-that doc:name="Currency kept" expression="#[vars.vRefunded.body.currency]" is="#[MunitTools::equalTo('USD')]" />
+			<munit-tools:assert-that doc:name="Unknown" expression="#[vars.vUnknown.body.status]" is="#[MunitTools::equalTo('UNKNOWN')]" />
+			<munit-tools:assert-that doc:name="Legacy code kept" expression="#[vars.vUnknown.body.legacyStatusCode]" is="#[MunitTools::equalTo('X')]" />
+			<munit-tools:assert-that doc:name="No legacy code when known" expression="#[vars.vDeclined.body.legacyStatusCode]" is="#[MunitTools::nullValue()]" />
+		</munit:validation>
+	</munit:test>
+
+	<munit:test name="ca-legacy-404-becomes-the-app-404" description="Channel adapter: the legacy ERP answers an unknown order with a plain-text 404; the adapter answers the app 404 in JSON">
+		<munit:enable-flow-sources>
+			<munit:enable-flow-source value="order-read-through-legacy-adapter" />
+			<munit:enable-flow-source value="legacy-erp-get-order" />
+		</munit:enable-flow-sources>
+		<munit:execution>
+			<http:request doc:name="GET legacy ERP directly" config-ref="eip-self-http-request-config" method="GET" path="/eip/legacy/orders/ORD-LEGACY-NONE" target="vLegacy" targetValue="#[output application/java --- { status: attributes.statusCode, contentType: attributes.headers.'content-type' default '', text: read(payload.^raw, 'text/plain') }]">
+				<http:response-validator>
+					<http:success-status-code-validator values="200..499" />
+				</http:response-validator>
+			</http:request>
+			<http:request doc:name="GET through the adapter" config-ref="eip-self-http-request-config" method="GET" path="/eip/adapters/legacy-orders/ORD-LEGACY-NONE" target="vAdapted" targetValue="#[output application/java --- { status: attributes.statusCode, contentType: attributes.headers.'content-type' default '', body: payload }]">
+				<http:response-validator>
+					<http:success-status-code-validator values="200..499" />
+				</http:response-validator>
+			</http:request>
+		</munit:execution>
+		<munit:validation>
+			<munit-tools:assert-that doc:name="Legacy 404" expression="#[vars.vLegacy.status]" is="#[MunitTools::equalTo(404)]" />
+			<munit-tools:assert-that doc:name="Legacy plain text" expression="#[vars.vLegacy.contentType]" is="#[MunitTools::startsWith('text/plain')]" />
+			<munit-tools:assert-that doc:name="Adapter 404" expression="#[vars.vAdapted.status]" is="#[MunitTools::equalTo(404)]" />
+			<munit-tools:assert-that doc:name="Adapter JSON" expression="#[vars.vAdapted.contentType]" is="#[MunitTools::startsWith('application/json')]" />
+			<munit-tools:assert-that doc:name="Says why" expression="#[vars.vAdapted.body.error]" is="#[MunitTools::equalTo('Order not found in the legacy ERP')]" />
+		</munit:validation>
+	</munit:test>
+
+	<munit:test name="ca-legacy-500-becomes-503" description="Channel adapter: a legacy ERP 500 becomes the adapter 503 in JSON, not a generic 500">
+		<munit:enable-flow-sources>
+			<munit:enable-flow-source value="order-read-through-legacy-adapter" />
+		</munit:enable-flow-sources>
+		<munit:behavior>
+			<munit-tools:mock-when doc:name="Legacy ERP fails" processor="http:request">
+				<munit-tools:with-attributes>
+					<munit-tools:with-attribute attributeName="doc:name" whereValue="GET Order From Legacy ERP" />
+				</munit-tools:with-attributes>
+				<munit-tools:then-return>
+					<munit-tools:error typeId="HTTP:INTERNAL_SERVER_ERROR" />
+				</munit-tools:then-return>
+			</munit-tools:mock-when>
+		</munit:behavior>
+		<munit:execution>
+			<http:request doc:name="GET through the adapter" config-ref="eip-self-http-request-config" method="GET" path="/eip/adapters/legacy-orders/ORD-LEGACY-1001" target="vAdapted" targetValue="#[output application/java --- { status: attributes.statusCode, contentType: attributes.headers.'content-type' default '', body: payload }]">
+				<http:response-validator>
+					<http:success-status-code-validator values="200..599" />
+				</http:response-validator>
+			</http:request>
+		</munit:execution>
+		<munit:validation>
+			<munit-tools:assert-that doc:name="503" expression="#[vars.vAdapted.status]" is="#[MunitTools::equalTo(503)]" />
+			<munit-tools:assert-that doc:name="JSON" expression="#[vars.vAdapted.contentType]" is="#[MunitTools::startsWith('application/json')]" />
+			<munit-tools:assert-that doc:name="Says why" expression="#[vars.vAdapted.body.error]" is="#[MunitTools::equalTo('Legacy ERP unavailable')]" />
+		</munit:validation>
+	</munit:test>
+
+	<munit:test name="ca-legacy-503-becomes-503" description="Channel adapter: a legacy ERP 503 becomes the adapter 503 in JSON">
+		<munit:enable-flow-sources>
+			<munit:enable-flow-source value="order-read-through-legacy-adapter" />
+		</munit:enable-flow-sources>
+		<munit:behavior>
+			<munit-tools:mock-when doc:name="Legacy ERP fails" processor="http:request">
+				<munit-tools:with-attributes>
+					<munit-tools:with-attribute attributeName="doc:name" whereValue="GET Order From Legacy ERP" />
+				</munit-tools:with-attributes>
+				<munit-tools:then-return>
+					<munit-tools:error typeId="HTTP:SERVICE_UNAVAILABLE" />
+				</munit-tools:then-return>
+			</munit-tools:mock-when>
+		</munit:behavior>
+		<munit:execution>
+			<http:request doc:name="GET through the adapter" config-ref="eip-self-http-request-config" method="GET" path="/eip/adapters/legacy-orders/ORD-LEGACY-1001" target="vAdapted" targetValue="#[output application/java --- { status: attributes.statusCode, contentType: attributes.headers.'content-type' default '', body: payload }]">
+				<http:response-validator>
+					<http:success-status-code-validator values="200..599" />
+				</http:response-validator>
+			</http:request>
+		</munit:execution>
+		<munit:validation>
+			<munit-tools:assert-that doc:name="503" expression="#[vars.vAdapted.status]" is="#[MunitTools::equalTo(503)]" />
+			<munit-tools:assert-that doc:name="JSON" expression="#[vars.vAdapted.contentType]" is="#[MunitTools::startsWith('application/json')]" />
+			<munit-tools:assert-that doc:name="Says why" expression="#[vars.vAdapted.body.error]" is="#[MunitTools::equalTo('Legacy ERP unavailable')]" />
+		</munit:validation>
+	</munit:test>
+
+	<munit:test name="ca-legacy-unreachable-becomes-503" description="Channel adapter: a legacy ERP that cannot be reached becomes the adapter 503 in JSON">
+		<munit:enable-flow-sources>
+			<munit:enable-flow-source value="order-read-through-legacy-adapter" />
+		</munit:enable-flow-sources>
+		<munit:behavior>
+			<munit-tools:mock-when doc:name="Legacy ERP fails" processor="http:request">
+				<munit-tools:with-attributes>
+					<munit-tools:with-attribute attributeName="doc:name" whereValue="GET Order From Legacy ERP" />
+				</munit-tools:with-attributes>
+				<munit-tools:then-return>
+					<munit-tools:error typeId="HTTP:CONNECTIVITY" />
+				</munit-tools:then-return>
+			</munit-tools:mock-when>
+		</munit:behavior>
+		<munit:execution>
+			<http:request doc:name="GET through the adapter" config-ref="eip-self-http-request-config" method="GET" path="/eip/adapters/legacy-orders/ORD-LEGACY-1001" target="vAdapted" targetValue="#[output application/java --- { status: attributes.statusCode, contentType: attributes.headers.'content-type' default '', body: payload }]">
+				<http:response-validator>
+					<http:success-status-code-validator values="200..599" />
+				</http:response-validator>
+			</http:request>
+		</munit:execution>
+		<munit:validation>
+			<munit-tools:assert-that doc:name="503" expression="#[vars.vAdapted.status]" is="#[MunitTools::equalTo(503)]" />
+			<munit-tools:assert-that doc:name="JSON" expression="#[vars.vAdapted.contentType]" is="#[MunitTools::startsWith('application/json')]" />
+			<munit-tools:assert-that doc:name="Says why" expression="#[vars.vAdapted.body.error]" is="#[MunitTools::equalTo('Legacy ERP unavailable')]" />
+		</munit:validation>
+	</munit:test>
+</mule>
