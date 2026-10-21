@@ -206,3 +206,77 @@ POST {{base}}/eip/orders/enrich
 Content-Type: application/json
 
 { "orderId": "ORD-3802", "customerId": "CUS-DOWN-1", "items": [ { "sku": "SKU-BOOK", "quantity": 2, "unitPrice": 30 } ] }
+
+### EIP request-reply — synchronous: the requestor waits for the warehouse (waitedMillis >= 300)
+POST {{base}}/eip/stock/reservations/sync
+Content-Type: application/json
+
+{ "orderId": "ORD-4101", "sku": "SKU-BOOK", "quantity": 2 }
+
+### Asynchronous: 202 PENDING now, the warehouse calls the reply channel later
+POST {{base}}/eip/stock/reservations/async
+Content-Type: application/json
+
+{ "orderId": "ORD-4102", "sku": "SKU-MUG", "quantity": 1 }
+
+###
+GET {{base}}/eip/stock/reservation-replies/ORD-4102
+
+### EIP return address — the invoice goes to the address in X-Reply-To
+POST {{base}}/eip/invoice-requests
+Content-Type: application/json
+X-Reply-To: /eip/requestors/checkout/invoice-replies
+
+{ "orderId": "ORD-4201", "amount": 72.5 }
+
+###
+POST {{base}}/eip/invoice-requests
+Content-Type: application/json
+X-Reply-To: /eip/requestors/backoffice/invoice-replies
+
+{ "orderId": "ORD-4202", "amount": 30 }
+
+###
+GET {{base}}/eip/requestors/checkout/invoice-replies
+
+###
+GET {{base}}/eip/requestors/backoffice/invoice-replies
+
+### EIP event-driven consumer — processed when it arrives
+POST {{base}}/eip/payment-events
+Content-Type: application/json
+
+{ "eventId": "EVT-4301", "orderId": "ORD-4301", "type": "PAYMENT_CONFIRMED" }
+
+###
+GET {{base}}/eip/payment-events/ORD-4301
+
+### EIP polling consumer — added now, allocated by the next poll (every second)
+POST {{base}}/eip/stock/pending-orders
+Content-Type: application/json
+
+{ "orderId": "ORD-4401" }
+
+###
+GET {{base}}/eip/stock/polled-orders
+
+### EIP competing consumers — put work on the list, then run three consumers at once
+POST {{base}}/eip/invoice-work/items
+Content-Type: application/json
+
+{ "orderIds": ["ORD-4501", "ORD-4502", "ORD-4503", "ORD-4504", "ORD-4505", "ORD-4506"] }
+
+###
+POST {{base}}/eip/invoice-work/runs
+Content-Type: application/json
+
+{ "consumers": 3 }
+
+###
+GET {{base}}/eip/invoice-work/items/ORD-4503
+
+### EIP channel adapter — the legacy ERP's CSV, and the same order through the adapter
+GET {{base}}/eip/legacy/orders/ORD-LEGACY-1001
+
+###
+GET {{base}}/eip/adapters/legacy-orders/ORD-LEGACY-1001

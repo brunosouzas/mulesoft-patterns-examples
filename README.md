@@ -83,6 +83,17 @@ In progress. Patterns from Hohpe and Woolf's *Enterprise Integration Patterns*, 
 | Claim check | An order's document (base64) is checked in to an object store under a claim key; only `{ orderId, claimKey, fileName }` is sent to the (simulated) archive, which checks the document out with the key. Checking out does not remove it: the claim is valid until the store's `entryTtl` (`eip.claimCheck.ttlSeconds`, 3 seconds here) ends, and then the key gets 404 (`OS:KEY_NOT_FOUND` turned into `APP:NOT_FOUND`) | [`eip/claim-check/`](src/main/mule/eip/claim-check) | `POST /eip/orders/documents`, `GET /eip/orders/documents/{claimKey}`, `POST /eip/archive/documents` (simulated archive) |
 | Content enricher | An order with only a `customerId` gets the customer's name, tier and shipping address from a (simulated) CRM. Mule 4 has no enricher scope: the HTTP request stores the answer in a target variable (`target="vCustomer"`, `targetValue="#[payload.customer]"`), so the order is still the payload after the call and a Transform merges the two. When the CRM is down (503, unreachable or timed out) the target variable is not set and the order is not passed on: 503 with `enrichment: FAILED`. An unknown customer is 400 | [`eip/content-enricher/`](src/main/mule/eip/content-enricher) | `POST /eip/orders/enrich`, `GET /eip/services/customers/{customerId}` (simulated CRM; `CUS-DOWN...` answers 503) |
 
+**Wave 4, endpoints:**
+
+| Pattern | Scenario | Code | Endpoints |
+|---|---|---|---|
+| Request-reply | A stock reservation asked of the simulated warehouse two ways. **Synchronous:** the requestor's HTTP request waits for the reply, which is the HTTP response; the requestor's caller waits too (at least the warehouse's 300 ms, `waitedMillis`). **Asynchronous:** the requestor answers 202 `PENDING`; the warehouse answers 202 and later, from an Async scope, posts the reservation to a reply channel fixed in configuration (`eip.requestReply.replyChannelPath`). Matching uses the `orderId`; the full matching problem is the wave-1 correlation identifier, not duplicated here | [`eip/request-reply/`](src/main/mule/eip/request-reply) | `POST /eip/stock/reservations/{sync\|async}`, `POST /eip/warehouse/reservations`, `POST /eip/warehouse/reservation-requests` (simulated warehouse), `POST /eip/stock/reservation-replies` (reply channel), `GET /eip/stock/reservation-replies/{orderId}` |
+| Return address | The invoice request carries the requestor's reply channel in `X-Reply-To`; invoicing answers 202 and posts the invoice to that address, so two requestors (checkout, backoffice) each get their own invoice. Only a path of the form `/eip/requestors/{requestor}/invoice-replies` is accepted (400 otherwise, an absolute URL included), so the return address cannot make the replier call anywhere else | [`eip/return-address/`](src/main/mule/eip/return-address) | `POST /eip/invoice-requests`, `POST\|GET /eip/requestors/{requestor}/invoice-replies` |
+| Event-driven consumer | The HTTP Listener is the trigger: each payment event runs the flow when it arrives, and the order is `PAID` by the time the sender has its 200. VM Listener and Anypoint MQ Subscriber are the messaging equivalents (no broker simulated) | [`eip/event-driven-consumer/`](src/main/mule/eip/event-driven-consumer) | `POST /eip/payment-events`, `GET /eip/payment-events/{orderId}` |
+| Polling consumer | A Scheduler (`fixed-frequency` 1000 ms, `disallowConcurrentExecution`) polls a pending-orders list in an object store. The list is never emptied; a watermark (highest sequence processed) in another object store makes each order allocated once, however many polls run. The watermark is stored after processing, so a failed poll is read again (at least once) | [`eip/polling-consumer/`](src/main/mule/eip/polling-consumer) | `POST /eip/stock/pending-orders`, `GET /eip/stock/polled-orders` |
+| Competing consumers | Several consumers (Parallel For Each; consumer flow `maxConcurrency` = `eip.competingConsumers.consumers`, 3) walk one shared invoice work list; each item is claimed with `os:store failIfPresent="true"`, so the first consumer owns it and the others get `OS:KEY_ALREADY_EXISTS` and skip it. With a queue the broker does this | [`eip/competing-consumers/`](src/main/mule/eip/competing-consumers) | `POST /eip/invoice-work/items`, `POST /eip/invoice-work/runs`, `POST /eip/invoice-work/consumers/{consumerId}/runs`, `GET /eip/invoice-work/items/{orderId}` |
+| Channel adapter | The HTTP Request connector reads an order from a simulated legacy ERP that answers `;`-separated CSV with cents and one-letter status codes, and DataWeave turns it into the order message (`amount`, `status` `PAID`/`PAYMENT_DECLINED`/`REFUNDED`, else `UNKNOWN` with `legacyStatusCode`). The legacy plain-text 404 becomes the app's JSON 404. Every connector plays this role | [`eip/channel-adapter/`](src/main/mule/eip/channel-adapter) | `GET /eip/adapters/legacy-orders/{orderId}`, `GET /eip/legacy/orders/{orderId}` (simulated legacy ERP) |
+
 The MUnit suites are in [`src/test/munit/eip/`](src/test/munit/eip), one per pattern. What the wave 1 suites show, observed on Mule 4.9.17 with MUnit 3.7.1:
 
 - With no `objectStore`, the idempotent validator keeps IDs in memory for 5 minutes (the defaults in the 4.9.17 runtime's `IdempotentMessageValidator`). Three different orders posted over HTTP from one For Each give `accepted,duplicate,duplicate`; with `idExpression="#[payload.orderId]"` they give `accepted,accepted,accepted`.
@@ -106,6 +117,15 @@ What the wave 3 suites show, observed on Mule 4.9.17 with MUnit 3.7.1:
 - What the simulated invoicing system received has exactly the seven allowed fields; the card number and the email do not appear anywhere in it, and neither does a `loyaltyCardNumber` added to the order (`cf-field-added-to-the-order-later-does-not-leak`).
 - For a 200,000-byte document the archive receives a message with three fields (`orderId`, `claimKey`, `fileName`) and still archives 200,000 bytes, fetched with the key. The same key works again after the archive has used it, and 5 seconds after check-in it gets 404 (`cc-claim-expires-after-its-time-to-live`), so the claim check suite takes about 6 seconds. Over real HTTP, check-in answers 202 and check-out answers 200 with the document as `application/json` (`cc-check-out-does-not-remove-the-document`).
 - In the content enricher, a spy before the merge sees the order as payload after the CRM call, and `vars.vCustomer` holds only the customer part of the answer (no `meta`), while the payload still has only the order's keys (`orderId`, `customerId`, `items`). When the CRM answers 503, a value that `vCustomer` held before the call is still there afterwards (`ce-crm-down-sets-no-target-variable-and-returns-503`), the merge does not run and the endpoint answers 503; `HTTP:CONNECTIVITY` and `HTTP:TIMEOUT` give the same 503 (`ce-crm-unreachable-returns-503`, `ce-crm-timeout-returns-503`).
+
+What the wave 4 suites show, observed on Mule 4.9.17 with MUnit 3.7.1 (every call goes over HTTP to the app, and the tests assert status codes and content types):
+
+- Request-reply: the synchronous response already holds the reservation and `waitedMillis` is at least 300; the asynchronous one is 202 `PENDING`, a GET right after it is still `PENDING`, and the reply arrives later, sent once to the reply channel. A reply nobody asked for gets 404.
+- Return address: invoices requested with `X-Reply-To` `/eip/requestors/checkout/...` and `/eip/requestors/backoffice/...` land each in its own inbox only, one reply per request. No header, an absolute URL or another path of the app (`/eip/payments/callback`) get 400 and no reply is sent.
+- Event-driven consumer: the GET made right after the event's 200 already shows the new state; two events run the flow twice, in arrival order.
+- Polling consumer: an order added between polls is not allocated until the next poll; three polls over orders A, B (poll 1, 2) and C (poll 3) store three allocations and the watermark twice, each order `timesAllocated` 1. With the Scheduler source enabled, an order is allocated with no request to the poller.
+- Competing consumers: three consumers over nine items process all nine, none twice, nine invoices issued, each claimed by the consumer that reports it. An item already claimed in the claims store is skipped (`OS:KEY_ALREADY_EXISTS`) and not invoiced. The claim is atomic per key on one worker; across workers only in a Mule cluster (Object Store connector reference).
+- Channel adapter: the legacy endpoint answers `application/csv` (`ORD-LEGACY-1001;4250;BRL;P`), the adapter answers `application/json` `{ orderId, amount: 42.5, currency, status: PAID, source }`.
 
 Notes:
 
@@ -161,7 +181,21 @@ src/main/mule/
     content-enricher/
       content-enricher.xml         HTTP request with a target variable, merge, CRM-down handling
       content-enricher-crm.xml     simulated customer service (CRM)
-src/main/resources/config/app.yaml   port, OCP payment routing, DIP repository choice, EIP self-call host, callback path, routing and claim check settings
+    request-reply/
+      request-reply.xml            synchronous and asynchronous requestor, reply channel, reply lookup
+      request-reply-warehouse.xml  simulated warehouse: synchronous and asynchronous replier
+    return-address/
+      return-address.xml           replier that uses X-Reply-To, requestor reply channels and inboxes
+    event-driven-consumer/
+      event-driven-consumer.xml    HTTP Listener-triggered payment event consumer
+    polling-consumer/
+      polling-consumer.xml         Scheduler poller with an object store watermark, pending list producer
+    competing-consumers/
+      competing-consumers.xml      shared work list, consumers with an atomic claim, Parallel For Each runner
+    channel-adapter/
+      channel-adapter.xml          HTTP Request + DataWeave adapter from legacy CSV to the order message
+      legacy-erp.xml               simulated legacy ERP answering CSV
+src/main/resources/config/app.yaml   port, OCP payment routing, DIP repository choice, EIP self-call host, callback path, routing, claim check, request-reply, polling and competing consumers settings
 src/main/resources/dwl/
   translator/PartnerProducts.dwl     partner product codes -> SKUs (message translator)
   canonical/                         CanonicalOrder (type, validation), FromMarketplace, FromPartnerXml, ToInvoicing, ToWarehouse
