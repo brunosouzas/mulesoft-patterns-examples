@@ -1,0 +1,148 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<mule xmlns="http://www.mulesoft.org/schema/mule/core"
+	xmlns:munit="http://www.mulesoft.org/schema/mule/munit"
+	xmlns:munit-tools="http://www.mulesoft.org/schema/mule/munit-tools"
+	xmlns:http="http://www.mulesoft.org/schema/mule/http"
+	xmlns:os="http://www.mulesoft.org/schema/mule/os"
+	xmlns:doc="http://www.mulesoft.org/schema/mule/documentation"
+	xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+	xsi:schemaLocation="http://www.mulesoft.org/schema/mule/core http://www.mulesoft.org/schema/mule/core/current/mule.xsd
+		http://www.mulesoft.org/schema/mule/munit http://www.mulesoft.org/schema/mule/munit/current/mule-munit.xsd
+		http://www.mulesoft.org/schema/mule/munit-tools http://www.mulesoft.org/schema/mule/munit-tools/current/mule-munit-tools.xsd
+		http://www.mulesoft.org/schema/mule/http http://www.mulesoft.org/schema/mule/http/current/mule-http.xsd
+		http://www.mulesoft.org/schema/mule/os http://www.mulesoft.org/schema/mule/os/current/mule-os.xsd">
+
+	<!--
+		Competing consumers: several consumers take items from one work list in an object store; an atomic claim
+		(os:store failIfPresent) makes each item go to one consumer. Every call goes over HTTP to this app.
+	-->
+	<munit:config name="competing-consumers-test-suite.xml" />
+
+	<munit:test name="cc-each-item-is-processed-by-exactly-one-consumer" description="Competing consumers: three consumers run at once over one work list of nine items; every item is invoiced once, by the consumer that claimed it">
+		<munit:enable-flow-sources>
+			<munit:enable-flow-source value="invoice-work-add-items" />
+			<munit:enable-flow-source value="invoice-work-start-consumers" />
+			<munit:enable-flow-source value="invoice-work-consumer" />
+			<munit:enable-flow-source value="invoice-work-get-item" />
+		</munit:enable-flow-sources>
+		<munit:execution>
+			<http:request doc:name="POST nine work items" config-ref="eip-self-http-request-config" method="POST" path="/eip/invoice-work/items" target="vAdded" targetValue="#[output application/java --- { status: attributes.statusCode, contentType: attributes.headers.'content-type' default '', body: payload }]">
+				<http:body><![CDATA[#[output application/json --- {orderIds: ['ORD-CC-ITEM-1','ORD-CC-ITEM-2','ORD-CC-ITEM-3','ORD-CC-ITEM-4','ORD-CC-ITEM-5','ORD-CC-ITEM-6','ORD-CC-ITEM-7','ORD-CC-ITEM-8','ORD-CC-ITEM-9']}]]]></http:body>
+				<http:response-validator>
+					<http:success-status-code-validator values="200..499" />
+				</http:response-validator>
+			</http:request>
+			<http:request doc:name="POST run three consumers" config-ref="eip-self-http-request-config" method="POST" path="/eip/invoice-work/runs" target="vRuns" targetValue="#[output application/java --- { status: attributes.statusCode, contentType: attributes.headers.'content-type' default '', body: payload }]">
+				<http:body><![CDATA[#[output application/json --- {consumers: 3}]]]></http:body>
+				<http:response-validator>
+					<http:success-status-code-validator values="200..499" />
+				</http:response-validator>
+			</http:request>
+			<http:request doc:name="GET item 5" config-ref="eip-self-http-request-config" method="GET" path="/eip/invoice-work/items/ORD-CC-ITEM-5" target="vItem5" targetValue="#[output application/java --- { status: attributes.statusCode, contentType: attributes.headers.'content-type' default '', body: payload }]">
+				<http:response-validator>
+					<http:success-status-code-validator values="200..499" />
+				</http:response-validator>
+			</http:request>
+		</munit:execution>
+		<munit:validation>
+			<munit-tools:assert-that doc:name="202" expression="#[vars.vAdded.status]" is="#[MunitTools::equalTo(202)]" />
+			<munit-tools:assert-that doc:name="200" expression="#[vars.vRuns.status]" is="#[MunitTools::equalTo(200)]" />
+			<munit-tools:assert-that doc:name="JSON" expression="#[vars.vRuns.contentType]" is="#[MunitTools::startsWith('application/json')]" />
+			<munit-tools:assert-that doc:name="Three consumers ran" expression="#[vars.vRuns.body.consumers map $.consumer]" is="#[MunitTools::equalTo(['consumer-1', 'consumer-2', 'consumer-3'])]" />
+			<munit-tools:assert-that doc:name="Every item processed" expression="#[flatten(vars.vRuns.body.consumers map ($.processed filter ($ startsWith 'ORD-CC-ITEM-'))) orderBy $]" is="#[MunitTools::equalTo(['ORD-CC-ITEM-1','ORD-CC-ITEM-2','ORD-CC-ITEM-3','ORD-CC-ITEM-4','ORD-CC-ITEM-5','ORD-CC-ITEM-6','ORD-CC-ITEM-7','ORD-CC-ITEM-8','ORD-CC-ITEM-9'])]" />
+			<munit-tools:assert-that doc:name="No item processed twice" expression="#[sizeOf(flatten(vars.vRuns.body.consumers map ($.processed filter ($ startsWith 'ORD-CC-ITEM-'))) distinctBy $)]" is="#[MunitTools::equalTo(9)]" />
+			<munit-tools:assert-that doc:name="Item 5 invoiced once" expression="#[vars.vItem5.body.invoicesIssued]" is="#[MunitTools::equalTo(1)]" />
+			<munit-tools:assert-that doc:name="Item 5 claimed by the consumer that processed it" expression="#[vars.vItem5.body.claimedBy]" is="#[MunitTools::equalTo((vars.vRuns.body.consumers filter ($.processed contains 'ORD-CC-ITEM-5'))[0].consumer)]" />
+			<munit-tools:verify-call doc:name="Nine invoices issued" processor="os:store" times="9">
+				<munit-tools:with-attributes>
+					<munit-tools:with-attribute attributeName="doc:name" whereValue="Store Issued Count" />
+				</munit-tools:with-attributes>
+			</munit-tools:verify-call>
+			<munit-tools:verify-call doc:name="One run per consumer" processor="http:request" times="3">
+				<munit-tools:with-attributes>
+					<munit-tools:with-attribute attributeName="doc:name" whereValue="POST Run Consumer" />
+				</munit-tools:with-attributes>
+			</munit-tools:verify-call>
+		</munit:validation>
+	</munit:test>
+
+	<munit:test name="cc-item-claimed-by-another-consumer-is-skipped" description="Competing consumers: an item another consumer has already claimed raises OS:KEY_ALREADY_EXISTS on the claim and is skipped; the free item is invoiced">
+		<munit:enable-flow-sources>
+			<munit:enable-flow-source value="invoice-work-add-items" />
+			<munit:enable-flow-source value="invoice-work-start-consumers" />
+			<munit:enable-flow-source value="invoice-work-consumer" />
+			<munit:enable-flow-source value="invoice-work-get-item" />
+		</munit:enable-flow-sources>
+		<munit:execution>
+			<os:store doc:name="Claim ORD-CC-TAKEN as another consumer" key="ORD-CC-TAKEN" objectStore="eip-invoice-work-claims-store">
+				<os:value><![CDATA[#[output application/java --- { orderId: 'ORD-CC-TAKEN', consumer: 'consumer-elsewhere' }]]]></os:value>
+			</os:store>
+			<http:request doc:name="POST two work items" config-ref="eip-self-http-request-config" method="POST" path="/eip/invoice-work/items" target="vAdded" targetValue="#[output application/java --- { status: attributes.statusCode, contentType: attributes.headers.'content-type' default '', body: payload }]">
+				<http:body><![CDATA[#[output application/json --- {orderIds: ['ORD-CC-TAKEN', 'ORD-CC-FREE']}]]]></http:body>
+				<http:response-validator>
+					<http:success-status-code-validator values="200..499" />
+				</http:response-validator>
+			</http:request>
+			<http:request doc:name="POST run consumer-1" config-ref="eip-self-http-request-config" method="POST" path="/eip/invoice-work/consumers/consumer-1/runs" target="vRun" targetValue="#[output application/java --- { status: attributes.statusCode, contentType: attributes.headers.'content-type' default '', body: payload }]">
+				<http:response-validator>
+					<http:success-status-code-validator values="200..499" />
+				</http:response-validator>
+			</http:request>
+			<http:request doc:name="GET taken item" config-ref="eip-self-http-request-config" method="GET" path="/eip/invoice-work/items/ORD-CC-TAKEN" target="vTaken" targetValue="#[output application/java --- { status: attributes.statusCode, contentType: attributes.headers.'content-type' default '', body: payload }]">
+				<http:response-validator>
+					<http:success-status-code-validator values="200..499" />
+				</http:response-validator>
+			</http:request>
+			<http:request doc:name="GET free item" config-ref="eip-self-http-request-config" method="GET" path="/eip/invoice-work/items/ORD-CC-FREE" target="vFree" targetValue="#[output application/java --- { status: attributes.statusCode, contentType: attributes.headers.'content-type' default '', body: payload }]">
+				<http:response-validator>
+					<http:success-status-code-validator values="200..499" />
+				</http:response-validator>
+			</http:request>
+		</munit:execution>
+		<munit:validation>
+			<munit-tools:assert-that doc:name="200" expression="#[vars.vRun.status]" is="#[MunitTools::equalTo(200)]" />
+			<munit-tools:assert-that doc:name="JSON" expression="#[vars.vRun.contentType]" is="#[MunitTools::startsWith('application/json')]" />
+			<munit-tools:assert-that doc:name="Free item processed" expression="#[vars.vRun.body.processed contains 'ORD-CC-FREE']" is="#[MunitTools::equalTo(true)]" />
+			<munit-tools:assert-that doc:name="Taken item skipped" expression="#[vars.vRun.body.processed contains 'ORD-CC-TAKEN']" is="#[MunitTools::equalTo(false)]" />
+			<munit-tools:assert-that doc:name="Skips counted" expression="#[vars.vRun.body.alreadyClaimed]" is="#[MunitTools::greaterThanOrEqualTo(1)]" />
+			<munit-tools:assert-that doc:name="Taken item keeps its owner" expression="#[vars.vTaken.body.claimedBy]" is="#[MunitTools::equalTo('consumer-elsewhere')]" />
+			<munit-tools:assert-that doc:name="Taken item not invoiced here" expression="#[vars.vTaken.body.invoicesIssued]" is="#[MunitTools::equalTo(0)]" />
+			<munit-tools:assert-that doc:name="Free item claimed by consumer-1" expression="#[vars.vFree.body.claimedBy]" is="#[MunitTools::equalTo('consumer-1')]" />
+			<munit-tools:assert-that doc:name="Free item invoiced once" expression="#[vars.vFree.body.invoicesIssued]" is="#[MunitTools::equalTo(1)]" />
+		</munit:validation>
+	</munit:test>
+
+	<munit:test name="cc-invalid-work-and-unknown-item" description="Competing consumers: a work list request without orderIds, or a run with more consumers than configured, gets 400; an unknown item gets 404">
+		<munit:enable-flow-sources>
+			<munit:enable-flow-source value="invoice-work-add-items" />
+			<munit:enable-flow-source value="invoice-work-start-consumers" />
+			<munit:enable-flow-source value="invoice-work-consumer" />
+			<munit:enable-flow-source value="invoice-work-get-item" />
+		</munit:enable-flow-sources>
+		<munit:execution>
+			<http:request doc:name="POST without orderIds" config-ref="eip-self-http-request-config" method="POST" path="/eip/invoice-work/items" target="vBad" targetValue="#[output application/java --- { status: attributes.statusCode, contentType: attributes.headers.'content-type' default '', body: payload }]">
+				<http:body><![CDATA[#[output application/json --- {orderIds: []}]]]></http:body>
+				<http:response-validator>
+					<http:success-status-code-validator values="200..499" />
+				</http:response-validator>
+			</http:request>
+			<http:request doc:name="POST runs with too many consumers" config-ref="eip-self-http-request-config" method="POST" path="/eip/invoice-work/runs" target="vTooMany" targetValue="#[output application/java --- { status: attributes.statusCode, contentType: attributes.headers.'content-type' default '', body: payload }]">
+				<http:body><![CDATA[#[output application/json --- {consumers: 50}]]]></http:body>
+				<http:response-validator>
+					<http:success-status-code-validator values="200..499" />
+				</http:response-validator>
+			</http:request>
+			<http:request doc:name="GET unknown item" config-ref="eip-self-http-request-config" method="GET" path="/eip/invoice-work/items/ORD-CC-NONE" target="vUnknown" targetValue="#[output application/java --- { status: attributes.statusCode, contentType: attributes.headers.'content-type' default '', body: payload }]">
+				<http:response-validator>
+					<http:success-status-code-validator values="200..499" />
+				</http:response-validator>
+			</http:request>
+		</munit:execution>
+		<munit:validation>
+			<munit-tools:assert-that doc:name="400" expression="#[vars.vBad.status]" is="#[MunitTools::equalTo(400)]" />
+			<munit-tools:assert-that doc:name="JSON" expression="#[vars.vBad.contentType]" is="#[MunitTools::startsWith('application/json')]" />
+			<munit-tools:assert-that doc:name="Too many consumers 400" expression="#[vars.vTooMany.status]" is="#[MunitTools::equalTo(400)]" />
+			<munit-tools:assert-that doc:name="404" expression="#[vars.vUnknown.status]" is="#[MunitTools::equalTo(404)]" />
+		</munit:validation>
+	</munit:test>
+</mule>
