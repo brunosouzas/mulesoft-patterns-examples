@@ -87,7 +87,7 @@ What the wave 2 suites show, observed on Mule 4.9.17 with MUnit 3.7.1 and Aggreg
 - After For Each the payload is the original order and a variable set inside the scope keeps its last value; after Parallel For Each the payload is a list of three messages (`payload[0].payload` is the first item's result), in input order, and a variable set inside a route is `null` after the scope.
 - The aggregator answers 202, 202, 201 to the three items of an order sent by the client, and groups interleaved items of two orders by `orderId`. The timeout test waits for the group to time out (5 seconds, checked by the module once a second), so the aggregator suite takes about 9 seconds.
 - With the fraud route failing (`HTTP:SERVICE_UNAVAILABLE`), the pricing and stock routes still run once each, and their results are read from the `MULE:COMPOSITE_ROUTING` error (`sg-failed-route-raises-composite-routing-with-the-other-results`).
-- In the recipient list, with the warehouse failing, the recipient after it is still notified. The test double for the failing recipient is an MUnit `then-call` flow, and MUnit hands its error back as `MULE:UNKNOWN`, so the test asserts that the failure is recorded, not its type.
+- In the recipient list, the simulated warehouse answers 503 to an order whose `orderId` starts with `ORD-WAREHOUSE-DOWN`: its delivery is recorded `FAILED` with `HTTP:SERVICE_UNAVAILABLE`, and the recipient after it is still notified (`rl-failed-recipient-does-not-stop-the-others`).
 
 Notes:
 

@@ -102,44 +102,29 @@
 		</munit:validation>
 	</munit:test>
 
-	<!-- Stands in for the HTTP requester: the warehouse is down, the other recipients answer as usual. -->
-	<flow name="test-recipient-list-warehouse-down" doc:description="Test double for POST Order To Recipient: raises an error for the warehouse and accepts the order for any other recipient.">
-		<choice doc:name="Check Recipient Is Warehouse">
-			<when expression="#[vars.vRecipient == 'warehouse']">
-				<raise-error doc:name="Raise RECIPIENT_DOWN Error - Warehouse down" type="TEST:RECIPIENT_DOWN" description="Warehouse is down" />
-			</when>
-			<otherwise>
-				<set-payload doc:name="Set Received Response" value="#[output application/json --- { recipient: vars.vRecipient, status: 'RECEIVED' }]" />
-			</otherwise>
-		</choice>
-		<!-- Without this the app's default error handler (on-error-continue) would turn the failure into a success. -->
-		<error-handler>
-			<on-error-propagate doc:name="On Error Propagate (recipient down)" type="ANY" logException="false" />
-		</error-handler>
-	</flow>
-
-	<munit:test name="rl-failed-recipient-does-not-stop-the-others" description="Recipient list: when the warehouse fails, its delivery is recorded FAILED and the recipient after it is still notified">
-		<munit:behavior>
-			<munit-tools:mock-when doc:name="Warehouse down" processor="http:request">
-				<munit-tools:with-attributes>
-					<munit-tools:with-attribute attributeName="doc:name" whereValue="POST Order To Recipient" />
-				</munit-tools:with-attributes>
-				<munit-tools:then-call flow="test-recipient-list-warehouse-down" />
-			</munit-tools:mock-when>
-		</munit:behavior>
+	<munit:test name="rl-failed-recipient-does-not-stop-the-others" description="Recipient list: when the warehouse answers 503, its delivery is recorded FAILED with HTTP:SERVICE_UNAVAILABLE and the recipient after it is still notified">
+		<munit:enable-flow-sources>
+			<munit:enable-flow-source value="recipient-receive-order" />
+		</munit:enable-flow-sources>
 		<munit:execution>
+			<!-- The simulated warehouse answers 503 to an orderId that starts with ORD-WAREHOUSE-DOWN. -->
 			<munit:set-event doc:name="Domestic order, physical and digital">
-				<munit:payload value="#[output application/json --- {orderId: 'ORD-RL-DOWN', country: 'BR', items: [{sku: 'SKU-0', quantity: 1, unitPrice: 10, 'type': 'PHYSICAL'}, {sku: 'SKU-1', quantity: 1, unitPrice: 10, 'type': 'DIGITAL'}]}]" mediaType="application/json" />
+				<munit:payload value="#[output application/json --- {orderId: 'ORD-WAREHOUSE-DOWN-RL', country: 'BR', items: [{sku: 'SKU-0', quantity: 1, unitPrice: 10, 'type': 'PHYSICAL'}, {sku: 'SKU-1', quantity: 1, unitPrice: 10, 'type': 'DIGITAL'}]}]" mediaType="application/json" />
 			</munit:set-event>
 			<flow-ref doc:name="POST /eip/orders/notifications" name="order-notify-recipients" />
+			<set-variable doc:name="Notification response" variableName="response" value="#[payload]" />
+			<munit:set-event doc:name="GET notifications" cloneOriginalEvent="true">
+				<munit:attributes value="#[{ uriParams: { orderId: 'ORD-WAREHOUSE-DOWN-RL' } }]" />
+			</munit:set-event>
+			<flow-ref doc:name="GET /eip/orders/ORD-WAREHOUSE-DOWN-RL/notifications" name="recipient-get-order-notifications" />
 		</munit:execution>
 		<munit:validation>
-			<munit-tools:assert-that doc:name="Recipient list" expression="#[payload.recipients]" is="#[MunitTools::equalTo(['invoicing', 'warehouse', 'digitalDelivery'])]" />
-			<munit-tools:assert-that doc:name="Statuses" expression="#[payload.deliveries map $.status]" is="#[MunitTools::equalTo(['DELIVERED', 'FAILED', 'DELIVERED'])]" />
-			<!-- MUnit's then-call hands the double's error back as MULE:UNKNOWN, so only its presence is asserted. -->
-			<munit-tools:assert-that doc:name="Failure recorded with its error type" expression="#[payload.deliveries[1].errorType]" is="#[MunitTools::notNullValue()]" />
-			<munit-tools:assert-that doc:name="Failed recipient named" expression="#[payload.deliveries[1].recipient]" is="#[MunitTools::equalTo('warehouse')]" />
-			<munit-tools:assert-that doc:name="Not all delivered" expression="#[payload.allDelivered]" is="#[MunitTools::equalTo(false)]" />
+			<munit-tools:assert-that doc:name="Recipient list" expression="#[vars.response.recipients]" is="#[MunitTools::equalTo(['invoicing', 'warehouse', 'digitalDelivery'])]" />
+			<munit-tools:assert-that doc:name="Statuses" expression="#[vars.response.deliveries map $.status]" is="#[MunitTools::equalTo(['DELIVERED', 'FAILED', 'DELIVERED'])]" />
+			<munit-tools:assert-that doc:name="Failure recorded with its error type" expression="#[vars.response.deliveries[1].errorType]" is="#[MunitTools::equalTo('HTTP:SERVICE_UNAVAILABLE')]" />
+			<munit-tools:assert-that doc:name="Failed recipient named" expression="#[vars.response.deliveries[1].recipient]" is="#[MunitTools::equalTo('warehouse')]" />
+			<munit-tools:assert-that doc:name="Not all delivered" expression="#[vars.response.allDelivered]" is="#[MunitTools::equalTo(false)]" />
+			<munit-tools:assert-that doc:name="Received by the others only" expression="#[payload.receivedBy]" is="#[MunitTools::equalTo(['digitalDelivery', 'invoicing'])]" />
 			<munit-tools:verify-call doc:name="Every recipient attempted" processor="http:request" times="3">
 				<munit-tools:with-attributes>
 					<munit-tools:with-attribute attributeName="doc:name" whereValue="POST Order To Recipient" />
