@@ -84,9 +84,9 @@ The MUnit suites are in [`src/test/munit/eip/`](src/test/munit/eip), one per pat
 What the wave 2 suites show, observed on Mule 4.9.17 with MUnit 3.7.1 and Aggregators 1.1.5:
 
 - A Choice does not end the flow. In the message filter "before" version an order with status `PAYMENT_DECLINED` is answered `DISCARDED` and still gets one stock reservation (`filter-before-unpaid-order-is-reported-discarded-but-stock-is-reserved`); in the "after" version it gets none.
-- After For Each the payload is the original order and a variable set inside the scope keeps its last value; after Parallel For Each the payload is a list of three messages (`payload[0].payload` is the first item's result), in input order, and a variable set inside a route is `null` after the scope.
+- After For Each the payload is the original order and a variable set inside the scope keeps its last value; after Parallel For Each the payload is a list of three messages (`payload[0].payload` is the first item's result), in input order even though the `SKU-BOOK` check (300 ms) finishes after the `SKU-MUG` one (their `checkedAt`), and a variable set inside a route is `null` after the scope.
 - The aggregator answers 202, 202, 201 to the three items of an order sent by the client, and groups interleaved items of two orders by `orderId`. The timeout test waits for the group to time out (5 seconds, checked by the module once a second), so the aggregator suite takes about 9 seconds.
-- With the fraud route failing (`HTTP:SERVICE_UNAVAILABLE`), the pricing and stock routes still run once each, and their results are read from the `MULE:COMPOSITE_ROUTING` error (`sg-failed-route-raises-composite-routing-with-the-other-results`).
+- With the fraud route failing (`HTTP:SERVICE_UNAVAILABLE`), the pricing and stock routes still run once each, and their results are read from the `MULE:COMPOSITE_ROUTING` error (`sg-failed-route-raises-composite-routing-with-the-other-results`). The 503 body names each failed check by error type only; the error description is logged, not returned.
 - In the recipient list, the simulated warehouse answers 503 to an order whose `orderId` starts with `ORD-WAREHOUSE-DOWN`: its delivery is recorded `FAILED` with `HTTP:SERVICE_UNAVAILABLE`, and the recipient after it is still notified (`rl-failed-recipient-does-not-stop-the-others`).
 
 Notes:
