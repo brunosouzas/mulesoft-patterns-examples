@@ -26,7 +26,7 @@ curl -s 'localhost:8081/lsp/before/orders/ORD-1001?provider=new'
 mvn clean test
 ```
 
-MUnit runs on the Mule Enterprise runtime, so Maven needs access to the MuleSoft Enterprise repository (credentials in `~/.m2/settings.xml`, as in any MuleSoft project). The build fails below 80% application coverage; the current suites cover 119 cases at about 99.7%.
+MUnit runs on the Mule Enterprise runtime, so Maven needs access to the MuleSoft Enterprise repository (credentials in `~/.m2/settings.xml`, as in any MuleSoft project). The build fails below 80% application coverage; the current suites cover 143 cases at about 99.8%.
 
 ## SOLID in MuleSoft
 
