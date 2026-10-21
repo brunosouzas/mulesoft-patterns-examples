@@ -19,7 +19,9 @@
 		  payment  APPROVED, or DECLINED when amount is above eip.processManager.paymentLimit (1000)
 		  stock    RESERVED, or UNAVAILABLE when the sku starts with SKU-OUT
 		  invoice  ISSUED;  refund  REFUNDED
-		A reply that fails to be sent is lost (logged) and the process stays waiting at the step.
+		A reply that fails to be sent is lost (logged) and the process stays waiting at the step (the suite's
+		pm-reply-lost-leaves-process-waiting shows it). The refund service always answers REFUNDED; REFUND
+		FAILED, which ends the process COMPENSATION_FAILED, is sent by the test itself.
 	-->
 	<flow name="process-manager-simulated-service" doc:description="Simulated processing unit of the process manager: accepts a step command with 202 and, from an Async scope, posts the step's outcome back to the manager's reply endpoint with the processId.">
 		<http:listener doc:name="POST /eip/process-manager/services/{service}" config-ref="http-listener-config" path="/eip/process-manager/services/{service}" allowedMethods="POST">

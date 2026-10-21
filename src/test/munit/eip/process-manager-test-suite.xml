@@ -20,9 +20,13 @@
 	-->
 	<munit:config name="process-manager-test-suite.xml" />
 
+	<!-- Test-only store: the concurrent-copies test holds each copy here until both have read the state. -->
+	<os:object-store name="pm-test-barrier-store" doc:name="Test Barrier Object Store" persistent="false" />
+
 	<munit:before-test name="pm-clear-stores" description="Starts each test with no processes and no reply receipts">
 		<os:clear doc:name="Clear Processes" objectStore="eip-pm-process-store" />
 		<os:clear doc:name="Clear Receipts" objectStore="eip-pm-receipts-store" />
+		<os:clear doc:name="Clear Barrier" objectStore="pm-test-barrier-store" />
 	</munit:before-test>
 
 	<munit:test name="pm-happy-path-completes" description="Process manager: an order is paid, its stock reserved and invoiced by services that reply asynchronously; the process ends COMPLETED with the whole history">
@@ -265,7 +269,7 @@
 		<munit:validation>
 			<munit-tools:assert-that doc:name="409" expression="#[vars.vLate.status]" is="#[MunitTools::equalTo(409)]" />
 			<munit-tools:assert-that doc:name="JSON" expression="#[vars.vLate.contentType]" is="#[MunitTools::startsWith('application/json')]" />
-			<munit-tools:assert-that doc:name="Says why" expression="#[vars.vLate.body.error]" is="#[MunitTools::equalTo('Process already ended COMPLETED')]" />
+			<munit-tools:assert-that doc:name="Says why" expression="#[vars.vLate.body.error]" is="#[MunitTools::equalTo('Process is COMPLETED and not accepting replies')]" />
 			<munit-tools:assert-that doc:name="Payment 409" expression="#[vars.vLatePayment.status]" is="#[MunitTools::equalTo(409)]" />
 			<munit-tools:assert-that doc:name="Still COMPLETED" expression="#[vars.vAfter.body.status]" is="#[MunitTools::equalTo('COMPLETED')]" />
 			<munit-tools:assert-that doc:name="History unchanged" expression="#[sizeOf(vars.vAfter.body.history)]" is="#[MunitTools::equalTo(6)]" />
@@ -331,7 +335,7 @@
 		</munit:validation>
 	</munit:test>
 
-	<munit:test name="pm-command-not-sent-suspends-the-process" description="Process manager: when the payment command cannot be sent the start answers 503, the process is SUSPENDED with the error, and a reply for it then gets 409">
+	<munit:test name="pm-command-not-sent-suspends-the-process" description="Process manager: when the payment command cannot be sent the start answers 503 with the processId and status SUSPENDED in the body, the process is SUSPENDED with the error, and a reply for it then gets 409">
 		<munit:enable-flow-sources>
 			<munit:enable-flow-source value="process-manager-start-order" />
 			<munit:enable-flow-source value="process-manager-receive-reply" />
@@ -355,13 +359,13 @@
 					<http:success-status-code-validator values="200..599" />
 				</http:response-validator>
 			</http:request>
-			<http:request doc:name="GET process" config-ref="eip-self-http-request-config" method="GET" path="#['/eip/process-manager/processes/' ++ (vars.vStart.body.error splitBy ' ')[-3]]" target="vState" targetValue="#[output application/java --- { status: attributes.statusCode, contentType: attributes.headers.'content-type' default '', body: payload }]">
+			<http:request doc:name="GET process" config-ref="eip-self-http-request-config" method="GET" path="#['/eip/process-manager/processes/' ++ vars.vStart.body.processId]" target="vState" targetValue="#[output application/java --- { status: attributes.statusCode, contentType: attributes.headers.'content-type' default '', body: payload }]">
 				<http:response-validator>
 					<http:success-status-code-validator values="200..599" />
 				</http:response-validator>
 			</http:request>
 			<http:request doc:name="POST reply" config-ref="eip-self-http-request-config" method="POST" path="/eip/process-manager/replies" target="vReply" targetValue="#[output application/java --- { status: attributes.statusCode, contentType: attributes.headers.'content-type' default '', body: payload }]">
-				<http:body><![CDATA[#[output application/json --- { processId: (vars.vStart.body.error splitBy ' ')[-3], step: 'PAYMENT', outcome: 'APPROVED' }]]]></http:body>
+				<http:body><![CDATA[#[output application/json --- { processId: vars.vStart.body.processId, step: 'PAYMENT', outcome: 'APPROVED' }]]]></http:body>
 				<http:response-validator>
 					<http:success-status-code-validator values="200..599" />
 				</http:response-validator>
@@ -370,9 +374,345 @@
 		<munit:validation>
 			<munit-tools:assert-that doc:name="503" expression="#[vars.vStart.status]" is="#[MunitTools::equalTo(503)]" />
 			<munit-tools:assert-that doc:name="JSON" expression="#[vars.vStart.contentType]" is="#[MunitTools::startsWith('application/json')]" />
+			<munit-tools:assert-that doc:name="processId in body" expression="#[vars.vStart.body.processId]" is="#[MunitTools::startsWith('PM-')]" />
+			<munit-tools:assert-that doc:name="Body says SUSPENDED" expression="#[vars.vStart.body.status]" is="#[MunitTools::equalTo('SUSPENDED')]" />
 			<munit-tools:assert-that doc:name="SUSPENDED" expression="#[vars.vState.body.status]" is="#[MunitTools::equalTo('SUSPENDED')]" />
 			<munit-tools:assert-that doc:name="Last error" expression="#[vars.vState.body.lastError]" is="#[MunitTools::equalTo('HTTP:CONNECTIVITY')]" />
 			<munit-tools:assert-that doc:name="Reply 409" expression="#[vars.vReply.status]" is="#[MunitTools::equalTo(409)]" />
+		</munit:validation>
+	</munit:test>
+
+	<munit:test name="pm-concurrent-copies-apply-once" description="Process manager: two copies of the payment reply sent at the same time over HTTP, both held after reading the state until the other arrives, get one APPLIED and one DUPLICATE (the second claim meets OS:KEY_ALREADY_EXISTS); the history has one PAYMENT reply">
+		<munit:enable-flow-sources>
+			<munit:enable-flow-source value="process-manager-start-order" />
+			<munit:enable-flow-source value="process-manager-receive-reply" />
+			<munit:enable-flow-source value="process-manager-get-process" />
+			<munit:enable-flow-source value="process-manager-simulated-service" />
+		</munit:enable-flow-sources>
+		<munit:behavior>
+			<munit-tools:mock-when doc:name="Services do not reply" processor="http:request">
+				<munit-tools:with-attributes>
+					<munit-tools:with-attribute attributeName="doc:name" whereValue="POST Step Command To Service" />
+				</munit-tools:with-attributes>
+				<munit-tools:then-return>
+					<munit-tools:payload value="#[output application/json --- { status: 'ACCEPTED' }]" />
+				</munit-tools:then-return>
+			</munit-tools:mock-when>
+			<munit-tools:spy doc:name="Hold each copy before the claim" processor="os:store">
+				<munit-tools:with-attributes>
+					<munit-tools:with-attribute attributeName="doc:name" whereValue="Claim Reply Receipt" />
+				</munit-tools:with-attributes>
+				<munit-tools:before-call>
+					<os:store doc:name="Arrive At Barrier" key="#[uuid()]" objectStore="pm-test-barrier-store">
+						<os:value><![CDATA[#[output application/java --- 'arrived']]]></os:value>
+					</os:store>
+					<until-successful doc:name="Wait For Both Copies" maxRetries="50" millisBetweenRetries="100">
+						<os:retrieve-all-keys doc:name="Read Barrier" objectStore="pm-test-barrier-store" target="vBarrier" />
+						<choice doc:name="Check Both Arrived">
+							<when expression="#[sizeOf(vars.vBarrier) &lt; 2]">
+								<raise-error doc:name="Raise TEST:NOT_YET Error" type="TEST:NOT_YET" description="Waiting for the other copy" />
+							</when>
+						</choice>
+					</until-successful>
+				</munit-tools:before-call>
+			</munit-tools:spy>
+		</munit:behavior>
+		<munit:execution>
+			<http:request doc:name="POST start" config-ref="eip-self-http-request-config" method="POST" path="/eip/process-manager/orders" target="vStart" targetValue="#[output application/java --- { status: attributes.statusCode, contentType: attributes.headers.'content-type' default '', body: payload }]">
+				<http:body><![CDATA[#[output application/json --- { orderId: 'ORD-PM-9', amount: 100, sku: 'SKU-BOOK', quantity: 1 }]]]></http:body>
+				<http:response-validator>
+					<http:success-status-code-validator values="200..599" />
+				</http:response-validator>
+			</http:request>
+			<scatter-gather doc:name="Send two copies at once">
+				<route>
+					<http:request doc:name="POST copy 1" config-ref="eip-self-http-request-config" method="POST" path="/eip/process-manager/replies">
+						<http:body><![CDATA[#[output application/json --- { processId: vars.vStart.body.processId, step: 'PAYMENT', outcome: 'APPROVED' }]]]></http:body>
+						<http:response-validator>
+							<http:success-status-code-validator values="200..599" />
+						</http:response-validator>
+					</http:request>
+					<set-payload doc:name="Keep status and body" value="#[output application/java --- { status: attributes.statusCode, body: payload }]" />
+				</route>
+				<route>
+					<http:request doc:name="POST copy 2" config-ref="eip-self-http-request-config" method="POST" path="/eip/process-manager/replies">
+						<http:body><![CDATA[#[output application/json --- { processId: vars.vStart.body.processId, step: 'PAYMENT', outcome: 'APPROVED' }]]]></http:body>
+						<http:response-validator>
+							<http:success-status-code-validator values="200..599" />
+						</http:response-validator>
+					</http:request>
+					<set-payload doc:name="Keep status and body" value="#[output application/java --- { status: attributes.statusCode, body: payload }]" />
+				</route>
+			</scatter-gather>
+			<set-variable doc:name="SET vCopies" variableName="vCopies" value="#[output application/java --- payload pluck ((v) -> v.payload)]" />
+			<http:request doc:name="GET process" config-ref="eip-self-http-request-config" method="GET" path="#['/eip/process-manager/processes/' ++ vars.vStart.body.processId]" target="vState" targetValue="#[output application/java --- { status: attributes.statusCode, contentType: attributes.headers.'content-type' default '', body: payload }]">
+				<http:response-validator>
+					<http:success-status-code-validator values="200..599" />
+				</http:response-validator>
+			</http:request>
+		</munit:execution>
+		<munit:validation>
+			<munit-tools:assert-that doc:name="Both 200" expression="#[vars.vCopies map $.status]" is="#[MunitTools::equalTo([200, 200])]" />
+			<munit-tools:assert-that doc:name="One applied, one duplicate" expression="#[(vars.vCopies map $.body.result) orderBy $]" is="#[MunitTools::equalTo(['APPLIED', 'DUPLICATE'])]" />
+			<munit-tools:assert-that doc:name="Both copies reached the claim" expression="#[sizeOf(vars.vCopies)]" is="#[MunitTools::equalTo(2)]" />
+			<munit-tools:assert-that doc:name="One PAYMENT reply" expression="#[vars.vState.body.history map ((h) -> h.step ++ ':' ++ h.event ++ (if (h.outcome != null) ':' ++ h.outcome else ''))]" is="#[MunitTools::equalTo(['PAYMENT:SENT','PAYMENT:REPLY:APPROVED','STOCK:SENT'])]" />
+		</munit:validation>
+	</munit:test>
+
+	<munit:test name="pm-suspend-does-not-overwrite-a-newer-state" description="Process manager: the payment reply is applied before the send error is handled (the state moves to STOCK); the suspend re-reads the state, sees it changed and keeps it, so the process is not SUSPENDED">
+		<munit:enable-flow-sources>
+			<munit:enable-flow-source value="process-manager-start-order" />
+			<munit:enable-flow-source value="process-manager-receive-reply" />
+			<munit:enable-flow-source value="process-manager-get-process" />
+			<munit:enable-flow-source value="process-manager-simulated-service" />
+		</munit:enable-flow-sources>
+		<munit:behavior>
+			<munit-tools:mock-when doc:name="Step services unreachable" processor="http:request">
+				<munit-tools:with-attributes>
+					<munit-tools:with-attribute attributeName="doc:name" whereValue="POST Step Command To Service" />
+				</munit-tools:with-attributes>
+				<munit-tools:then-return>
+					<munit-tools:error typeId="HTTP:CONNECTIVITY" />
+				</munit-tools:then-return>
+			</munit-tools:mock-when>
+			<munit-tools:spy doc:name="A reply moves the process on meanwhile" processor="logger">
+				<munit-tools:with-attributes>
+					<munit-tools:with-attribute attributeName="doc:name" whereValue="WARN: Log command not sent" />
+				</munit-tools:with-attributes>
+				<munit-tools:before-call>
+					<os:store doc:name="Store State Moved To STOCK" key="#[vars.vState.processId]" objectStore="eip-pm-process-store">
+						<os:value><![CDATA[#[output application/java --- vars.vState ++ { currentStep: 'STOCK', history: vars.vState.history ++ [{ step: 'PAYMENT', event: 'REPLY', outcome: 'APPROVED' }, { step: 'STOCK', event: 'SENT' }] }]]]></os:value>
+					</os:store>
+				</munit-tools:before-call>
+			</munit-tools:spy>
+		</munit:behavior>
+		<munit:execution>
+			<http:request doc:name="POST start" config-ref="eip-self-http-request-config" method="POST" path="/eip/process-manager/orders" target="vStart" targetValue="#[output application/java --- { status: attributes.statusCode, contentType: attributes.headers.'content-type' default '', body: payload }]">
+				<http:body><![CDATA[#[output application/json --- { orderId: 'ORD-PM-10', amount: 100, sku: 'SKU-BOOK', quantity: 1 }]]]></http:body>
+				<http:response-validator>
+					<http:success-status-code-validator values="200..599" />
+				</http:response-validator>
+			</http:request>
+			<http:request doc:name="GET process" config-ref="eip-self-http-request-config" method="GET" path="#['/eip/process-manager/processes/' ++ vars.vStart.body.processId]" target="vState" targetValue="#[output application/java --- { status: attributes.statusCode, contentType: attributes.headers.'content-type' default '', body: payload }]">
+				<http:response-validator>
+					<http:success-status-code-validator values="200..599" />
+				</http:response-validator>
+			</http:request>
+		</munit:execution>
+		<munit:validation>
+			<munit-tools:assert-that doc:name="Start 202" expression="#[vars.vStart.status]" is="#[MunitTools::equalTo(202)]" />
+			<munit-tools:assert-that doc:name="Start shows STOCK" expression="#[vars.vStart.body.currentStep]" is="#[MunitTools::equalTo('STOCK')]" />
+			<munit-tools:assert-that doc:name="Still RUNNING" expression="#[vars.vState.body.status]" is="#[MunitTools::equalTo('RUNNING')]" />
+			<munit-tools:assert-that doc:name="At STOCK" expression="#[vars.vState.body.currentStep]" is="#[MunitTools::equalTo('STOCK')]" />
+			<munit-tools:assert-that doc:name="No lastError" expression="#[vars.vState.body.lastError]" is="#[MunitTools::nullValue()]" />
+			<munit-tools:assert-that doc:name="Newer history kept" expression="#[vars.vState.body.history map ((h) -> h.step ++ ':' ++ h.event ++ (if (h.outcome != null) ':' ++ h.outcome else ''))]" is="#[MunitTools::equalTo(['PAYMENT:SENT','PAYMENT:REPLY:APPROVED','STOCK:SENT'])]" />
+		</munit:validation>
+	</munit:test>
+
+	<munit:test name="pm-conflicting-reply-is-409" description="Process manager: after the payment reply APPROVED was applied, a payment reply DECLINED for the same process gets 409 Conflicting reply and the state is unchanged">
+		<munit:enable-flow-sources>
+			<munit:enable-flow-source value="process-manager-start-order" />
+			<munit:enable-flow-source value="process-manager-receive-reply" />
+			<munit:enable-flow-source value="process-manager-get-process" />
+			<munit:enable-flow-source value="process-manager-simulated-service" />
+		</munit:enable-flow-sources>
+		<munit:behavior>
+			<munit-tools:mock-when doc:name="Services do not reply" processor="http:request">
+				<munit-tools:with-attributes>
+					<munit-tools:with-attribute attributeName="doc:name" whereValue="POST Step Command To Service" />
+				</munit-tools:with-attributes>
+				<munit-tools:then-return>
+					<munit-tools:payload value="#[output application/json --- { status: 'ACCEPTED' }]" />
+				</munit-tools:then-return>
+			</munit-tools:mock-when>
+		</munit:behavior>
+		<munit:execution>
+			<http:request doc:name="POST start" config-ref="eip-self-http-request-config" method="POST" path="/eip/process-manager/orders" target="vStart" targetValue="#[output application/java --- { status: attributes.statusCode, contentType: attributes.headers.'content-type' default '', body: payload }]">
+				<http:body><![CDATA[#[output application/json --- { orderId: 'ORD-PM-11', amount: 100, sku: 'SKU-BOOK', quantity: 1 }]]]></http:body>
+				<http:response-validator>
+					<http:success-status-code-validator values="200..599" />
+				</http:response-validator>
+			</http:request>
+			<http:request doc:name="POST approved" config-ref="eip-self-http-request-config" method="POST" path="/eip/process-manager/replies" target="vFirst" targetValue="#[output application/java --- { status: attributes.statusCode, contentType: attributes.headers.'content-type' default '', body: payload }]">
+				<http:body><![CDATA[#[output application/json --- { processId: vars.vStart.body.processId, step: 'PAYMENT', outcome: 'APPROVED' }]]]></http:body>
+				<http:response-validator>
+					<http:success-status-code-validator values="200..599" />
+				</http:response-validator>
+			</http:request>
+			<http:request doc:name="POST declined" config-ref="eip-self-http-request-config" method="POST" path="/eip/process-manager/replies" target="vConflict" targetValue="#[output application/java --- { status: attributes.statusCode, contentType: attributes.headers.'content-type' default '', body: payload }]">
+				<http:body><![CDATA[#[output application/json --- { processId: vars.vStart.body.processId, step: 'PAYMENT', outcome: 'DECLINED' }]]]></http:body>
+				<http:response-validator>
+					<http:success-status-code-validator values="200..599" />
+				</http:response-validator>
+			</http:request>
+			<http:request doc:name="GET process" config-ref="eip-self-http-request-config" method="GET" path="#['/eip/process-manager/processes/' ++ vars.vStart.body.processId]" target="vState" targetValue="#[output application/java --- { status: attributes.statusCode, contentType: attributes.headers.'content-type' default '', body: payload }]">
+				<http:response-validator>
+					<http:success-status-code-validator values="200..599" />
+				</http:response-validator>
+			</http:request>
+		</munit:execution>
+		<munit:validation>
+			<munit-tools:assert-that doc:name="First applied" expression="#[vars.vFirst.body.result]" is="#[MunitTools::equalTo('APPLIED')]" />
+			<munit-tools:assert-that doc:name="409" expression="#[vars.vConflict.status]" is="#[MunitTools::equalTo(409)]" />
+			<munit-tools:assert-that doc:name="JSON" expression="#[vars.vConflict.contentType]" is="#[MunitTools::startsWith('application/json')]" />
+			<munit-tools:assert-that doc:name="Says why" expression="#[vars.vConflict.body.error]" is="#[MunitTools::equalTo('Conflicting reply: PAYMENT was applied as APPROVED, not DECLINED')]" />
+			<munit-tools:assert-that doc:name="Still RUNNING" expression="#[vars.vState.body.status]" is="#[MunitTools::equalTo('RUNNING')]" />
+			<munit-tools:assert-that doc:name="Unchanged" expression="#[vars.vState.body.history map ((h) -> h.step ++ ':' ++ h.event ++ (if (h.outcome != null) ':' ++ h.outcome else ''))]" is="#[MunitTools::equalTo(['PAYMENT:SENT','PAYMENT:REPLY:APPROVED','STOCK:SENT'])]" />
+		</munit:validation>
+	</munit:test>
+
+	<munit:test name="pm-reply-applied-next-command-not-sent-is-200-suspended" description="Process manager: a payment reply is applied but the stock command cannot be sent; the replying service gets 200 APPLIED with status SUSPENDED (not 503) and the process is SUSPENDED with the error">
+		<munit:enable-flow-sources>
+			<munit:enable-flow-source value="process-manager-start-order" />
+			<munit:enable-flow-source value="process-manager-receive-reply" />
+			<munit:enable-flow-source value="process-manager-get-process" />
+			<munit:enable-flow-source value="process-manager-simulated-service" />
+		</munit:enable-flow-sources>
+		<munit:behavior>
+			<munit-tools:mock-when doc:name="Step services unreachable" processor="http:request">
+				<munit-tools:with-attributes>
+					<munit-tools:with-attribute attributeName="doc:name" whereValue="POST Step Command To Service" />
+				</munit-tools:with-attributes>
+				<munit-tools:then-return>
+					<munit-tools:error typeId="HTTP:CONNECTIVITY" />
+				</munit-tools:then-return>
+			</munit-tools:mock-when>
+		</munit:behavior>
+		<munit:execution>
+			<os:store doc:name="Seed Process Waiting For PAYMENT" key="PM-SEEDED-12" objectStore="eip-pm-process-store">
+				<os:value><![CDATA[#[output application/java --- { processId: 'PM-SEEDED-12', orderId: 'ORD-PM-12', order: { amount: 100, sku: 'SKU-BOOK', quantity: 1 }, status: 'RUNNING', currentStep: 'PAYMENT', history: [{ step: 'PAYMENT', event: 'SENT' }], startedAt: now() as String }]]]></os:value>
+			</os:store>
+			<http:request doc:name="POST payment reply" config-ref="eip-self-http-request-config" method="POST" path="/eip/process-manager/replies" target="vReply" targetValue="#[output application/java --- { status: attributes.statusCode, contentType: attributes.headers.'content-type' default '', body: payload }]">
+				<http:body><![CDATA[#[output application/json --- { processId: 'PM-SEEDED-12', step: 'PAYMENT', outcome: 'APPROVED' }]]]></http:body>
+				<http:response-validator>
+					<http:success-status-code-validator values="200..599" />
+				</http:response-validator>
+			</http:request>
+			<http:request doc:name="GET process" config-ref="eip-self-http-request-config" method="GET" path="#['/eip/process-manager/processes/' ++ 'PM-SEEDED-12']" target="vState" targetValue="#[output application/java --- { status: attributes.statusCode, contentType: attributes.headers.'content-type' default '', body: payload }]">
+				<http:response-validator>
+					<http:success-status-code-validator values="200..599" />
+				</http:response-validator>
+			</http:request>
+		</munit:execution>
+		<munit:validation>
+			<munit-tools:assert-that doc:name="200" expression="#[vars.vReply.status]" is="#[MunitTools::equalTo(200)]" />
+			<munit-tools:assert-that doc:name="Applied" expression="#[vars.vReply.body.result]" is="#[MunitTools::equalTo('APPLIED')]" />
+			<munit-tools:assert-that doc:name="Says SUSPENDED" expression="#[vars.vReply.body.status]" is="#[MunitTools::equalTo('SUSPENDED')]" />
+			<munit-tools:assert-that doc:name="processId" expression="#[vars.vReply.body.processId]" is="#[MunitTools::equalTo('PM-SEEDED-12')]" />
+			<munit-tools:assert-that doc:name="SUSPENDED" expression="#[vars.vState.body.status]" is="#[MunitTools::equalTo('SUSPENDED')]" />
+			<munit-tools:assert-that doc:name="Last error" expression="#[vars.vState.body.lastError]" is="#[MunitTools::equalTo('HTTP:CONNECTIVITY')]" />
+			<munit-tools:assert-that doc:name="At STOCK" expression="#[vars.vState.body.currentStep]" is="#[MunitTools::equalTo('STOCK')]" />
+		</munit:validation>
+	</munit:test>
+
+	<munit:test name="pm-refund-failed-ends-compensation-failed" description="Process manager: stock is unavailable, the refund is sent and its reply is FAILED; the process ends COMPENSATION_FAILED, and a later reply gets 409">
+		<munit:enable-flow-sources>
+			<munit:enable-flow-source value="process-manager-start-order" />
+			<munit:enable-flow-source value="process-manager-receive-reply" />
+			<munit:enable-flow-source value="process-manager-get-process" />
+			<munit:enable-flow-source value="process-manager-simulated-service" />
+		</munit:enable-flow-sources>
+		<munit:behavior>
+			<munit-tools:mock-when doc:name="Services do not reply" processor="http:request">
+				<munit-tools:with-attributes>
+					<munit-tools:with-attribute attributeName="doc:name" whereValue="POST Step Command To Service" />
+				</munit-tools:with-attributes>
+				<munit-tools:then-return>
+					<munit-tools:payload value="#[output application/json --- { status: 'ACCEPTED' }]" />
+				</munit-tools:then-return>
+			</munit-tools:mock-when>
+		</munit:behavior>
+		<munit:execution>
+			<http:request doc:name="POST start" config-ref="eip-self-http-request-config" method="POST" path="/eip/process-manager/orders" target="vStart" targetValue="#[output application/java --- { status: attributes.statusCode, contentType: attributes.headers.'content-type' default '', body: payload }]">
+				<http:body><![CDATA[#[output application/json --- { orderId: 'ORD-PM-13', amount: 100, sku: 'SKU-BOOK', quantity: 1 }]]]></http:body>
+				<http:response-validator>
+					<http:success-status-code-validator values="200..599" />
+				</http:response-validator>
+			</http:request>
+			<http:request doc:name="POST payment" config-ref="eip-self-http-request-config" method="POST" path="/eip/process-manager/replies" target="vPay" targetValue="#[output application/java --- { status: attributes.statusCode, contentType: attributes.headers.'content-type' default '', body: payload }]">
+				<http:body><![CDATA[#[output application/json --- { processId: vars.vStart.body.processId, step: 'PAYMENT', outcome: 'APPROVED' }]]]></http:body>
+				<http:response-validator>
+					<http:success-status-code-validator values="200..599" />
+				</http:response-validator>
+			</http:request>
+			<http:request doc:name="POST stock" config-ref="eip-self-http-request-config" method="POST" path="/eip/process-manager/replies" target="vStock" targetValue="#[output application/java --- { status: attributes.statusCode, contentType: attributes.headers.'content-type' default '', body: payload }]">
+				<http:body><![CDATA[#[output application/json --- { processId: vars.vStart.body.processId, step: 'STOCK', outcome: 'UNAVAILABLE' }]]]></http:body>
+				<http:response-validator>
+					<http:success-status-code-validator values="200..599" />
+				</http:response-validator>
+			</http:request>
+			<http:request doc:name="POST refund failed" config-ref="eip-self-http-request-config" method="POST" path="/eip/process-manager/replies" target="vRefund" targetValue="#[output application/java --- { status: attributes.statusCode, contentType: attributes.headers.'content-type' default '', body: payload }]">
+				<http:body><![CDATA[#[output application/json --- { processId: vars.vStart.body.processId, step: 'REFUND', outcome: 'FAILED' }]]]></http:body>
+				<http:response-validator>
+					<http:success-status-code-validator values="200..599" />
+				</http:response-validator>
+			</http:request>
+			<http:request doc:name="POST refund again" config-ref="eip-self-http-request-config" method="POST" path="/eip/process-manager/replies" target="vLate" targetValue="#[output application/java --- { status: attributes.statusCode, contentType: attributes.headers.'content-type' default '', body: payload }]">
+				<http:body><![CDATA[#[output application/json --- { processId: vars.vStart.body.processId, step: 'REFUND', outcome: 'REFUNDED' }]]]></http:body>
+				<http:response-validator>
+					<http:success-status-code-validator values="200..599" />
+				</http:response-validator>
+			</http:request>
+			<http:request doc:name="GET process" config-ref="eip-self-http-request-config" method="GET" path="#['/eip/process-manager/processes/' ++ vars.vStart.body.processId]" target="vState" targetValue="#[output application/java --- { status: attributes.statusCode, contentType: attributes.headers.'content-type' default '', body: payload }]">
+				<http:response-validator>
+					<http:success-status-code-validator values="200..599" />
+				</http:response-validator>
+			</http:request>
+		</munit:execution>
+		<munit:validation>
+			<munit-tools:assert-that doc:name="Compensating" expression="#[vars.vStock.body.status]" is="#[MunitTools::equalTo('COMPENSATING')]" />
+			<munit-tools:assert-that doc:name="Refund 200" expression="#[vars.vRefund.status]" is="#[MunitTools::equalTo(200)]" />
+			<munit-tools:assert-that doc:name="Reply says it" expression="#[vars.vRefund.body.status]" is="#[MunitTools::equalTo('COMPENSATION_FAILED')]" />
+			<munit-tools:assert-that doc:name="COMPENSATION_FAILED" expression="#[vars.vState.body.status]" is="#[MunitTools::equalTo('COMPENSATION_FAILED')]" />
+			<munit-tools:assert-that doc:name="Ended at" expression="#[vars.vState.body.endedAt]" is="#[MunitTools::notNullValue()]" />
+			<munit-tools:assert-that doc:name="History" expression="#[vars.vState.body.history map ((h) -> h.step ++ ':' ++ h.event ++ (if (h.outcome != null) ':' ++ h.outcome else ''))]" is="#[MunitTools::equalTo(['PAYMENT:SENT','PAYMENT:REPLY:APPROVED','STOCK:SENT','STOCK:REPLY:UNAVAILABLE','REFUND:SENT','REFUND:REPLY:FAILED'])]" />
+			<munit-tools:assert-that doc:name="Later 409" expression="#[vars.vLate.status]" is="#[MunitTools::equalTo(409)]" />
+			<munit-tools:assert-that doc:name="Not accepting" expression="#[vars.vLate.body.error]" is="#[MunitTools::equalTo('Process is COMPENSATION_FAILED and not accepting replies')]" />
+		</munit:validation>
+	</munit:test>
+
+	<munit:test name="pm-reply-lost-leaves-process-waiting" description="Process manager: the payment service cannot deliver its reply (reply endpoint mocked unreachable); the loss is logged and the process stays RUNNING at PAYMENT">
+		<munit:enable-flow-sources>
+			<munit:enable-flow-source value="process-manager-start-order" />
+			<munit:enable-flow-source value="process-manager-receive-reply" />
+			<munit:enable-flow-source value="process-manager-get-process" />
+			<munit:enable-flow-source value="process-manager-simulated-service" />
+		</munit:enable-flow-sources>
+		<munit:behavior>
+			<munit-tools:mock-when doc:name="Reply endpoint unreachable" processor="http:request">
+				<munit-tools:with-attributes>
+					<munit-tools:with-attribute attributeName="doc:name" whereValue="POST Reply To Process Manager" />
+				</munit-tools:with-attributes>
+				<munit-tools:then-return>
+					<munit-tools:error typeId="HTTP:CONNECTIVITY" />
+				</munit-tools:then-return>
+			</munit-tools:mock-when>
+		</munit:behavior>
+		<munit:execution>
+			<http:request doc:name="POST start" config-ref="eip-self-http-request-config" method="POST" path="/eip/process-manager/orders" target="vStart" targetValue="#[output application/java --- { status: attributes.statusCode, contentType: attributes.headers.'content-type' default '', body: payload }]">
+				<http:body><![CDATA[#[output application/json --- { orderId: 'ORD-PM-14', amount: 100, sku: 'SKU-BOOK', quantity: 1 }]]]></http:body>
+				<http:response-validator>
+					<http:success-status-code-validator values="200..599" />
+				</http:response-validator>
+			</http:request>
+			<until-successful doc:name="Wait for the lost reply" maxRetries="50" millisBetweenRetries="100">
+				<munit-tools:verify-call doc:name="Reply lost was logged" processor="logger" times="1">
+					<munit-tools:with-attributes>
+						<munit-tools:with-attribute attributeName="doc:name" whereValue="WARN: Log reply lost" />
+					</munit-tools:with-attributes>
+				</munit-tools:verify-call>
+			</until-successful>
+			<http:request doc:name="GET process" config-ref="eip-self-http-request-config" method="GET" path="#['/eip/process-manager/processes/' ++ vars.vStart.body.processId]" target="vState" targetValue="#[output application/java --- { status: attributes.statusCode, contentType: attributes.headers.'content-type' default '', body: payload }]">
+				<http:response-validator>
+					<http:success-status-code-validator values="200..599" />
+				</http:response-validator>
+			</http:request>
+		</munit:execution>
+		<munit:validation>
+			<munit-tools:assert-that doc:name="Start 202" expression="#[vars.vStart.status]" is="#[MunitTools::equalTo(202)]" />
+			<munit-tools:assert-that doc:name="Still RUNNING" expression="#[vars.vState.body.status]" is="#[MunitTools::equalTo('RUNNING')]" />
+			<munit-tools:assert-that doc:name="Waiting at PAYMENT" expression="#[vars.vState.body.currentStep]" is="#[MunitTools::equalTo('PAYMENT')]" />
+			<munit-tools:assert-that doc:name="Only the command" expression="#[vars.vState.body.history map ((h) -> h.step ++ ':' ++ h.event ++ (if (h.outcome != null) ':' ++ h.outcome else ''))]" is="#[MunitTools::equalTo(['PAYMENT:SENT'])]" />
 		</munit:validation>
 	</munit:test>
 

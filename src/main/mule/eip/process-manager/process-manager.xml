@@ -29,20 +29,35 @@
 		  PAYMENT APPROVED  -> STOCK                          PAYMENT DECLINED -> end FAILED
 		  STOCK RESERVED    -> INVOICE                        STOCK UNAVAILABLE -> REFUND (compensation), COMPENSATING
 		  INVOICE ISSUED    -> end COMPLETED                  REFUND REFUNDED   -> end CANCELLED
-		Replies: unknown processId 404; a process already ended (COMPLETED, FAILED, CANCELLED, SUSPENDED) 409,
-		late or repeated replies included; a reply for a step the process is not waiting for 409; a repeated
-		reply for the step it is waiting for, while a race is still possible, 200 DUPLICATE and nothing changes.
+		                                                      REFUND FAILED     -> end COMPENSATION_FAILED
+		Replies: unknown processId 404; a process not accepting replies (FAILED, CANCELLED, COMPLETED,
+		COMPENSATION_FAILED, SUSPENDED) 409, late or repeated replies included; a reply for a step the process
+		is not waiting for, and never received, 409; a repeated reply for a step already applied, while the
+		process runs, is 200 DUPLICATE and nothing changes; the same step with a different outcome than the one
+		applied is 409 "Conflicting reply".
 		A reply is applied once per process and step: os:store with failIfPresent="true" on a receipts store
 		claims processId:step, and "If the parameter is set to true, then an OS:KEY_ALREADY_EXISTS error is
 		thrown instead" (https://docs.mulesoft.com/object-store-connector/latest/object-store-connector-reference),
-		so of two copies arriving together only one moves the process on. Across workers that holds only in a
-		Mule cluster (same page).
+		so of two copies arriving together only one moves the process on (the suite sends two copies at once
+		over HTTP and holds both just before the claim, so the second one meets KEY_ALREADY_EXISTS). Across
+		workers that holds only in a Mule cluster (same page).
+		The state itself is read, changed and written back with no lock beyond that receipt claim: the claim
+		serialises replies for one step, and the SUSPENDED write re-reads the state and only suspends when
+		currentStep and history are still the ones it sent (compare-and-set), otherwise it keeps the newer state.
+		That holds on one worker only; a re-read and a write are two operations, not one atomic step.
 
 		The state lives in Object Stores declared persistent="true", so a process that waits for a reply for
 		hours survives a restart (the connector's guarantee, not shown by MUnit). There is no timeout here: a
 		reply that never comes leaves the process waiting at its step; a real manager needs a Scheduler that
 		looks for processes waiting too long. A step command that cannot be sent leaves the process SUSPENDED
-		with the error and answers 503.
+		with the error: the start endpoint answers 503 with the processId in the body; the reply endpoint, whose
+		reply was applied, answers 200 APPLIED with status SUSPENDED (the replying service did its part). A
+		refund that fails ends the process COMPENSATION_FAILED. SUSPENDED and COMPENSATION_FAILED both need
+		recovery by hand or by a Scheduler; this example has no resume endpoint.
+
+		Neither store has a TTL by default; the connector reference (link above) describes entryTtl and
+		expirationInterval for expiring entries. The receipts store keeps receipts 7 days (entryTtl); the
+		process store keeps every process, so in production give it a TTL or a cleanup job too.
 
 		WHEN IT IS OVERKILL: if every step answers synchronously within one request, a single flow that calls
 		payment, stock and invoice in sequence, with a Choice on each result and a Try for the refund, is the
@@ -60,7 +75,7 @@
 		No broker is simulated: the commands and the replies are HTTP calls to this app.
 	-->
 	<os:object-store name="eip-pm-process-store" doc:name="Process Manager State Object Store" persistent="true" />
-	<os:object-store name="eip-pm-receipts-store" doc:name="Process Manager Reply Receipts Object Store" persistent="true" />
+	<os:object-store name="eip-pm-receipts-store" doc:name="Process Manager Reply Receipts Object Store" persistent="true" entryTtl="7" entryTtlUnit="DAYS" expirationInterval="1" expirationIntervalUnit="HOURS" />
 
 	<flow name="process-manager-start-order" doc:description="Process manager trigger: validates the order, creates the process state (RUNNING, history) in the persistent store and sends the first step, PAYMENT; 202 with the processId.">
 		<http:listener doc:name="POST /eip/process-manager/orders" config-ref="http-listener-config" path="/eip/process-manager/orders" allowedMethods="POST">
@@ -89,10 +104,18 @@ output application/java
 		</ee:transform>
 		<logger doc:name="INFO: Log process started" level="INFO" message="#['Process ' ++ vars.vState.processId ++ ' started for orderId=' ++ vars.vState.orderId ++ ', correlationId=' ++ correlationId]" />
 		<flow-ref doc:name="Refer to sf-send-step-command" name="sf-send-step-command" />
-		<set-payload doc:name="Set Started Response" value="#[output application/json --- vars.vState filterObject ((v, k) -> (k as String) != 'history')]" />
+		<choice doc:name="Check Command Sent">
+			<when expression="#[vars.vState.status == 'SUSPENDED']">
+				<set-variable doc:name="SET httpStatus 503" variableName="httpStatus" value="#[503]" />
+				<set-payload doc:name="Set Suspended Response" value="#[output application/json --- { error: 'Step ' ++ vars.vState.currentStep ++ ' could not be sent; the process is SUSPENDED', processId: vars.vState.processId, status: vars.vState.status, currentStep: vars.vState.currentStep, lastError: vars.vState.lastError }]" />
+			</when>
+			<otherwise>
+				<set-payload doc:name="Set Started Response" value="#[output application/json --- vars.vState filterObject ((v, k) -> (k as String) != 'history')]" />
+			</otherwise>
+		</choice>
 	</flow>
 
-	<flow name="process-manager-receive-reply" doc:description="Process manager reply endpoint: correlates a step's reply by processId, applies it once per process and step, decides the next step (or the end) from the outcome, stores the state and sends the next command; 404 unknown process, 409 ended process or unexpected step, 200 DUPLICATE for a repeat.">
+	<flow name="process-manager-receive-reply" doc:description="Process manager reply endpoint: correlates a step's reply by processId, applies it once per process and step, decides the next step (or the end) from the outcome, stores the state and sends the next command; 404 unknown process, 409 process not accepting replies, unexpected step or conflicting reply, 200 DUPLICATE for a repeat, 200 APPLIED with status SUSPENDED when the next command cannot be sent.">
 		<http:listener doc:name="POST /eip/process-manager/replies" config-ref="http-listener-config" path="/eip/process-manager/replies" allowedMethods="POST">
 			<http:response statusCode="#[vars.httpStatus default 200]" />
 		</http:listener>
@@ -110,13 +133,15 @@ output application/java
 				<raise-error doc:name="Raise NOT_FOUND Error - Unknown process" type="APP:NOT_FOUND" description="No process with this processId" />
 			</when>
 			<when expression="#[not (['RUNNING', 'COMPENSATING'] contains vars.vState.status)]">
-				<raise-error doc:name="Raise CONFLICT Error - Process ended" type="APP:CONFLICT" description="#['Process already ended ' ++ vars.vState.status]" />
+				<raise-error doc:name="Raise CONFLICT Error - Not accepting replies" type="APP:CONFLICT" description="#['Process is ' ++ vars.vState.status ++ ' and not accepting replies']" />
 			</when>
 		</choice>
-		<os:contains doc:name="Check Reply Received" key="#[vars.vReply.processId ++ ':' ++ vars.vReply.step]" objectStore="eip-pm-receipts-store" target="vReceived" />
-		<choice doc:name="Check Expected Step">
-			<when expression="#[vars.vReceived]">
-				<set-variable doc:name="SET vDuplicate" variableName="vDuplicate" value="#[true]" />
+		<os:retrieve doc:name="Read Reply Receipt" key="#[vars.vReply.processId ++ ':' ++ vars.vReply.step]" objectStore="eip-pm-receipts-store" target="vReceipt">
+			<os:default-value><![CDATA[#[output application/java --- { outcome: null }]]]></os:default-value>
+		</os:retrieve>
+		<choice doc:name="Check Duplicate Or Expected Step">
+			<when expression="#[vars.vReceipt.outcome != null]">
+				<flow-ref doc:name="Refer to sf-check-repeated-reply" name="sf-check-repeated-reply" />
 			</when>
 			<when expression="#[vars.vReply.step != vars.vState.currentStep]">
 				<raise-error doc:name="Raise CONFLICT Error - Unexpected step" type="APP:CONFLICT" description="#['Process is waiting for ' ++ vars.vState.currentStep ++ ', not ' ++ vars.vReply.step]" />
@@ -128,15 +153,19 @@ output application/java
 						<os:value><![CDATA[#[output application/java --- { outcome: vars.vReply.outcome, receivedAt: now() as String }]]]></os:value>
 					</os:store>
 					<error-handler>
-						<on-error-continue doc:name="On Error Continue (a copy was applied first)" type="OS:KEY_ALREADY_EXISTS" logException="false">
-							<set-variable doc:name="SET vDuplicate" variableName="vDuplicate" value="#[true]" />
+						<on-error-continue doc:name="On Error Continue (a copy claimed it first)" type="OS:KEY_ALREADY_EXISTS" logException="false">
+							<set-variable doc:name="SET vClaimLost" variableName="vClaimLost" value="#[true]" />
 						</on-error-continue>
 					</error-handler>
 				</try>
 				<choice doc:name="Check Claimed">
-					<when expression="#[not (vars.vDuplicate default false)]">
-						<flow-ref doc:name="Refer to sf-apply-reply" name="sf-apply-reply" />
+					<when expression="#[vars.vClaimLost default false]">
+						<os:retrieve doc:name="Read Winning Reply Receipt" key="#[vars.vReply.processId ++ ':' ++ vars.vReply.step]" objectStore="eip-pm-receipts-store" target="vReceipt" />
+						<flow-ref doc:name="Refer to sf-check-repeated-reply" name="sf-check-repeated-reply" />
 					</when>
+					<otherwise>
+						<flow-ref doc:name="Refer to sf-apply-reply" name="sf-apply-reply" />
+					</otherwise>
 				</choice>
 			</otherwise>
 		</choice>
@@ -151,6 +180,15 @@ output application/java
 		</choice>
 	</flow>
 
+	<sub-flow name="sf-check-repeated-reply" doc:description="A reply for a step already applied: the same outcome is a DUPLICATE (nothing changes); a different outcome is 409 Conflicting reply.">
+		<choice doc:name="Check Same Outcome">
+			<when expression="#[vars.vReceipt.outcome != vars.vReply.outcome]">
+				<raise-error doc:name="Raise CONFLICT Error - Conflicting reply" type="APP:CONFLICT" description="#['Conflicting reply: ' ++ vars.vReply.step ++ ' was applied as ' ++ vars.vReceipt.outcome ++ ', not ' ++ vars.vReply.outcome]" />
+			</when>
+		</choice>
+		<set-variable doc:name="SET vDuplicate" variableName="vDuplicate" value="#[true]" />
+	</sub-flow>
+
 	<sub-flow name="sf-decide-next-step" doc:description="The manager's rules: from the step and its outcome, the next step and the process status; an outcome the step does not have is 400.">
 		<ee:transform doc:name="Decide Next Step">
 			<ee:variables>
@@ -164,6 +202,7 @@ output application/java
 	case "STOCK:UNAVAILABLE" -> { status: "COMPENSATING", nextStep: "REFUND" }
 	case "INVOICE:ISSUED" -> { status: "COMPLETED", nextStep: null }
 	case "REFUND:REFUNDED" -> { status: "CANCELLED", nextStep: null }
+	case "REFUND:FAILED" -> { status: "COMPENSATION_FAILED", nextStep: null }
 	else -> null
 }]]></ee:set-variable>
 			</ee:variables>
@@ -208,7 +247,7 @@ vars.vState ++ {
 		</choice>
 	</sub-flow>
 
-	<sub-flow name="sf-send-step-command" doc:description="Records the command for vars.vState.currentStep in the history, stores the state before sending (the reply can come back before the 202 does), and POSTs the command to the step's service; when it cannot be sent the process is stored SUSPENDED and the caller gets 503.">
+	<sub-flow name="sf-send-step-command" doc:description="Records the command for vars.vState.currentStep in the history, stores the state before sending (the reply can come back before the 202 does), and POSTs the command to the step's service; when it cannot be sent it re-reads the state and stores it SUSPENDED only if nothing moved it on since (compare-and-set), else keeps the newer state. Raises nothing: the caller reads vars.vState.status.">
 		<ee:transform doc:name="Record Command Sent">
 			<ee:variables>
 				<ee:set-variable variableName="vState"><![CDATA[%dw 2.0
@@ -226,19 +265,24 @@ vars.vState ++ { history: vars.vState.history << { step: vars.vState.currentStep
 			</http:request>
 			<error-handler>
 				<on-error-continue doc:name="On Error Continue (command not sent, suspend)" type="ANY" logException="false">
-					<logger doc:name="WARN: Log command not sent" level="WARN" message="#['Process ' ++ vars.vState.processId ++ ' could not send ' ++ vars.vState.currentStep ++ ' (' ++ error.errorType.namespace ++ ':' ++ error.errorType.identifier ++ '), suspended, correlationId=' ++ correlationId]" />
-					<set-variable doc:name="SET vState" variableName="vState" value="#[output application/java --- vars.vState ++ { status: 'SUSPENDED', lastError: error.errorType.namespace ++ ':' ++ error.errorType.identifier }]" />
-					<os:store doc:name="Store Suspended Process" key="#[vars.vState.processId]" objectStore="eip-pm-process-store">
-						<os:value><![CDATA[#[output application/java --- vars.vState]]]></os:value>
-					</os:store>
+					<logger doc:name="WARN: Log command not sent" level="WARN" message="#['Process ' ++ vars.vState.processId ++ ' could not send ' ++ vars.vState.currentStep ++ ' (' ++ error.errorType.namespace ++ ':' ++ error.errorType.identifier ++ '), correlationId=' ++ correlationId]" />
+					<set-variable doc:name="SET vLastError" variableName="vLastError" value="#[error.errorType.namespace ++ ':' ++ error.errorType.identifier]" />
+					<os:retrieve doc:name="Re-read Process State" key="#[vars.vState.processId]" objectStore="eip-pm-process-store" target="vCurrent" />
+					<choice doc:name="Check State Unchanged">
+						<when expression="#[(vars.vCurrent.currentStep == vars.vState.currentStep) and (vars.vCurrent.history == vars.vState.history)]">
+							<set-variable doc:name="SET vState" variableName="vState" value="#[output application/java --- vars.vState ++ { status: 'SUSPENDED', lastError: vars.vLastError }]" />
+							<os:store doc:name="Store Suspended Process" key="#[vars.vState.processId]" objectStore="eip-pm-process-store">
+								<os:value><![CDATA[#[output application/java --- vars.vState]]]></os:value>
+							</os:store>
+						</when>
+						<otherwise>
+							<logger doc:name="INFO: Log newer state kept" level="INFO" message="#['Process ' ++ vars.vState.processId ++ ' moved on to ' ++ (vars.vCurrent.currentStep default 'end') ++ ' meanwhile; not suspended, correlationId=' ++ correlationId]" />
+							<set-variable doc:name="SET vState To Newer State" variableName="vState" value="#[vars.vCurrent]" />
+						</otherwise>
+					</choice>
 				</on-error-continue>
 			</error-handler>
 		</try>
-		<choice doc:name="Check Command Sent">
-			<when expression="#[vars.vState.status == 'SUSPENDED']">
-				<raise-error doc:name="Raise SERVICE_UNAVAILABLE Error - Step not sent" type="APP:SERVICE_UNAVAILABLE" description="#['Step ' ++ vars.vState.currentStep ++ ' could not be sent; process ' ++ vars.vState.processId ++ ' is SUSPENDED']" />
-			</when>
-		</choice>
 	</sub-flow>
 
 	<flow name="process-manager-get-process" doc:description="GET /eip/process-manager/processes/{processId}: the process state (status, currentStep, history); 404 for an unknown processId.">
