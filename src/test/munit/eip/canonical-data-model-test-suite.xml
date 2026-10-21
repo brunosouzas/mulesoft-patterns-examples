@@ -10,8 +10,9 @@
 
 	<!--
 		Canonical data model: the same order sent by the marketplace (JSON) and by a partner (XML) becomes the same
-		canonical order, and from it the same invoicing and warehouse documents. The target translators are tested
-		alone with a canonical order, which shows they need no knowledge of any source.
+		canonical order, and from it the same invoicing and warehouse documents. The cdm-module-* tests are module
+		tests: they call the DataWeave target translators directly, with no flow, to show they need a canonical order
+		and no knowledge of any source; the other tests go through the source flows.
 	-->
 	<munit:config name="canonical-data-model-test-suite.xml" />
 
@@ -46,7 +47,7 @@
 		</munit:validation>
 	</munit:test>
 
-	<munit:test name="cdm-target-translators-need-only-the-canonical-order" description="Canonical data model: the invoicing and warehouse translators are called with a canonical order alone, with no source format involved">
+	<munit:test name="cdm-module-target-translators-need-only-the-canonical-order" description="Canonical data model (module test, no flow): the invoicing and warehouse translators are called with a canonical order alone, with no source format involved">
 		<munit:execution>
 			<munit:set-event doc:name="A canonical order">
 				<munit:payload value="#[output application/java --- {orderId: 'ORD-C-1', source: 'ANY', customerId: 'CUS-1', country: 'PT', currency: 'EUR', items: [{sku: 'SKU-EBOOK', quantity: 3, unitPrice: 9}]}]" />
@@ -57,6 +58,38 @@
 		<munit:validation>
 			<munit-tools:assert-that doc:name="Invoice" expression="#[vars.vInvoice]" is="#[MunitTools::equalTo({invoiceFor: 'ORD-C-1', customer: 'CUS-1', currency: 'EUR', lines: [{sku: 'SKU-EBOOK', qty: 3, amount: 27}], total: 27})]" />
 			<munit-tools:assert-that doc:name="Pick list" expression="#[vars.vPickList]" is="#[MunitTools::equalTo([{orderId: 'ORD-C-1', sku: 'SKU-EBOOK', quantity: 3, shipTo: 'PT'}])]" />
+		</munit:validation>
+	</munit:test>
+
+	<munit:test name="cdm-module-target-translator-rejects-an-order-that-is-not-canonical" description="Canonical data model (module test, no flow): the invoicing translator takes a CanonicalOrder, so an order without currency fails at the call instead of producing an invoice without one" expectedErrorType="MULE:EXPRESSION">
+		<munit:execution>
+			<set-variable doc:name="SET vInvoice" variableName="vInvoice" value="#[dwl::canonical::ToInvoicing::fromCanonical({orderId: 'ORD-C-2', source: 'ANY', customerId: 'CUS-1', country: 'PT', currency: null, items: [{sku: 'SKU-EBOOK', quantity: 3, unitPrice: 9}]})]" />
+		</munit:execution>
+	</munit:test>
+
+	<munit:test name="cdm-partner-order-without-currency-returns-400" description="Canonical data model: a partner purchase order without a currency attribute fails the canonical validation with 400; no currency is assumed">
+		<munit:execution>
+			<munit:set-event doc:name="Partner order PO-79 without currency">
+				<munit:payload value="#[output application/xml --- {PurchaseOrder @(number: 'PO-79'): {Customer @(code: 'A-9'): null, ShipTo @(country: 'BR'): null, Lines: {Line @(sku: 'SKU-BOOK', quantity: '1', unitPrice: '30.00'): null}}}]" mediaType="application/xml" />
+			</munit:set-event>
+			<flow-ref doc:name="POST /eip/canonical/orders/partner" name="canonical-order-from-partner" />
+		</munit:execution>
+		<munit:validation>
+			<munit-tools:assert-that doc:name="400" expression="#[vars.httpStatus as Number]" is="#[MunitTools::equalTo(400)]" />
+			<munit-tools:assert-that doc:name="Currency rule named" expression="#[payload.error]" is="#[MunitTools::equalTo('currency is required')]" />
+		</munit:validation>
+	</munit:test>
+
+	<munit:test name="cdm-marketplace-order-in-two-currencies-returns-400" description="Canonical data model: a marketplace order whose lines are in two currencies cannot become one canonical order: 400">
+		<munit:execution>
+			<munit:set-event doc:name="Marketplace order MK-503 in BRL and USD">
+				<munit:payload value="#[output application/json --- {id: 'MK-503', buyer: {accountId: 'A-9'}, shipping: {country: 'BR'}, lines: [{listing: {sku: 'SKU-BOOK'}, units: 1, price: {amount: '30.00', currency: 'BRL'}}, {listing: {sku: 'SKU-MUG'}, units: 1, price: {amount: '3.00', currency: 'USD'}}]}]" mediaType="application/json" />
+			</munit:set-event>
+			<flow-ref doc:name="POST /eip/canonical/orders/marketplace" name="canonical-order-from-marketplace" />
+		</munit:execution>
+		<munit:validation>
+			<munit-tools:assert-that doc:name="400" expression="#[vars.httpStatus as Number]" is="#[MunitTools::equalTo(400)]" />
+			<munit-tools:assert-that doc:name="Currency rule named" expression="#[payload.error]" is="#[MunitTools::equalTo('currency must be one ISO 4217 code for the whole order')]" />
 		</munit:validation>
 	</munit:test>
 
@@ -76,7 +109,7 @@
 	<munit:test name="cdm-partner-line-with-bad-quantity-returns-400" description="Canonical data model: a partner line whose quantity is not a number is caught by the same canonical validation, with 400">
 		<munit:execution>
 			<munit:set-event doc:name="Partner order with quantity 'two'">
-				<munit:payload value="#[output application/xml --- {PurchaseOrder @(number: 'PO-78'): {Customer @(code: 'A-9'): null, ShipTo @(country: 'BR'): null, Lines: {Line @(sku: 'SKU-BOOK', quantity: 'two', unitPrice: '30.00'): null}}}]" mediaType="application/xml" />
+				<munit:payload value="#[output application/xml --- {PurchaseOrder @(number: 'PO-78', currency: 'BRL'): {Customer @(code: 'A-9'): null, ShipTo @(country: 'BR'): null, Lines: {Line @(sku: 'SKU-BOOK', quantity: 'two', unitPrice: '30.00'): null}}}]" mediaType="application/xml" />
 			</munit:set-event>
 			<flow-ref doc:name="POST /eip/canonical/orders/partner" name="canonical-order-from-partner" />
 		</munit:execution>
