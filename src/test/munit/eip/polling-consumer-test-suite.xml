@@ -161,4 +161,86 @@
 			</munit-tools:verify-call>
 		</munit:validation>
 	</munit:test>
+
+	<!-- Stands in for "Store Allocation" in poll-failed-poll-is-read-again: fails for vars.vFailOrderId, stores as the real one otherwise. -->
+	<flow name="test-poll-store-allocation-or-fail">
+		<choice doc:name="Check Failing Order">
+			<when expression="#[payload.orderId == vars.vFailOrderId]">
+				<raise-error doc:name="Raise TEST:STORE_DOWN Error" type="TEST:STORE_DOWN" description="Allocation store down" />
+			</when>
+		</choice>
+		<os:store doc:name="Store Allocation (test)" key="#[payload.orderId]" objectStore="eip-polled-orders-store">
+			<os:value><![CDATA[#[output application/java --- { orderId: payload.orderId, sequence: payload.sequence, status: "ALLOCATED", timesAllocated: (vars.vPrevious.timesAllocated as Number) + 1, allocatedAt: now() as String }]]]></os:value>
+		</os:store>
+		<error-handler>
+			<on-error-propagate doc:name="On Error Propagate (not the app's default handler)" logException="false" />
+		</error-handler>
+	</flow>
+
+	<munit:test name="poll-failed-poll-is-read-again" description="Polling consumer: a poll that fails on the second of two new orders leaves the watermark where it was; the next poll reads both again, so the first is allocated twice (at least once)">
+		<munit:enable-flow-sources>
+			<munit:enable-flow-source value="stock-add-pending-order" />
+			<munit:enable-flow-source value="stock-get-polled-orders" />
+		</munit:enable-flow-sources>
+		<munit:behavior>
+			<munit-tools:mock-when doc:name="Store Allocation fails for vFailOrderId" processor="os:store">
+				<munit-tools:with-attributes>
+					<munit-tools:with-attribute attributeName="doc:name" whereValue="Store Allocation" />
+				</munit-tools:with-attributes>
+				<munit-tools:then-call flow="test-poll-store-allocation-or-fail" />
+			</munit-tools:mock-when>
+		</munit:behavior>
+		<munit:execution>
+			<http:request doc:name="POST order 1" config-ref="eip-self-http-request-config" method="POST" path="/eip/stock/pending-orders" target="vFirst" targetValue="#[output application/java --- { status: attributes.statusCode, contentType: attributes.headers.'content-type' default '', body: payload }]">
+				<http:body><![CDATA[#[output application/json --- {orderId: 'ORD-POLL-FAIL-1'}]]]></http:body>
+				<http:response-validator>
+					<http:success-status-code-validator values="200..499" />
+				</http:response-validator>
+			</http:request>
+			<http:request doc:name="POST order 2" config-ref="eip-self-http-request-config" method="POST" path="/eip/stock/pending-orders" target="vSecond" targetValue="#[output application/java --- { status: attributes.statusCode, contentType: attributes.headers.'content-type' default '', body: payload }]">
+				<http:body><![CDATA[#[output application/json --- {orderId: 'ORD-POLL-FAIL-2'}]]]></http:body>
+				<http:response-validator>
+					<http:success-status-code-validator values="200..499" />
+				</http:response-validator>
+			</http:request>
+			<http:request doc:name="GET polled before" config-ref="eip-self-http-request-config" method="GET" path="/eip/stock/polled-orders" target="vBefore" targetValue="#[output application/java --- { status: attributes.statusCode, contentType: attributes.headers.'content-type' default '', body: payload }]">
+				<http:response-validator>
+					<http:success-status-code-validator values="200..499" />
+				</http:response-validator>
+			</http:request>
+			<set-variable doc:name="SET vFailOrderId (store down for order 2)" variableName="vFailOrderId" value="ORD-POLL-FAIL-2" />
+			<!-- The error ends the poll; the flow's (global) error handler takes it, so the flow-ref returns. -->
+			<flow-ref doc:name="Refer to stock-poll-pending-orders (poll fails)" name="stock-poll-pending-orders" />
+			<http:request doc:name="GET polled after the failed poll" config-ref="eip-self-http-request-config" method="GET" path="/eip/stock/polled-orders" target="vAfterFail" targetValue="#[output application/java --- { status: attributes.statusCode, contentType: attributes.headers.'content-type' default '', body: payload }]">
+				<http:response-validator>
+					<http:success-status-code-validator values="200..499" />
+				</http:response-validator>
+			</http:request>
+			<remove-variable doc:name="Remove vFailOrderId (store back)" variableName="vFailOrderId" />
+			<flow-ref doc:name="Refer to stock-poll-pending-orders (poll succeeds)" name="stock-poll-pending-orders" />
+			<http:request doc:name="GET polled after the next poll" config-ref="eip-self-http-request-config" method="GET" path="/eip/stock/polled-orders" target="vAfter" targetValue="#[output application/java --- { status: attributes.statusCode, contentType: attributes.headers.'content-type' default '', body: payload }]">
+				<http:response-validator>
+					<http:success-status-code-validator values="200..499" />
+				</http:response-validator>
+			</http:request>
+		</munit:execution>
+		<munit:validation>
+			<munit-tools:verify-call doc:name="Four allocation attempts over two polls" processor="os:store" times="4">
+				<munit-tools:with-attributes>
+					<munit-tools:with-attribute attributeName="doc:name" whereValue="Store Allocation" />
+				</munit-tools:with-attributes>
+			</munit-tools:verify-call>
+			<munit-tools:verify-call doc:name="Watermark stored by the second poll only" processor="os:store" times="1">
+				<munit-tools:with-attributes>
+					<munit-tools:with-attribute attributeName="doc:name" whereValue="Store Watermark" />
+				</munit-tools:with-attributes>
+			</munit-tools:verify-call>
+			<munit-tools:assert-that doc:name="Watermark unchanged by the failed poll" expression="#[vars.vAfterFail.body.watermark]" is="#[MunitTools::equalTo(vars.vBefore.body.watermark)]" />
+			<munit-tools:assert-that doc:name="Order 1 allocated before the failure" expression="#[(vars.vAfterFail.body.orders filter ($.orderId == 'ORD-POLL-FAIL-1'))[0].timesAllocated]" is="#[MunitTools::equalTo(1)]" />
+			<munit-tools:assert-that doc:name="Order 2 not allocated" expression="#[(vars.vAfterFail.body.orders filter ($.orderId == 'ORD-POLL-FAIL-2'))[0]]" is="#[MunitTools::nullValue()]" />
+			<munit-tools:assert-that doc:name="Order 1 read again: allocated twice" expression="#[(vars.vAfter.body.orders filter ($.orderId == 'ORD-POLL-FAIL-1'))[0].timesAllocated]" is="#[MunitTools::equalTo(2)]" />
+			<munit-tools:assert-that doc:name="Order 2 allocated once" expression="#[(vars.vAfter.body.orders filter ($.orderId == 'ORD-POLL-FAIL-2'))[0].timesAllocated]" is="#[MunitTools::equalTo(1)]" />
+			<munit-tools:assert-that doc:name="Watermark moved to order 2" expression="#[vars.vAfter.body.watermark]" is="#[MunitTools::equalTo(vars.vSecond.body.sequence)]" />
+		</munit:validation>
+	</munit:test>
 </mule>

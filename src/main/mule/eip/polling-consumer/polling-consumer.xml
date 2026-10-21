@@ -31,8 +31,9 @@
 		already read is remembered by a watermark: every pending order gets an increasing sequence number, and
 		the poller keeps the highest one it has processed in an object store. Each poll reads only the orders
 		above the watermark and then moves it, so an order is allocated once however many polls run. The
-		watermark is stored only after the orders are processed: if a poll fails half way, the next one reads
-		those orders again, so processing must tolerate a repeat (at least once, not exactly once).
+		watermark is stored only after the orders are processed: if a poll fails half way, the watermark does not
+		move and the next poll reads those orders again, including the ones already allocated before the failure,
+		so processing must tolerate a repeat (at least once, not exactly once; poll-failed-poll-is-read-again).
 		Database and file sources have a built-in watermark; an object store does it for any source.
 		Object Store connector: https://docs.mulesoft.com/object-store-connector/latest/object-store-connector-reference
 	-->
@@ -40,7 +41,11 @@
 	<os:object-store name="eip-polling-watermark-store" doc:name="Polling Watermark Object Store" persistent="false" />
 	<os:object-store name="eip-polled-orders-store" doc:name="Polled Orders Object Store" persistent="false" />
 
-	<!-- maxConcurrency 1: two orders added at the same moment cannot get the same sequence number. -->
+	<!--
+		maxConcurrency 1: two orders added at the same moment on this worker cannot get the same sequence number.
+		It limits one flow on one Mule runtime only: on several workers (a cluster or multi-worker CloudHub) each
+		worker numbers its own orders, so the sequence needs a shared counter (a database sequence, for example).
+	-->
 	<flow name="stock-add-pending-order" maxConcurrency="1" doc:description="Adds an order to the pending list polled by the polling consumer, with the next sequence number.">
 		<http:listener doc:name="POST /eip/stock/pending-orders" config-ref="http-listener-config" path="/eip/stock/pending-orders" allowedMethods="POST">
 			<http:response statusCode="#[vars.httpStatus default 202]" />
