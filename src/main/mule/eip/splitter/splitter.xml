@@ -26,7 +26,9 @@
 		  come out of the scope (see the MUnit suite).
 		The aggregator example (aggregator/) puts the items back together.
 
-		The stock levels are synthetic, in sf-check-item-availability.
+		The stock levels are synthetic, in sf-check-item-availability. Checking SKU-BOOK takes 300 ms and every
+		result carries checkedAt, the moment its check finished: under Parallel For Each the book is checked
+		last but still comes back first (see the MUnit suite).
 	-->
 	<flow name="stock-check-availability-for-each" doc:description="Splitter with For Each: splits an order into its items and checks each item's stock in sequence, collecting the results in a variable.">
 		<http:listener doc:name="POST /eip/stock/availability/for-each" config-ref="http-listener-config" path="/eip/stock/availability/for-each" allowedMethods="POST">
@@ -100,10 +102,14 @@ var results = payload map $.payload
 			<ee:message>
 				<ee:set-payload><![CDATA[%dw 2.0
 output application/java
+import wait from dw::Runtime
 var stockLevels = { "SKU-BOOK": 10, "SKU-MUG": 3, "SKU-EBOOK": 9999, "SKU-POSTER": 0 }
 var inStock = stockLevels[payload.sku] default 0
+// SKU-BOOK is a slow lookup (300 ms), so under Parallel For Each it finishes after the items behind it.
+var lookupMillis = if (payload.sku == "SKU-BOOK") 300 else 0
 ---
-{ sku: payload.sku, quantity: payload.quantity, inStock: inStock, available: inStock >= payload.quantity }]]></ee:set-payload>
+({ sku: payload.sku, quantity: payload.quantity, inStock: inStock, available: inStock >= payload.quantity } wait lookupMillis)
+	++ { checkedAt: now() }]]></ee:set-payload>
 			</ee:message>
 		</ee:transform>
 	</sub-flow>

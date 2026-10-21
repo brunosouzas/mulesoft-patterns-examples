@@ -15,7 +15,8 @@
 	<!--
 		Splitter: one order of three items (SKU-BOOK x2 in stock, SKU-POSTER x1 out of stock, SKU-MUG x3 exactly in
 		stock), split with For Each and with Parallel For Each. Both give the same per-item results in input order;
-		what differs is what each scope leaves behind: the payload and the variables after the scope.
+		checking SKU-BOOK takes 300 ms, so under Parallel For Each it finishes last and still comes back first. What
+		differs is what each scope leaves behind: the payload and the variables after the scope.
 	-->
 	<munit:config name="splitter-test-suite.xml" />
 
@@ -41,7 +42,7 @@
 		</munit:validation>
 	</munit:test>
 
-	<munit:test name="splitter-parallel-for-each-returns-the-route-messages-in-input-order" description="Splitter with Parallel For Each: the payload after the scope is the list of route messages in input order, and a variable set inside a route is not visible after it">
+	<munit:test name="splitter-parallel-for-each-returns-the-route-messages-in-input-order" description="Splitter with Parallel For Each: the payload after the scope is the list of route messages in input order, even though SKU-BOOK (slow) finishes after SKU-MUG, and a variable set inside a route is not visible after it">
 		<munit:execution>
 			<munit:set-event doc:name="Order of three items">
 				<munit:payload value="#[output application/json --- {orderId: 'ORD-SPL-PFE', items: [{sku: 'SKU-BOOK', quantity: 2}, {sku: 'SKU-POSTER', quantity: 1}, {sku: 'SKU-MUG', quantity: 3}]}]" mediaType="application/json" />
@@ -53,6 +54,7 @@
 			<munit-tools:assert-that doc:name="Items in input order" expression="#[payload.items map $.sku]" is="#[MunitTools::equalTo(['SKU-BOOK', 'SKU-POSTER', 'SKU-MUG'])]" />
 			<munit-tools:assert-that doc:name="Availability per item" expression="#[payload.items map $.available]" is="#[MunitTools::equalTo([true, false, true])]" />
 			<munit-tools:assert-that doc:name="Not all available" expression="#[payload.allAvailable]" is="#[MunitTools::equalTo(false)]" />
+			<munit-tools:assert-that doc:name="SKU-BOOK finished after SKU-MUG" expression="#[(payload.items[0].checkedAt as DateTime) &gt; (payload.items[2].checkedAt as DateTime)]" is="#[MunitTools::equalTo(true)]" />
 			<munit-tools:assert-that doc:name="Variable set inside a route is not visible after" expression="#[payload.lastCheckedSku]" is="#[MunitTools::nullValue()]" />
 			<munit-tools:verify-call doc:name="One check per item" processor="flow-ref" times="3">
 				<munit-tools:with-attributes>
