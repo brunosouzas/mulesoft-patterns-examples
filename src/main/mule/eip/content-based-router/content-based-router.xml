@@ -1,0 +1,101 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<mule xmlns="http://www.mulesoft.org/schema/mule/core"
+	xmlns:http="http://www.mulesoft.org/schema/mule/http"
+	xmlns:ee="http://www.mulesoft.org/schema/mule/ee/core"
+	xmlns:doc="http://www.mulesoft.org/schema/mule/documentation"
+	xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+	xsi:schemaLocation="http://www.mulesoft.org/schema/mule/core http://www.mulesoft.org/schema/mule/core/current/mule.xsd
+		http://www.mulesoft.org/schema/mule/http http://www.mulesoft.org/schema/mule/http/current/mule-http.xsd
+		http://www.mulesoft.org/schema/mule/ee/core http://www.mulesoft.org/schema/mule/ee/core/current/mule-ee.xsd">
+
+	<!--
+		CONTENT-BASED ROUTER (Hohpe and Woolf): looks at the content of each message and sends it to exactly one
+		handler. POST /eip/orders/route { orderId, country, amount, items }
+
+		In Mule the router is a Choice: each <when> is a rule on the order's content, and the handler is a
+		flow reference. The rules here, in this order:
+		1. amount at or above eip.router.reviewThreshold: manual review (big orders are checked by a person first);
+		2. country other than eip.router.homeCountry: international fulfilment (customs paperwork);
+		3. otherwise: domestic fulfilment.
+
+		Choice evaluates the <when> expressions top to bottom and runs only the first that is true, so the order of
+		the rules is part of the routing: a high-value international order goes to review, never to international
+		fulfilment. The <otherwise> makes the router total: every valid order goes somewhere. Without it, an order
+		no rule matches passes through the Choice untouched and the caller gets its own request back.
+
+		Routing data comes from configuration (app.yaml), not from the XML, so the threshold and the home country
+		can change per environment. When the set of handlers itself keeps growing, look the handler up in
+		configuration instead of adding a <when> per case (see the OCP example in solid/ocp/).
+	-->
+	<flow name="order-route-by-content" doc:description="Content-based router: receives an order on POST /eip/orders/route and sends it to the review, international or domestic handler depending on its amount and destination country.">
+		<http:listener doc:name="POST /eip/orders/route" config-ref="http-listener-config" path="/eip/orders/route" allowedMethods="POST">
+			<http:response statusCode="#[vars.httpStatus default 200]" />
+		</http:listener>
+		<logger doc:name="INFO: Log routing request" level="INFO" message="#['Route order ' ++ (payload.orderId default 'none') ++ ', correlationId=' ++ correlationId]" />
+		<choice doc:name="Validate Order For Routing">
+			<when expression="#[(not (payload is Object)) or isEmpty(payload.orderId) or isEmpty(payload.country) or not (payload.amount is Number)]">
+				<raise-error doc:name="Raise BAD_REQUEST Error - Missing order fields" type="APP:BAD_REQUEST" description="orderId, country and amount (number) are required" />
+			</when>
+		</choice>
+		<choice doc:name="Route Order By Content">
+			<when expression="#[payload.amount &gt;= (p('eip.router.reviewThreshold') as Number)]">
+				<flow-ref doc:name="Refer to sf-route-order-to-review" name="sf-route-order-to-review" />
+			</when>
+			<when expression="#[upper(payload.country) != upper(p('eip.router.homeCountry'))]">
+				<flow-ref doc:name="Refer to sf-route-order-to-international-fulfilment" name="sf-route-order-to-international-fulfilment" />
+			</when>
+			<otherwise>
+				<flow-ref doc:name="Refer to sf-route-order-to-domestic-fulfilment" name="sf-route-order-to-domestic-fulfilment" />
+			</otherwise>
+		</choice>
+		<logger doc:name="INFO: Log routing result" level="INFO" message="#['Order ' ++ payload.orderId ++ ' routed to ' ++ payload.routedTo ++ ', correlationId=' ++ correlationId]" />
+	</flow>
+
+	<sub-flow name="sf-route-order-to-review" doc:description="Review handler of the content-based router: accepts an order whose amount is at or above the review threshold for manual review.">
+		<ee:transform doc:name="Build Review Response">
+			<ee:message>
+				<ee:set-payload><![CDATA[%dw 2.0
+output application/json
+---
+{
+	orderId: payload.orderId,
+	routedTo: "MANUAL_REVIEW",
+	reason: "AMOUNT_AT_OR_ABOVE_THRESHOLD",
+	threshold: p('eip.router.reviewThreshold') as Number
+}]]></ee:set-payload>
+			</ee:message>
+		</ee:transform>
+	</sub-flow>
+
+	<sub-flow name="sf-route-order-to-international-fulfilment" doc:description="International handler of the content-based router: accepts an order shipped outside the home country, which needs a customs declaration.">
+		<ee:transform doc:name="Build International Response">
+			<ee:message>
+				<ee:set-payload><![CDATA[%dw 2.0
+output application/json
+---
+{
+	orderId: payload.orderId,
+	routedTo: "INTERNATIONAL_FULFILMENT",
+	country: upper(payload.country),
+	customsDeclarationRequired: true
+}]]></ee:set-payload>
+			</ee:message>
+		</ee:transform>
+	</sub-flow>
+
+	<sub-flow name="sf-route-order-to-domestic-fulfilment" doc:description="Domestic handler of the content-based router: accepts every valid order that no earlier rule claimed.">
+		<ee:transform doc:name="Build Domestic Response">
+			<ee:message>
+				<ee:set-payload><![CDATA[%dw 2.0
+output application/json
+---
+{
+	orderId: payload.orderId,
+	routedTo: "DOMESTIC_FULFILMENT",
+	country: upper(payload.country),
+	customsDeclarationRequired: false
+}]]></ee:set-payload>
+			</ee:message>
+		</ee:transform>
+	</sub-flow>
+</mule>
