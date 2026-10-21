@@ -75,3 +75,84 @@ GET {{base}}/eip/correlation-id/call/default
 
 ###
 GET {{base}}/eip/correlation-id/call/never
+
+### EIP content-based router — domestic, international and review (the first matching rule wins: this one goes to review)
+POST {{base}}/eip/orders/route
+Content-Type: application/json
+
+{ "orderId": "ORD-3001", "country": "BR", "amount": 120, "items": [ { "sku": "SKU-BOOK", "quantity": 1, "unitPrice": 120 } ] }
+
+###
+POST {{base}}/eip/orders/route
+Content-Type: application/json
+
+{ "orderId": "ORD-3002", "country": "PT", "amount": 120, "items": [ { "sku": "SKU-BOOK", "quantity": 1, "unitPrice": 120 } ] }
+
+###
+POST {{base}}/eip/orders/route
+Content-Type: application/json
+
+{ "orderId": "ORD-3003", "country": "US", "amount": 5000, "items": [ { "sku": "SKU-BOOK", "quantity": 1, "unitPrice": 5000 } ] }
+
+### EIP message filter — a declined order: "before" answers DISCARDED but reserves stock anyway
+POST {{base}}/eip/stock/before/reservations
+Content-Type: application/json
+
+{ "orderId": "ORD-3101", "status": "PAYMENT_DECLINED", "items": [ { "sku": "SKU-BOOK", "quantity": 2 } ] }
+
+###
+GET {{base}}/eip/stock/ORD-3101/reservations
+
+### ...and "after" reserves nothing
+POST {{base}}/eip/stock/after/reservations
+Content-Type: application/json
+
+{ "orderId": "ORD-3102", "status": "PAYMENT_DECLINED", "items": [ { "sku": "SKU-BOOK", "quantity": 2 } ] }
+
+###
+GET {{base}}/eip/stock/ORD-3102/reservations
+
+### EIP splitter — the same order with For Each and with Parallel For Each
+POST {{base}}/eip/stock/availability/for-each
+Content-Type: application/json
+
+{ "orderId": "ORD-3201", "items": [ { "sku": "SKU-BOOK", "quantity": 2 }, { "sku": "SKU-POSTER", "quantity": 1 }, { "sku": "SKU-MUG", "quantity": 3 } ] }
+
+###
+POST {{base}}/eip/stock/availability/parallel-for-each
+Content-Type: application/json
+
+{ "orderId": "ORD-3201", "items": [ { "sku": "SKU-BOOK", "quantity": 2 }, { "sku": "SKU-POSTER", "quantity": 1 }, { "sku": "SKU-MUG", "quantity": 3 } ] }
+
+### EIP aggregator — the client splits the order and posts its items one by one; the last one gets the invoice
+POST {{base}}/eip/invoices/orders
+Content-Type: application/json
+
+{ "orderId": "ORD-3301", "items": [ { "sku": "SKU-BOOK", "quantity": 2, "unitPrice": 30 }, { "sku": "SKU-MUG", "quantity": 1, "unitPrice": 12.5 } ] }
+
+###
+GET {{base}}/eip/invoices/ORD-3301
+
+### One item of a two-item order: 202, and after 5 seconds the invoice is INCOMPLETE
+POST {{base}}/eip/invoices/items
+Content-Type: application/json
+
+{ "orderId": "ORD-3302", "itemCount": 2, "sku": "SKU-BOOK", "quantity": 1, "unitPrice": 30 }
+
+###
+GET {{base}}/eip/invoices/ORD-3302
+
+### EIP recipient list — an international order with physical and digital items goes to all four recipients
+POST {{base}}/eip/orders/notifications
+Content-Type: application/json
+
+{ "orderId": "ORD-3401", "country": "US", "items": [ { "sku": "SKU-BOOK", "quantity": 1, "unitPrice": 30, "type": "PHYSICAL" }, { "sku": "SKU-EBOOK", "quantity": 1, "unitPrice": 9, "type": "DIGITAL" } ] }
+
+###
+GET {{base}}/eip/orders/ORD-3401/notifications
+
+### EIP scatter-gather — pricing, stock and fraud checks in parallel (a CUS-NEW... customer goes to REVIEW)
+POST {{base}}/eip/orders/checks
+Content-Type: application/json
+
+{ "orderId": "ORD-3501", "customerId": "CUS-100", "items": [ { "sku": "SKU-BOOK", "quantity": 2, "unitPrice": 30 }, { "sku": "SKU-MUG", "quantity": 1, "unitPrice": 12.5 } ] }

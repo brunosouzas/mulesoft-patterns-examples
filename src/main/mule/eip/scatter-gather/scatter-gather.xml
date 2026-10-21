@@ -1,0 +1,118 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<mule xmlns="http://www.mulesoft.org/schema/mule/core"
+	xmlns:http="http://www.mulesoft.org/schema/mule/http"
+	xmlns:ee="http://www.mulesoft.org/schema/mule/ee/core"
+	xmlns:doc="http://www.mulesoft.org/schema/mule/documentation"
+	xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+	xsi:schemaLocation="http://www.mulesoft.org/schema/mule/core http://www.mulesoft.org/schema/mule/core/current/mule.xsd
+		http://www.mulesoft.org/schema/mule/http http://www.mulesoft.org/schema/mule/http/current/mule-http.xsd
+		http://www.mulesoft.org/schema/mule/ee/core http://www.mulesoft.org/schema/mule/ee/core/current/mule-ee.xsd">
+
+	<!--
+		SCATTER-GATHER (Hohpe and Woolf): sends one request to several recipients and aggregates their replies into
+		one message. Here, before an order is accepted, three independent checks run at the same time.
+		POST /eip/orders/checks { orderId, customerId, items: [ { sku, quantity, unitPrice } ] }
+
+		Routes (each one calls a simulated service on this application, see scatter-gather-services.xml):
+		  0 pricing  -> the order total
+		  1 stock    -> whether every item is in stock
+		  2 fraud    -> a risk score for the customer
+		Decision: REJECTED when an item is out of stock, REVIEW when the fraud check says HIGH_RISK, else ACCEPTED.
+
+		In the book Scatter-Gather is a Recipient List (or a broadcast) followed by an Aggregator. Mule's
+		Scatter-Gather router does both in one scope: every route gets a copy of the same event, the routes run
+		concurrently (up to maxConcurrency), and when all of them have finished the payload is one object with a
+		key per route, "0", "1", "2", each holding that route's message (payload and attributes). The routes are
+		fixed in the XML: when the list of recipients is computed per message, use a Recipient List
+		(recipient-list/) instead.
+
+		When a route fails, the others still run to the end, and then Scatter-Gather raises MULE:COMPOSITE_ROUTING.
+		The error does not throw the successful work away: error.errorMessage.payload.results holds the messages
+		of the routes that succeeded and error.errorMessage.payload.failures the error of each route that failed,
+		both by route key. The handler below answers 503 with what is known (decision INCOMPLETE, the completed
+		and the failed checks, each failure by its error type only), instead of a bare 500.
+
+		A route that does not finish within timeout (eip.scatterGather.timeoutMillis) fails with MULE:TIMEOUT,
+		and that failure is handled like any other: it is listed among the failures of MULE:COMPOSITE_ROUTING.
+		The MUnit suite does not exercise the timeout; this is the documented behaviour:
+		https://docs.mulesoft.com/mule-runtime/latest/scatter-gather-concept (Handle Timeout Errors).
+	-->
+	<flow name="order-check-before-acceptance" doc:description="Scatter-gather: runs the pricing, stock and fraud checks of an order in parallel on POST /eip/orders/checks and combines them into one acceptance decision; a failed check returns the partial result.">
+		<http:listener doc:name="POST /eip/orders/checks" config-ref="http-listener-config" path="/eip/orders/checks" allowedMethods="POST">
+			<http:response statusCode="#[vars.httpStatus default 200]" />
+		</http:listener>
+		<logger doc:name="INFO: Log order checks request" level="INFO" message="#['Check orderId=' ++ (payload.orderId default 'none') ++ ' before acceptance, correlationId=' ++ correlationId]" />
+		<choice doc:name="Validate Order To Check">
+			<when expression="#[(not (payload is Object)) or isEmpty(payload.orderId) or isEmpty(payload.customerId) or (not (payload.items is Array)) or isEmpty(payload.items) or not isEmpty(payload.items filter (isEmpty($.sku) or (not ($.quantity is Number)) or not ($.unitPrice is Number)))]">
+				<raise-error doc:name="Raise BAD_REQUEST Error - Missing order fields" type="APP:BAD_REQUEST" description="orderId, customerId and a non-empty items array (sku, quantity, unitPrice) are required" />
+			</when>
+		</choice>
+		<set-variable doc:name="SET vOrder" variableName="vOrder" value="#[output application/java --- payload]" />
+		<try doc:name="Try Run Order Checks">
+			<scatter-gather doc:name="Run Pricing Stock And Fraud Checks" timeout="${eip.scatterGather.timeoutMillis}" maxConcurrency="3">
+				<route>
+					<http:request doc:name="Call Pricing Service" config-ref="eip-self-http-request-config" method="POST" path="/eip/services/pricing">
+						<http:body><![CDATA[#[output application/json --- vars.vOrder]]]></http:body>
+					</http:request>
+				</route>
+				<route>
+					<http:request doc:name="Call Stock Service" config-ref="eip-self-http-request-config" method="POST" path="/eip/services/stock">
+						<http:body><![CDATA[#[output application/json --- vars.vOrder]]]></http:body>
+					</http:request>
+				</route>
+				<route>
+					<http:request doc:name="Call Fraud Service" config-ref="eip-self-http-request-config" method="POST" path="/eip/services/fraud">
+						<http:body><![CDATA[#[output application/json --- vars.vOrder]]]></http:body>
+					</http:request>
+				</route>
+			</scatter-gather>
+			<ee:transform doc:name="Combine Check Results">
+				<ee:message>
+					<ee:set-payload><![CDATA[%dw 2.0
+output application/json
+var pricing = payload["0"].payload
+var stock = payload["1"].payload
+var fraud = payload["2"].payload
+---
+{
+	orderId: vars.vOrder.orderId,
+	decision: if (not stock.available) "REJECTED" else if (fraud.risk == "HIGH_RISK") "REVIEW" else "ACCEPTED",
+	total: pricing.total,
+	stock: { available: stock.available, unavailableSkus: stock.unavailableSkus },
+	fraud: { score: fraud.score, risk: fraud.risk }
+}]]></ee:set-payload>
+				</ee:message>
+			</ee:transform>
+			<error-handler>
+				<on-error-continue doc:name="On Error Continue (a check failed)" type="MULE:COMPOSITE_ROUTING" logException="false">
+					<logger doc:name="WARN: Log failed checks" level="WARN" message="#['Order checks incomplete for orderId=' ++ vars.vOrder.orderId ++ ': ' ++ ((error.errorMessage.payload.failures default {}) pluck ((failure, route) -> (route as String) ++ ' ' ++ (failure.description default '')) joinBy '; ') ++ ', correlationId=' ++ correlationId]" />
+					<set-variable doc:name="SET httpStatus" variableName="httpStatus" value="503" />
+					<ee:transform doc:name="Build Partial Check Result">
+						<ee:message>
+							<ee:set-payload><![CDATA[%dw 2.0
+output application/json
+// Route keys are the positions of the routes in the scatter-gather.
+var checkNames = { "0": "pricing", "1": "stock", "2": "fraud" }
+var results = error.errorMessage.payload.results default {}
+var failures = error.errorMessage.payload.failures default {}
+---
+{
+	orderId: vars.vOrder.orderId,
+	decision: "INCOMPLETE",
+	completedChecks: results mapObject ((message, route) -> { (checkNames[route as String]): message.payload }),
+	failedChecks: failures mapObject ((failure, route) -> {
+		(checkNames[route as String]): {
+			// Only the error type: the description can carry internal details (the requester's URL, for one),
+			// so it is logged above and never sent to the caller.
+			errorType: failure.errorType.namespace ++ ":" ++ failure.errorType.identifier
+		}
+	})
+}]]></ee:set-payload>
+						</ee:message>
+					</ee:transform>
+				</on-error-continue>
+			</error-handler>
+		</try>
+		<logger doc:name="INFO: Log order checks result" level="INFO" message="#['Order ' ++ vars.vOrder.orderId ++ ' checks: ' ++ payload.decision ++ ', correlationId=' ++ correlationId]" />
+	</flow>
+</mule>

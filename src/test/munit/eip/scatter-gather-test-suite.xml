@@ -1,0 +1,160 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<mule xmlns="http://www.mulesoft.org/schema/mule/core"
+	xmlns:munit="http://www.mulesoft.org/schema/mule/munit"
+	xmlns:munit-tools="http://www.mulesoft.org/schema/mule/munit-tools"
+	xmlns:http="http://www.mulesoft.org/schema/mule/http"
+	xmlns:os="http://www.mulesoft.org/schema/mule/os"
+	xmlns:doc="http://www.mulesoft.org/schema/mule/documentation"
+	xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+	xsi:schemaLocation="http://www.mulesoft.org/schema/mule/core http://www.mulesoft.org/schema/mule/core/current/mule.xsd
+		http://www.mulesoft.org/schema/mule/munit http://www.mulesoft.org/schema/mule/munit/current/mule-munit.xsd
+		http://www.mulesoft.org/schema/mule/munit-tools http://www.mulesoft.org/schema/mule/munit-tools/current/mule-munit-tools.xsd
+		http://www.mulesoft.org/schema/mule/http http://www.mulesoft.org/schema/mule/http/current/mule-http.xsd
+		http://www.mulesoft.org/schema/mule/os http://www.mulesoft.org/schema/mule/os/current/mule-os.xsd">
+
+	<!--
+		Scatter-gather: three checks of one order (pricing, stock, fraud) run in parallel over HTTP against the
+		simulated services, and are combined into one decision. The last tests make one route fail and show what
+		MULE:COMPOSITE_ROUTING carries: the results of the routes that succeeded and the failure of the one that did not.
+	-->
+	<munit:config name="scatter-gather-test-suite.xml" />
+
+	<munit:test name="sg-all-checks-pass-order-is-accepted" description="Scatter-gather: all three checks succeed and pass, so the order is accepted with the total from pricing">
+		<munit:enable-flow-sources>
+			<munit:enable-flow-source value="service-price-order" />
+			<munit:enable-flow-source value="service-check-order-stock" />
+			<munit:enable-flow-source value="service-score-order-fraud" />
+		</munit:enable-flow-sources>
+		<munit:execution>
+			<munit:set-event doc:name="Order ORD-SG-OK">
+				<munit:payload value="#[output application/json --- {orderId: 'ORD-SG-OK', customerId: 'CUS-100', items: [{sku: 'SKU-BOOK', quantity: 2, unitPrice: 30}, {sku: 'SKU-MUG', quantity: 1, unitPrice: 12.5}]}]" mediaType="application/json" />
+			</munit:set-event>
+			<flow-ref doc:name="POST /eip/orders/checks" name="order-check-before-acceptance" />
+		</munit:execution>
+		<munit:validation>
+			<munit-tools:assert-that doc:name="200: no error status set" expression="#[vars.httpStatus]" is="#[MunitTools::nullValue()]" />
+			<munit-tools:assert-that doc:name="ACCEPTED" expression="#[payload.decision]" is="#[MunitTools::equalTo('ACCEPTED')]" />
+			<munit-tools:assert-that doc:name="Total from pricing" expression="#[payload.total]" is="#[MunitTools::equalTo(72.5)]" />
+			<munit-tools:assert-that doc:name="Stock from stock" expression="#[payload.stock.available]" is="#[MunitTools::equalTo(true)]" />
+			<munit-tools:assert-that doc:name="Risk from fraud" expression="#[payload.fraud.risk]" is="#[MunitTools::equalTo('LOW_RISK')]" />
+			<munit-tools:verify-call doc:name="Call Pricing Service called 1x" processor="http:request" times="1">
+				<munit-tools:with-attributes>
+					<munit-tools:with-attribute attributeName="doc:name" whereValue="Call Pricing Service" />
+				</munit-tools:with-attributes>
+			</munit-tools:verify-call>
+			<munit-tools:verify-call doc:name="Call Stock Service called 1x" processor="http:request" times="1">
+				<munit-tools:with-attributes>
+					<munit-tools:with-attribute attributeName="doc:name" whereValue="Call Stock Service" />
+				</munit-tools:with-attributes>
+			</munit-tools:verify-call>
+			<munit-tools:verify-call doc:name="Call Fraud Service called 1x" processor="http:request" times="1">
+				<munit-tools:with-attributes>
+					<munit-tools:with-attribute attributeName="doc:name" whereValue="Call Fraud Service" />
+				</munit-tools:with-attributes>
+			</munit-tools:verify-call>
+		</munit:validation>
+	</munit:test>
+
+	<munit:test name="sg-out-of-stock-order-is-rejected" description="Scatter-gather: the stock check reports an item out of stock, so the order is rejected">
+		<munit:enable-flow-sources>
+			<munit:enable-flow-source value="service-price-order" />
+			<munit:enable-flow-source value="service-check-order-stock" />
+			<munit:enable-flow-source value="service-score-order-fraud" />
+		</munit:enable-flow-sources>
+		<munit:execution>
+			<munit:set-event doc:name="Order ORD-SG-NOSTOCK">
+				<munit:payload value="#[output application/json --- {orderId: 'ORD-SG-NOSTOCK', customerId: 'CUS-100', items: [{sku: 'SKU-BOOK', quantity: 1, unitPrice: 30}, {sku: 'SKU-POSTER', quantity: 1, unitPrice: 8}]}]" mediaType="application/json" />
+			</munit:set-event>
+			<flow-ref doc:name="POST /eip/orders/checks" name="order-check-before-acceptance" />
+		</munit:execution>
+		<munit:validation>
+			<munit-tools:assert-that doc:name="REJECTED" expression="#[payload.decision]" is="#[MunitTools::equalTo('REJECTED')]" />
+			<munit-tools:assert-that doc:name="Which item" expression="#[payload.stock.unavailableSkus]" is="#[MunitTools::equalTo(['SKU-POSTER'])]" />
+			<munit-tools:assert-that doc:name="Total still priced" expression="#[payload.total]" is="#[MunitTools::equalTo(38)]" />
+		</munit:validation>
+	</munit:test>
+
+	<munit:test name="sg-high-risk-customer-goes-to-review" description="Scatter-gather: the fraud check scores a new customer HIGH_RISK, so the order goes to review">
+		<munit:enable-flow-sources>
+			<munit:enable-flow-source value="service-price-order" />
+			<munit:enable-flow-source value="service-check-order-stock" />
+			<munit:enable-flow-source value="service-score-order-fraud" />
+		</munit:enable-flow-sources>
+		<munit:execution>
+			<munit:set-event doc:name="Order ORD-SG-RISK">
+				<munit:payload value="#[output application/json --- {orderId: 'ORD-SG-RISK', customerId: 'CUS-NEW-7', items: [{sku: 'SKU-BOOK', quantity: 2, unitPrice: 30}, {sku: 'SKU-MUG', quantity: 1, unitPrice: 12.5}]}]" mediaType="application/json" />
+			</munit:set-event>
+			<flow-ref doc:name="POST /eip/orders/checks" name="order-check-before-acceptance" />
+		</munit:execution>
+		<munit:validation>
+			<munit-tools:assert-that doc:name="REVIEW" expression="#[payload.decision]" is="#[MunitTools::equalTo('REVIEW')]" />
+			<munit-tools:assert-that doc:name="Score" expression="#[payload.fraud.score]" is="#[MunitTools::equalTo(80)]" />
+		</munit:validation>
+	</munit:test>
+
+	<munit:test name="sg-failed-route-raises-composite-routing-with-the-other-results" description="Scatter-gather: when the fraud route fails, the other routes still finish, MULE:COMPOSITE_ROUTING carries their results and the fraud failure, and the endpoint answers 503 with the partial result">
+		<munit:enable-flow-sources>
+			<munit:enable-flow-source value="service-price-order" />
+			<munit:enable-flow-source value="service-check-order-stock" />
+			<munit:enable-flow-source value="service-score-order-fraud" />
+		</munit:enable-flow-sources>
+		<munit:behavior>
+			<munit-tools:mock-when doc:name="Fraud service unavailable" processor="http:request">
+				<munit-tools:with-attributes>
+					<munit-tools:with-attribute attributeName="doc:name" whereValue="Call Fraud Service" />
+				</munit-tools:with-attributes>
+				<munit-tools:then-return>
+					<munit-tools:error typeId="HTTP:SERVICE_UNAVAILABLE" />
+				</munit-tools:then-return>
+			</munit-tools:mock-when>
+		</munit:behavior>
+		<munit:execution>
+			<munit:set-event doc:name="Order ORD-SG-FRAUD-DOWN">
+				<munit:payload value="#[output application/json --- {orderId: 'ORD-SG-FRAUD-DOWN', customerId: 'CUS-100', items: [{sku: 'SKU-BOOK', quantity: 2, unitPrice: 30}, {sku: 'SKU-MUG', quantity: 1, unitPrice: 12.5}]}]" mediaType="application/json" />
+			</munit:set-event>
+			<flow-ref doc:name="POST /eip/orders/checks" name="order-check-before-acceptance" />
+		</munit:execution>
+		<munit:validation>
+			<munit-tools:assert-that doc:name="503" expression="#[vars.httpStatus as Number]" is="#[MunitTools::equalTo(503)]" />
+			<munit-tools:assert-that doc:name="INCOMPLETE" expression="#[payload.decision]" is="#[MunitTools::equalTo('INCOMPLETE')]" />
+			<munit-tools:assert-that doc:name="Completed checks" expression="#[keysOf(payload.completedChecks) map ($ as String) orderBy $]" is="#[MunitTools::equalTo(['pricing', 'stock'])]" />
+			<munit-tools:assert-that doc:name="Pricing result kept" expression="#[payload.completedChecks.pricing.total]" is="#[MunitTools::equalTo(72.5)]" />
+			<munit-tools:assert-that doc:name="Stock result kept" expression="#[payload.completedChecks.stock.available]" is="#[MunitTools::equalTo(true)]" />
+			<munit-tools:assert-that doc:name="Failed checks" expression="#[keysOf(payload.failedChecks) map ($ as String)]" is="#[MunitTools::equalTo(['fraud'])]" />
+			<munit-tools:assert-that doc:name="Failure error type" expression="#[payload.failedChecks.fraud.errorType]" is="#[MunitTools::equalTo('HTTP:SERVICE_UNAVAILABLE')]" />
+			<munit-tools:assert-that doc:name="No error description in the response" expression="#[payload.failedChecks.fraud.description default null]" is="#[MunitTools::nullValue()]" />
+			<munit-tools:verify-call doc:name="Call Pricing Service called 1x" processor="http:request" times="1">
+				<munit-tools:with-attributes>
+					<munit-tools:with-attribute attributeName="doc:name" whereValue="Call Pricing Service" />
+				</munit-tools:with-attributes>
+			</munit-tools:verify-call>
+			<munit-tools:verify-call doc:name="Call Stock Service called 1x" processor="http:request" times="1">
+				<munit-tools:with-attributes>
+					<munit-tools:with-attribute attributeName="doc:name" whereValue="Call Stock Service" />
+				</munit-tools:with-attributes>
+			</munit-tools:verify-call>
+			<munit-tools:verify-call doc:name="Call Fraud Service called 1x" processor="http:request" times="1">
+				<munit-tools:with-attributes>
+					<munit-tools:with-attribute attributeName="doc:name" whereValue="Call Fraud Service" />
+				</munit-tools:with-attributes>
+			</munit-tools:verify-call>
+		</munit:validation>
+	</munit:test>
+
+	<munit:test name="sg-order-without-customer-returns-400" description="Scatter-gather: an order without customerId is rejected with 400 and no check runs">
+		<munit:execution>
+			<munit:set-event doc:name="Order without customerId">
+				<munit:payload value="#[output application/json --- {orderId: 'ORD-SG-BAD', items: [{sku: 'SKU-BOOK', quantity: 1, unitPrice: 30}]}]" mediaType="application/json" />
+			</munit:set-event>
+			<flow-ref doc:name="POST /eip/orders/checks" name="order-check-before-acceptance" />
+		</munit:execution>
+		<munit:validation>
+			<munit-tools:assert-that doc:name="400" expression="#[vars.httpStatus as Number]" is="#[MunitTools::equalTo(400)]" />
+			<munit-tools:verify-call doc:name="Call Pricing Service called 0x" processor="http:request" times="0">
+				<munit-tools:with-attributes>
+					<munit-tools:with-attribute attributeName="doc:name" whereValue="Call Pricing Service" />
+				</munit-tools:with-attributes>
+			</munit-tools:verify-call>
+		</munit:validation>
+	</munit:test>
+</mule>

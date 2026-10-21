@@ -1,0 +1,154 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<mule xmlns="http://www.mulesoft.org/schema/mule/core"
+	xmlns:munit="http://www.mulesoft.org/schema/mule/munit"
+	xmlns:munit-tools="http://www.mulesoft.org/schema/mule/munit-tools"
+	xmlns:http="http://www.mulesoft.org/schema/mule/http"
+	xmlns:os="http://www.mulesoft.org/schema/mule/os"
+	xmlns:doc="http://www.mulesoft.org/schema/mule/documentation"
+	xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+	xsi:schemaLocation="http://www.mulesoft.org/schema/mule/core http://www.mulesoft.org/schema/mule/core/current/mule.xsd
+		http://www.mulesoft.org/schema/mule/munit http://www.mulesoft.org/schema/mule/munit/current/mule-munit.xsd
+		http://www.mulesoft.org/schema/mule/munit-tools http://www.mulesoft.org/schema/mule/munit-tools/current/mule-munit-tools.xsd
+		http://www.mulesoft.org/schema/mule/http http://www.mulesoft.org/schema/mule/http/current/mule-http.xsd
+		http://www.mulesoft.org/schema/mule/os http://www.mulesoft.org/schema/mule/os/current/mule-os.xsd">
+
+	<!--
+		Message filter: only PAID orders may reserve stock.
+		- before: the Choice "discards" the order, but the reservation sits after the Choice and still runs.
+		- after: the reservation is inside the route that lets the order through.
+		Every test uses its own orderIds, because the reservation ledger lives as long as the application.
+	-->
+	<munit:config name="message-filter-test-suite.xml" />
+
+	<munit:test name="filter-before-unpaid-order-is-reported-discarded-but-stock-is-reserved" description="Message filter before: a declined order is answered DISCARDED, yet the reservation after the Choice still runs and reserves stock for it">
+		<munit:execution>
+			<munit:set-event doc:name="Order ORD-MF-B-DECLINED (PAYMENT_DECLINED)">
+				<munit:payload value="#[output application/json --- {orderId: 'ORD-MF-B-DECLINED', status: 'PAYMENT_DECLINED', items: [{sku: 'SKU-BOOK', quantity: 2}, {sku: 'SKU-MUG', quantity: 1}]}]" mediaType="application/json" />
+			</munit:set-event>
+			<flow-ref doc:name="POST /eip/stock/before/reservations" name="stock-before-reserve-paid-orders" />
+			<set-variable doc:name="Reservation response" variableName="response" value="#[payload]" />
+			<munit:set-event doc:name="GET reservations" cloneOriginalEvent="true">
+				<munit:attributes value="#[{ uriParams: { orderId: 'ORD-MF-B-DECLINED' } }]" />
+			</munit:set-event>
+			<flow-ref doc:name="GET /eip/stock/ORD-MF-B-DECLINED/reservations" name="stock-get-reservations" />
+		</munit:execution>
+		<munit:validation>
+			<munit-tools:assert-that doc:name="200: no error status set" expression="#[vars.httpStatus]" is="#[MunitTools::nullValue()]" />
+			<munit-tools:assert-that doc:name="Response names the order" expression="#[vars.response.orderId]" is="#[MunitTools::equalTo('ORD-MF-B-DECLINED')]" />
+			<munit-tools:assert-that doc:name="Caller is told DISCARDED" expression="#[vars.response.result]" is="#[MunitTools::equalTo('DISCARDED')]" />
+			<munit-tools:assert-that doc:name="Reservations: 1" expression="#[payload.reservations]" is="#[MunitTools::equalTo(1)]" />
+			<munit-tools:verify-call doc:name="Reservation called 1x" processor="flow-ref" times="1">
+				<munit-tools:with-attributes>
+					<munit-tools:with-attribute attributeName="name" whereValue="sf-reserve-stock-for-order" />
+				</munit-tools:with-attributes>
+			</munit-tools:verify-call>
+		</munit:validation>
+	</munit:test>
+
+	<munit:test name="filter-before-paid-order-is-reserved" description="Message filter before: a paid order is reserved once; for qualifying messages the defect is invisible">
+		<munit:execution>
+			<munit:set-event doc:name="Order ORD-MF-B-PAID (PAID)">
+				<munit:payload value="#[output application/json --- {orderId: 'ORD-MF-B-PAID', status: 'PAID', items: [{sku: 'SKU-BOOK', quantity: 2}, {sku: 'SKU-MUG', quantity: 1}]}]" mediaType="application/json" />
+			</munit:set-event>
+			<flow-ref doc:name="POST /eip/stock/before/reservations" name="stock-before-reserve-paid-orders" />
+			<set-variable doc:name="Reservation response" variableName="response" value="#[payload]" />
+			<munit:set-event doc:name="GET reservations" cloneOriginalEvent="true">
+				<munit:attributes value="#[{ uriParams: { orderId: 'ORD-MF-B-PAID' } }]" />
+			</munit:set-event>
+			<flow-ref doc:name="GET /eip/stock/ORD-MF-B-PAID/reservations" name="stock-get-reservations" />
+		</munit:execution>
+		<munit:validation>
+			<munit-tools:assert-that doc:name="200: no error status set" expression="#[vars.httpStatus]" is="#[MunitTools::nullValue()]" />
+			<munit-tools:assert-that doc:name="Response names the order" expression="#[vars.response.orderId]" is="#[MunitTools::equalTo('ORD-MF-B-PAID')]" />
+			<munit-tools:assert-that doc:name="Caller is told RESERVED" expression="#[vars.response.result]" is="#[MunitTools::equalTo('RESERVED')]" />
+			<munit-tools:assert-that doc:name="Reservations: 1" expression="#[payload.reservations]" is="#[MunitTools::equalTo(1)]" />
+		</munit:validation>
+	</munit:test>
+
+	<munit:test name="filter-after-unpaid-order-is-discarded-and-nothing-is-reserved" description="Message filter after: a declined order is discarded inside the Choice and no stock is reserved">
+		<munit:execution>
+			<munit:set-event doc:name="Order ORD-MF-A-DECLINED (PAYMENT_DECLINED)">
+				<munit:payload value="#[output application/json --- {orderId: 'ORD-MF-A-DECLINED', status: 'PAYMENT_DECLINED', items: [{sku: 'SKU-BOOK', quantity: 2}, {sku: 'SKU-MUG', quantity: 1}]}]" mediaType="application/json" />
+			</munit:set-event>
+			<flow-ref doc:name="POST /eip/stock/after/reservations" name="stock-after-reserve-paid-orders" />
+			<set-variable doc:name="Reservation response" variableName="response" value="#[payload]" />
+			<munit:set-event doc:name="GET reservations" cloneOriginalEvent="true">
+				<munit:attributes value="#[{ uriParams: { orderId: 'ORD-MF-A-DECLINED' } }]" />
+			</munit:set-event>
+			<flow-ref doc:name="GET /eip/stock/ORD-MF-A-DECLINED/reservations" name="stock-get-reservations" />
+		</munit:execution>
+		<munit:validation>
+			<munit-tools:assert-that doc:name="200: no error status set" expression="#[vars.httpStatus]" is="#[MunitTools::nullValue()]" />
+			<munit-tools:assert-that doc:name="Response names the order" expression="#[vars.response.orderId]" is="#[MunitTools::equalTo('ORD-MF-A-DECLINED')]" />
+			<munit-tools:assert-that doc:name="Caller is told DISCARDED" expression="#[vars.response.result]" is="#[MunitTools::equalTo('DISCARDED')]" />
+			<munit-tools:assert-that doc:name="Reservations: 0" expression="#[payload.reservations]" is="#[MunitTools::equalTo(0)]" />
+			<munit-tools:verify-call doc:name="Reservation called 0x" processor="flow-ref" times="0">
+				<munit-tools:with-attributes>
+					<munit-tools:with-attribute attributeName="name" whereValue="sf-reserve-stock-for-order" />
+				</munit-tools:with-attributes>
+			</munit-tools:verify-call>
+		</munit:validation>
+	</munit:test>
+
+	<munit:test name="filter-after-order-in-review-is-discarded" description="Message filter after: an order still in payment review does not qualify either">
+		<munit:execution>
+			<munit:set-event doc:name="Order ORD-MF-A-REVIEW (PAYMENT_REVIEW)">
+				<munit:payload value="#[output application/json --- {orderId: 'ORD-MF-A-REVIEW', status: 'PAYMENT_REVIEW', items: [{sku: 'SKU-BOOK', quantity: 2}, {sku: 'SKU-MUG', quantity: 1}]}]" mediaType="application/json" />
+			</munit:set-event>
+			<flow-ref doc:name="POST /eip/stock/after/reservations" name="stock-after-reserve-paid-orders" />
+			<set-variable doc:name="Reservation response" variableName="response" value="#[payload]" />
+			<munit:set-event doc:name="GET reservations" cloneOriginalEvent="true">
+				<munit:attributes value="#[{ uriParams: { orderId: 'ORD-MF-A-REVIEW' } }]" />
+			</munit:set-event>
+			<flow-ref doc:name="GET /eip/stock/ORD-MF-A-REVIEW/reservations" name="stock-get-reservations" />
+		</munit:execution>
+		<munit:validation>
+			<munit-tools:assert-that doc:name="200: no error status set" expression="#[vars.httpStatus]" is="#[MunitTools::nullValue()]" />
+			<munit-tools:assert-that doc:name="Response names the order" expression="#[vars.response.orderId]" is="#[MunitTools::equalTo('ORD-MF-A-REVIEW')]" />
+			<munit-tools:assert-that doc:name="Caller is told DISCARDED" expression="#[vars.response.result]" is="#[MunitTools::equalTo('DISCARDED')]" />
+			<munit-tools:assert-that doc:name="Reservations: 0" expression="#[payload.reservations]" is="#[MunitTools::equalTo(0)]" />
+			<munit-tools:verify-call doc:name="Reservation called 0x" processor="flow-ref" times="0">
+				<munit-tools:with-attributes>
+					<munit-tools:with-attribute attributeName="name" whereValue="sf-reserve-stock-for-order" />
+				</munit-tools:with-attributes>
+			</munit-tools:verify-call>
+		</munit:validation>
+	</munit:test>
+
+	<munit:test name="filter-after-paid-order-is-reserved" description="Message filter after: a paid order passes the filter and is reserved once">
+		<munit:execution>
+			<munit:set-event doc:name="Order ORD-MF-A-PAID (PAID)">
+				<munit:payload value="#[output application/json --- {orderId: 'ORD-MF-A-PAID', status: 'PAID', items: [{sku: 'SKU-BOOK', quantity: 2}, {sku: 'SKU-MUG', quantity: 1}]}]" mediaType="application/json" />
+			</munit:set-event>
+			<flow-ref doc:name="POST /eip/stock/after/reservations" name="stock-after-reserve-paid-orders" />
+			<set-variable doc:name="Reservation response" variableName="response" value="#[payload]" />
+			<munit:set-event doc:name="GET reservations" cloneOriginalEvent="true">
+				<munit:attributes value="#[{ uriParams: { orderId: 'ORD-MF-A-PAID' } }]" />
+			</munit:set-event>
+			<flow-ref doc:name="GET /eip/stock/ORD-MF-A-PAID/reservations" name="stock-get-reservations" />
+		</munit:execution>
+		<munit:validation>
+			<munit-tools:assert-that doc:name="200: no error status set" expression="#[vars.httpStatus]" is="#[MunitTools::nullValue()]" />
+			<munit-tools:assert-that doc:name="Response names the order" expression="#[vars.response.orderId]" is="#[MunitTools::equalTo('ORD-MF-A-PAID')]" />
+			<munit-tools:assert-that doc:name="Caller is told RESERVED" expression="#[vars.response.result]" is="#[MunitTools::equalTo('RESERVED')]" />
+			<munit-tools:assert-that doc:name="Reservations: 1" expression="#[payload.reservations]" is="#[MunitTools::equalTo(1)]" />
+			<munit-tools:verify-call doc:name="Reservation called 1x" processor="flow-ref" times="1">
+				<munit-tools:with-attributes>
+					<munit-tools:with-attribute attributeName="name" whereValue="sf-reserve-stock-for-order" />
+				</munit-tools:with-attributes>
+			</munit-tools:verify-call>
+		</munit:validation>
+	</munit:test>
+
+	<munit:test name="filter-request-without-items-returns-400" description="Message filter: an order event without items is rejected with 400 before the filter">
+		<munit:execution>
+			<munit:set-event doc:name="Order without items">
+				<munit:payload value="#[output application/json --- {orderId: 'ORD-MF-BAD', status: 'PAID'}]" mediaType="application/json" />
+			</munit:set-event>
+			<flow-ref doc:name="POST /eip/stock/after/reservations" name="stock-after-reserve-paid-orders" />
+		</munit:execution>
+		<munit:validation>
+			<munit-tools:assert-that doc:name="400" expression="#[vars.httpStatus as Number]" is="#[MunitTools::equalTo(400)]" />
+		</munit:validation>
+	</munit:test>
+</mule>

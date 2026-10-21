@@ -1,0 +1,57 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<mule xmlns="http://www.mulesoft.org/schema/mule/core"
+	xmlns:http="http://www.mulesoft.org/schema/mule/http"
+	xmlns:ee="http://www.mulesoft.org/schema/mule/ee/core"
+	xmlns:doc="http://www.mulesoft.org/schema/mule/documentation"
+	xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+	xsi:schemaLocation="http://www.mulesoft.org/schema/mule/core http://www.mulesoft.org/schema/mule/core/current/mule.xsd
+		http://www.mulesoft.org/schema/mule/http http://www.mulesoft.org/schema/mule/http/current/mule-http.xsd
+		http://www.mulesoft.org/schema/mule/ee/core http://www.mulesoft.org/schema/mule/ee/core/current/mule-ee.xsd">
+
+	<!--
+		SCATTER-GATHER: the three services the order checks call, simulated on this application with synthetic
+		data. Each one takes the whole order and answers for its own concern.
+		POST /eip/services/pricing  -> { orderId, total }
+		POST /eip/services/stock    -> { orderId, available, unavailableSkus }
+		POST /eip/services/fraud    -> { orderId, customerId, score, risk }   customers whose id starts with
+		                                                                     CUS-NEW score 80 (HIGH_RISK)
+	-->
+	<flow name="service-price-order" doc:description="Simulated pricing service: POST /eip/services/pricing returns the order total (sum of quantity times unit price).">
+		<http:listener doc:name="POST /eip/services/pricing" config-ref="http-listener-config" path="/eip/services/pricing" allowedMethods="POST" />
+		<ee:transform doc:name="Price Order (simulated)">
+			<ee:message>
+				<ee:set-payload><![CDATA[%dw 2.0
+output application/json
+---
+{ orderId: payload.orderId, total: sum(payload.items map ($.quantity * $.unitPrice)) }]]></ee:set-payload>
+			</ee:message>
+		</ee:transform>
+	</flow>
+
+	<flow name="service-check-order-stock" doc:description="Simulated stock service: POST /eip/services/stock says whether every item of the order is in stock, from synthetic stock levels.">
+		<http:listener doc:name="POST /eip/services/stock" config-ref="http-listener-config" path="/eip/services/stock" allowedMethods="POST" />
+		<ee:transform doc:name="Check Order Stock (simulated)">
+			<ee:message>
+				<ee:set-payload><![CDATA[%dw 2.0
+output application/json
+var stockLevels = { "SKU-BOOK": 10, "SKU-MUG": 3, "SKU-EBOOK": 9999, "SKU-POSTER": 0 }
+var unavailable = payload.items filter ((stockLevels[$.sku] default 0) < $.quantity) map $.sku
+---
+{ orderId: payload.orderId, available: isEmpty(unavailable), unavailableSkus: unavailable }]]></ee:set-payload>
+			</ee:message>
+		</ee:transform>
+	</flow>
+
+	<flow name="service-score-order-fraud" doc:description="Simulated fraud service: POST /eip/services/fraud scores the order's customer; new customers (CUS-NEW...) are HIGH_RISK.">
+		<http:listener doc:name="POST /eip/services/fraud" config-ref="http-listener-config" path="/eip/services/fraud" allowedMethods="POST" />
+		<ee:transform doc:name="Score Order Fraud Risk (simulated)">
+			<ee:message>
+				<ee:set-payload><![CDATA[%dw 2.0
+output application/json
+var score = if ((payload.customerId default "") startsWith "CUS-NEW") 80 else 10
+---
+{ orderId: payload.orderId, customerId: payload.customerId, score: score, risk: if (score >= 70) "HIGH_RISK" else "LOW_RISK" }]]></ee:set-payload>
+			</ee:message>
+		</ee:transform>
+	</flow>
+</mule>

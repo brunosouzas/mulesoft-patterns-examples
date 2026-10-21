@@ -1,0 +1,60 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<mule xmlns="http://www.mulesoft.org/schema/mule/core"
+	xmlns:http="http://www.mulesoft.org/schema/mule/http"
+	xmlns:ee="http://www.mulesoft.org/schema/mule/ee/core"
+	xmlns:doc="http://www.mulesoft.org/schema/mule/documentation"
+	xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+	xsi:schemaLocation="http://www.mulesoft.org/schema/mule/core http://www.mulesoft.org/schema/mule/core/current/mule.xsd
+		http://www.mulesoft.org/schema/mule/http http://www.mulesoft.org/schema/mule/http/current/mule-http.xsd
+		http://www.mulesoft.org/schema/mule/ee/core http://www.mulesoft.org/schema/mule/ee/core/current/mule-ee.xsd">
+
+	<!--
+		AGGREGATOR, CLIENT: splits an order and sends its items to the aggregator one request at a time, the way a
+		warehouse confirms items as it picks them. POST /eip/invoices/orders { orderId, items: [ { sku, quantity, unitPrice } ] }
+
+		Each item request carries the orderId and the order's itemCount, which is all the aggregator needs to
+		put the order back together. The last item's response is the invoice (201); the others are 202.
+	-->
+	<flow name="invoice-send-order-items" doc:description="Aggregator client: splits an order on POST /eip/invoices/orders and sends each item to POST /eip/invoices/items over HTTP, returning each item's status and the invoice.">
+		<http:listener doc:name="POST /eip/invoices/orders" config-ref="http-listener-config" path="/eip/invoices/orders" allowedMethods="POST">
+			<http:response statusCode="#[vars.httpStatus default 200]" />
+		</http:listener>
+		<logger doc:name="INFO: Log order to invoice" level="INFO" message="#['Send items of orderId=' ++ (payload.orderId default 'none') ++ ' to the invoice aggregator, correlationId=' ++ correlationId]" />
+		<choice doc:name="Validate Order To Invoice">
+			<when expression="#[(not (payload is Object)) or isEmpty(payload.orderId) or (not (payload.items is Array)) or isEmpty(payload.items)]">
+				<raise-error doc:name="Raise BAD_REQUEST Error - Missing order items" type="APP:BAD_REQUEST" description="orderId and a non-empty items array are required" />
+			</when>
+		</choice>
+		<set-variable doc:name="SET vOrder" variableName="vOrder" value="#[output application/java --- payload]" />
+		<set-variable doc:name="SET vItemStatuses" variableName="vItemStatuses" value="#[[]]" />
+		<foreach doc:name="For Each Order Item" collection="#[vars.vOrder.items]">
+			<http:request doc:name="POST Item To Invoice Aggregator" config-ref="eip-self-http-request-config" method="POST" path="/eip/invoices/items">
+				<http:body><![CDATA[#[output application/json --- {
+	orderId: vars.vOrder.orderId,
+	itemCount: sizeOf(vars.vOrder.items),
+	sku: payload.sku,
+	quantity: payload.quantity,
+	unitPrice: payload.unitPrice
+}]]]></http:body>
+				<!-- 202 (waiting), 201 (invoice issued) and 409 (order already closed) are all answers, not failures. -->
+				<http:response-validator>
+					<http:success-status-code-validator values="201,202,409" />
+				</http:response-validator>
+			</http:request>
+			<set-variable doc:name="SET vItemStatuses" variableName="vItemStatuses" value="#[output application/java --- vars.vItemStatuses ++ [attributes.statusCode]]" />
+			<set-variable doc:name="SET vLastItemResponse" variableName="vLastItemResponse" value="#[output application/java --- payload]" />
+		</foreach>
+		<ee:transform doc:name="Build Invoice Client Response">
+			<ee:message>
+				<ee:set-payload><![CDATA[%dw 2.0
+output application/json
+---
+{
+	orderId: vars.vOrder.orderId,
+	itemStatuses: vars.vItemStatuses,
+	invoice: if (vars.vItemStatuses[-1] == 201) vars.vLastItemResponse else null
+}]]></ee:set-payload>
+			</ee:message>
+		</ee:transform>
+	</flow>
+</mule>

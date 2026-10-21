@@ -1,0 +1,67 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<mule xmlns="http://www.mulesoft.org/schema/mule/core"
+	xmlns:http="http://www.mulesoft.org/schema/mule/http"
+	xmlns:os="http://www.mulesoft.org/schema/mule/os"
+	xmlns:ee="http://www.mulesoft.org/schema/mule/ee/core"
+	xmlns:doc="http://www.mulesoft.org/schema/mule/documentation"
+	xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+	xsi:schemaLocation="http://www.mulesoft.org/schema/mule/core http://www.mulesoft.org/schema/mule/core/current/mule.xsd
+		http://www.mulesoft.org/schema/mule/http http://www.mulesoft.org/schema/mule/http/current/mule-http.xsd
+		http://www.mulesoft.org/schema/mule/os http://www.mulesoft.org/schema/mule/os/current/mule-os.xsd
+		http://www.mulesoft.org/schema/mule/ee/core http://www.mulesoft.org/schema/mule/ee/core/current/mule-ee.xsd">
+
+	<!--
+		MESSAGE FILTER: the stock reservation shared by the before and the after endpoints.
+
+		- sf-reserve-stock-for-order: the simulated warehouse reservation. Every reservation is recorded in a
+		  ledger, one entry per reservation ("<orderId>|reservation|<reservationId>"), so the tests (and
+		  GET /eip/stock/{orderId}/reservations) can count how many times stock was reserved for an order.
+		- sf-validate-stock-request: validates the order event { orderId, status, items }.
+	-->
+	<os:object-store name="eip-stock-reservations-store" doc:name="Stock Reservations Object Store" persistent="false" />
+
+	<sub-flow name="sf-validate-stock-request" doc:description="Validates an order event sent to a stock reservation endpoint: orderId, status and a non-empty items array are required.">
+		<choice doc:name="Validate Stock Request">
+			<when expression="#[(not (payload is Object)) or isEmpty(payload.orderId) or isEmpty(payload.status) or (not (payload.items is Array)) or isEmpty(payload.items)]">
+				<raise-error doc:name="Raise BAD_REQUEST Error - Missing order fields" type="APP:BAD_REQUEST" description="orderId, status and a non-empty items array are required" />
+			</when>
+		</choice>
+	</sub-flow>
+
+	<sub-flow name="sf-reserve-stock-for-order" doc:description="Simulated warehouse reservation for every item of the order in the payload; records the reservation in the ledger and leaves the order as payload.">
+		<ee:transform doc:name="Reserve Items In Warehouse (simulated)">
+			<ee:variables>
+				<ee:set-variable variableName="vReservationId"><![CDATA["RSV-" ++ uuid()]]></ee:set-variable>
+			</ee:variables>
+		</ee:transform>
+		<os:store doc:name="Record Reservation" key="#[payload.orderId ++ '|reservation|' ++ vars.vReservationId]" objectStore="eip-stock-reservations-store">
+			<os:value><![CDATA[#[output application/java --- {
+	orderId: payload.orderId,
+	reservationId: vars.vReservationId,
+	orderStatus: payload.status,
+	items: payload.items map { sku: $.sku, quantity: $.quantity },
+	reservedAt: now() as String
+}]]]></os:value>
+		</os:store>
+		<logger doc:name="INFO: Log reservation" level="INFO" message="#['Stock reserved for orderId=' ++ payload.orderId ++ ' (status ' ++ payload.status ++ '), reservationId=' ++ vars.vReservationId ++ ', correlationId=' ++ correlationId]" />
+	</sub-flow>
+
+	<flow name="stock-get-reservations" doc:description="GET /eip/stock/{orderId}/reservations: how many stock reservations were made for an order, and for which order statuses.">
+		<http:listener doc:name="GET /eip/stock/{orderId}/reservations" config-ref="http-listener-config" path="/eip/stock/{orderId}/reservations" allowedMethods="GET" />
+		<set-variable doc:name="SET vReservationOrderId" variableName="vReservationOrderId" value="#[attributes.uriParams.orderId]" />
+		<os:retrieve-all doc:name="Read Reservation Ledger" objectStore="eip-stock-reservations-store" />
+		<ee:transform doc:name="Summarise Reservations">
+			<ee:message>
+				<ee:set-payload><![CDATA[%dw 2.0
+output application/json
+var reservations = valuesOf(payload) filter ($.orderId == vars.vReservationOrderId)
+---
+{
+	orderId: vars.vReservationOrderId,
+	reservations: sizeOf(reservations),
+	orderStatuses: reservations map $.orderStatus
+}]]></ee:set-payload>
+			</ee:message>
+		</ee:transform>
+	</flow>
+</mule>

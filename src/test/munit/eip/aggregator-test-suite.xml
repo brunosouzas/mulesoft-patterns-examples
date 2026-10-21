@@ -1,0 +1,196 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<mule xmlns="http://www.mulesoft.org/schema/mule/core"
+	xmlns:munit="http://www.mulesoft.org/schema/mule/munit"
+	xmlns:munit-tools="http://www.mulesoft.org/schema/mule/munit-tools"
+	xmlns:http="http://www.mulesoft.org/schema/mule/http"
+	xmlns:os="http://www.mulesoft.org/schema/mule/os"
+	xmlns:doc="http://www.mulesoft.org/schema/mule/documentation"
+	xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+	xsi:schemaLocation="http://www.mulesoft.org/schema/mule/core http://www.mulesoft.org/schema/mule/core/current/mule.xsd
+		http://www.mulesoft.org/schema/mule/munit http://www.mulesoft.org/schema/mule/munit/current/mule-munit.xsd
+		http://www.mulesoft.org/schema/mule/munit-tools http://www.mulesoft.org/schema/mule/munit-tools/current/mule-munit-tools.xsd
+		http://www.mulesoft.org/schema/mule/http http://www.mulesoft.org/schema/mule/http/current/mule-http.xsd
+		http://www.mulesoft.org/schema/mule/os http://www.mulesoft.org/schema/mule/os/current/mule-os.xsd">
+
+	<!--
+		Aggregator: an order's items arrive one request at a time, over real HTTP, and are aggregated by orderId
+		into one invoice. Every test uses its own orderIds: the aggregator remembers finished groups (eviction
+		time) and the stores live as long as the application, not the test.
+	-->
+	<munit:config name="aggregator-test-suite.xml" />
+
+	<munit:test name="agg-split-order-is-aggregated-back-into-one-invoice" description="Aggregator: the client splits an order of three items into three requests; the first two get 202 and the third completes the group and gets the invoice">
+		<munit:enable-flow-sources>
+			<munit:enable-flow-source value="invoice-aggregate-order-items" />
+		</munit:enable-flow-sources>
+		<munit:execution>
+			<munit:set-event doc:name="Order of three items">
+				<munit:payload value="#[output application/json --- {orderId: 'ORD-AGG-E2E', items: [{sku: 'SKU-BOOK', quantity: 2, unitPrice: 30}, {sku: 'SKU-MUG', quantity: 1, unitPrice: 12.5}, {sku: 'SKU-EBOOK', quantity: 1, unitPrice: 9}]}]" mediaType="application/json" />
+			</munit:set-event>
+			<flow-ref doc:name="POST /eip/invoices/orders" name="invoice-send-order-items" />
+			<set-variable doc:name="Client response" variableName="clientResponse" value="#[payload]" />
+			<munit:set-event doc:name="GET invoice ORD-AGG-E2E" cloneOriginalEvent="true">
+				<munit:attributes value="#[{ uriParams: { orderId: 'ORD-AGG-E2E' } }]" />
+			</munit:set-event>
+			<flow-ref doc:name="GET /eip/invoices/ORD-AGG-E2E" name="invoice-get" />
+		</munit:execution>
+		<munit:validation>
+			<munit-tools:assert-that doc:name="202, 202, 201" expression="#[vars.clientResponse.itemStatuses]" is="#[MunitTools::equalTo([202, 202, 201])]" />
+			<munit-tools:assert-that doc:name="Invoice returned to the last item" expression="#[vars.clientResponse.invoice.invoiceId]" is="#[MunitTools::startsWith('INV-')]" />
+			<munit-tools:assert-that doc:name="Issued" expression="#[payload.status]" is="#[MunitTools::equalTo('ISSUED')]" />
+			<munit-tools:assert-that doc:name="Same invoice stored" expression="#[payload.invoiceId]" is="#[MunitTools::equalTo(vars.clientResponse.invoice.invoiceId)]" />
+			<munit-tools:assert-that doc:name="Lines in arrival order" expression="#[payload.lines map $.sku]" is="#[MunitTools::equalTo(['SKU-BOOK', 'SKU-MUG', 'SKU-EBOOK'])]" />
+			<munit-tools:assert-that doc:name="Total" expression="#[payload.total]" is="#[MunitTools::equalTo(81.5)]" />
+		</munit:validation>
+	</munit:test>
+
+	<munit:test name="agg-interleaved-items-are-grouped-by-order-id" description="Aggregator: items of two orders arriving interleaved are grouped by orderId; each order is invoiced by its own last item with only its own lines">
+		<munit:enable-flow-sources>
+			<munit:enable-flow-source value="invoice-aggregate-order-items" />
+		</munit:enable-flow-sources>
+		<munit:execution>
+			<http:request doc:name="A item 1 of 2" config-ref="eip-self-http-request-config" method="POST" path="/eip/invoices/items" target="a1" targetValue="#[output application/java --- { status: attributes.statusCode, body: payload }]">
+				<http:body><![CDATA[#[output application/json --- {orderId: 'ORD-AGG-A', itemCount: 2, sku: 'SKU-BOOK', quantity: 1, unitPrice: 30}]]]></http:body>
+				<http:response-validator>
+					<http:success-status-code-validator values="201,202,409" />
+				</http:response-validator>
+			</http:request>
+			<http:request doc:name="B item 1 of 2" config-ref="eip-self-http-request-config" method="POST" path="/eip/invoices/items" target="b1" targetValue="#[output application/java --- { status: attributes.statusCode, body: payload }]">
+				<http:body><![CDATA[#[output application/json --- {orderId: 'ORD-AGG-B', itemCount: 2, sku: 'SKU-MUG', quantity: 2, unitPrice: 12}]]]></http:body>
+				<http:response-validator>
+					<http:success-status-code-validator values="201,202,409" />
+				</http:response-validator>
+			</http:request>
+			<http:request doc:name="B item 2 of 2" config-ref="eip-self-http-request-config" method="POST" path="/eip/invoices/items" target="b2" targetValue="#[output application/java --- { status: attributes.statusCode, body: payload }]">
+				<http:body><![CDATA[#[output application/json --- {orderId: 'ORD-AGG-B', itemCount: 2, sku: 'SKU-POSTER', quantity: 1, unitPrice: 8}]]]></http:body>
+				<http:response-validator>
+					<http:success-status-code-validator values="201,202,409" />
+				</http:response-validator>
+			</http:request>
+			<http:request doc:name="A item 2 of 2" config-ref="eip-self-http-request-config" method="POST" path="/eip/invoices/items" target="a2" targetValue="#[output application/java --- { status: attributes.statusCode, body: payload }]">
+				<http:body><![CDATA[#[output application/json --- {orderId: 'ORD-AGG-A', itemCount: 2, sku: 'SKU-EBOOK', quantity: 1, unitPrice: 9}]]]></http:body>
+				<http:response-validator>
+					<http:success-status-code-validator values="201,202,409" />
+				</http:response-validator>
+			</http:request>
+		</munit:execution>
+		<munit:validation>
+			<munit-tools:assert-that doc:name="A1 waits" expression="#[vars.a1.status]" is="#[MunitTools::equalTo(202)]" />
+			<munit-tools:assert-that doc:name="A1 progress" expression="#[vars.a1.body.receivedItems]" is="#[MunitTools::equalTo(1)]" />
+			<munit-tools:assert-that doc:name="B1 waits" expression="#[vars.b1.status]" is="#[MunitTools::equalTo(202)]" />
+			<munit-tools:assert-that doc:name="B2 completes B" expression="#[vars.b2.status]" is="#[MunitTools::equalTo(201)]" />
+			<munit-tools:assert-that doc:name="B invoice: B's lines only" expression="#[vars.b2.body.lines map $.sku]" is="#[MunitTools::equalTo(['SKU-MUG', 'SKU-POSTER'])]" />
+			<munit-tools:assert-that doc:name="B total" expression="#[vars.b2.body.total]" is="#[MunitTools::equalTo(32)]" />
+			<munit-tools:assert-that doc:name="A2 completes A" expression="#[vars.a2.status]" is="#[MunitTools::equalTo(201)]" />
+			<munit-tools:assert-that doc:name="A invoice names A" expression="#[vars.a2.body.orderId]" is="#[MunitTools::equalTo('ORD-AGG-A')]" />
+			<munit-tools:assert-that doc:name="A invoice: A's lines only" expression="#[vars.a2.body.lines map $.sku]" is="#[MunitTools::equalTo(['SKU-BOOK', 'SKU-EBOOK'])]" />
+		</munit:validation>
+	</munit:test>
+
+	<munit:test name="agg-item-after-the-invoice-is-rejected-with-409" description="Aggregator: once an order's group is complete, another item for it raises AGGREGATORS:GROUP_COMPLETED (409) and the invoice is not changed">
+		<munit:enable-flow-sources>
+			<munit:enable-flow-source value="invoice-aggregate-order-items" />
+		</munit:enable-flow-sources>
+		<munit:execution>
+			<http:request doc:name="Only item" config-ref="eip-self-http-request-config" method="POST" path="/eip/invoices/items" target="first" targetValue="#[output application/java --- { status: attributes.statusCode, body: payload }]">
+				<http:body><![CDATA[#[output application/json --- {orderId: 'ORD-AGG-LATE', itemCount: 1, sku: 'SKU-BOOK', quantity: 1, unitPrice: 30}]]]></http:body>
+				<http:response-validator>
+					<http:success-status-code-validator values="201,202,409" />
+				</http:response-validator>
+			</http:request>
+			<http:request doc:name="Late extra item" config-ref="eip-self-http-request-config" method="POST" path="/eip/invoices/items" target="late" targetValue="#[output application/java --- { status: attributes.statusCode, body: payload }]">
+				<http:body><![CDATA[#[output application/json --- {orderId: 'ORD-AGG-LATE', itemCount: 1, sku: 'SKU-MUG', quantity: 1, unitPrice: 12}]]]></http:body>
+				<http:response-validator>
+					<http:success-status-code-validator values="201,202,409" />
+				</http:response-validator>
+			</http:request>
+			<munit:set-event doc:name="GET invoice ORD-AGG-LATE" cloneOriginalEvent="true">
+				<munit:attributes value="#[{ uriParams: { orderId: 'ORD-AGG-LATE' } }]" />
+			</munit:set-event>
+			<flow-ref doc:name="GET /eip/invoices/ORD-AGG-LATE" name="invoice-get" />
+		</munit:execution>
+		<munit:validation>
+			<munit-tools:assert-that doc:name="Invoice issued" expression="#[vars.first.status]" is="#[MunitTools::equalTo(201)]" />
+			<munit-tools:assert-that doc:name="Late item: 409" expression="#[vars.late.status]" is="#[MunitTools::equalTo(409)]" />
+			<munit-tools:assert-that doc:name="Late item: reason" expression="#[vars.late.body.reason]" is="#[MunitTools::equalTo('GROUP_COMPLETED')]" />
+			<munit-tools:assert-that doc:name="Invoice unchanged" expression="#[payload.lines map $.sku]" is="#[MunitTools::equalTo(['SKU-BOOK'])]" />
+			<munit-tools:assert-that doc:name="Same invoice" expression="#[payload.invoiceId]" is="#[MunitTools::equalTo(vars.first.body.invoiceId)]" />
+		</munit:validation>
+	</munit:test>
+
+	<munit:test name="agg-incomplete-order-times-out-and-is-recorded-incomplete" description="Aggregator: when an order's last item never arrives the group times out, the listener records the invoice INCOMPLETE, and the missing item arriving later is rejected with AGGREGATORS:GROUP_TIMED_OUT (409)">
+		<munit:enable-flow-sources>
+			<munit:enable-flow-source value="invoice-aggregate-order-items" />
+			<munit:enable-flow-source value="invoice-record-incomplete-order" />
+		</munit:enable-flow-sources>
+		<munit:execution>
+			<http:request doc:name="Item 1 of 2" config-ref="eip-self-http-request-config" method="POST" path="/eip/invoices/items" target="first" targetValue="#[output application/java --- { status: attributes.statusCode, body: payload }]">
+				<http:body><![CDATA[#[output application/json --- {orderId: 'ORD-AGG-TIMEOUT', itemCount: 2, sku: 'SKU-BOOK', quantity: 1, unitPrice: 30}]]]></http:body>
+				<http:response-validator>
+					<http:success-status-code-validator values="201,202,409" />
+				</http:response-validator>
+			</http:request>
+			<!-- The group times out after eip.invoice.groupTimeoutSeconds (5 s); the aggregator checks once a second. -->
+			<until-successful doc:name="Wait Until The Invoice Is INCOMPLETE" maxRetries="40" millisBetweenRetries="500">
+				<os:retrieve doc:name="Read Invoice" key="ORD-AGG-TIMEOUT" objectStore="eip-invoices-store" />
+			</until-successful>
+			<set-variable doc:name="Incomplete invoice" variableName="incomplete" value="#[payload]" />
+			<http:request doc:name="Item 2 of 2, too late" config-ref="eip-self-http-request-config" method="POST" path="/eip/invoices/items" target="late" targetValue="#[output application/java --- { status: attributes.statusCode, body: payload }]">
+				<http:body><![CDATA[#[output application/json --- {orderId: 'ORD-AGG-TIMEOUT', itemCount: 2, sku: 'SKU-MUG', quantity: 1, unitPrice: 12}]]]></http:body>
+				<http:response-validator>
+					<http:success-status-code-validator values="201,202,409" />
+				</http:response-validator>
+			</http:request>
+		</munit:execution>
+		<munit:validation>
+			<munit-tools:assert-that doc:name="First item waits" expression="#[vars.first.status]" is="#[MunitTools::equalTo(202)]" />
+			<munit-tools:assert-that doc:name="INCOMPLETE" expression="#[vars.incomplete.status]" is="#[MunitTools::equalTo('INCOMPLETE')]" />
+			<munit-tools:assert-that doc:name="Received 1" expression="#[vars.incomplete.receivedItems]" is="#[MunitTools::equalTo(1)]" />
+			<munit-tools:assert-that doc:name="Expected 2" expression="#[vars.incomplete.expectedItems]" is="#[MunitTools::equalTo(2)]" />
+			<munit-tools:assert-that doc:name="Which items arrived" expression="#[vars.incomplete.receivedSkus]" is="#[MunitTools::equalTo(['SKU-BOOK'])]" />
+			<munit-tools:assert-that doc:name="Late item: 409" expression="#[vars.late.status]" is="#[MunitTools::equalTo(409)]" />
+			<munit-tools:assert-that doc:name="Late item: reason" expression="#[vars.late.body.reason]" is="#[MunitTools::equalTo('GROUP_TIMED_OUT')]" />
+		</munit:validation>
+	</munit:test>
+
+	<munit:test name="agg-item-without-item-count-returns-400" description="Aggregator: an item without itemCount cannot say when its order is complete and is rejected with 400">
+		<munit:execution>
+			<munit:set-event doc:name="Item without itemCount">
+				<munit:payload value="#[output application/json --- {orderId: 'ORD-AGG-BAD', sku: 'SKU-BOOK', quantity: 1, unitPrice: 30}]" mediaType="application/json" />
+			</munit:set-event>
+			<flow-ref doc:name="POST /eip/invoices/items" name="invoice-aggregate-order-items" />
+		</munit:execution>
+		<munit:validation>
+			<munit-tools:assert-that doc:name="400" expression="#[vars.httpStatus as Number]" is="#[MunitTools::equalTo(400)]" />
+		</munit:validation>
+	</munit:test>
+
+	<munit:test name="agg-invoice-of-unknown-order-returns-404" description="Aggregator: GET /eip/invoices/{orderId} answers 404 for an order with no invoice">
+		<munit:execution>
+			<munit:set-event doc:name="GET invoice">
+				<munit:attributes value="#[{ uriParams: { orderId: 'ORD-AGG-NONE' } }]" />
+			</munit:set-event>
+			<flow-ref doc:name="GET /eip/invoices/ORD-AGG-NONE" name="invoice-get" />
+		</munit:execution>
+		<munit:validation>
+			<munit-tools:assert-that doc:name="404" expression="#[vars.httpStatus as Number]" is="#[MunitTools::equalTo(404)]" />
+		</munit:validation>
+	</munit:test>
+
+	<munit:test name="agg-client-order-without-items-returns-400" description="Aggregator client: POST /eip/invoices/orders rejects an order without items with 400 and sends nothing to the aggregator">
+		<munit:execution>
+			<munit:set-event doc:name="Order without items">
+				<munit:payload value="#[output application/json --- {orderId: 'ORD-AGG-CLIENT-BAD', items: []}]" mediaType="application/json" />
+			</munit:set-event>
+			<flow-ref doc:name="POST /eip/invoices/orders" name="invoice-send-order-items" />
+		</munit:execution>
+		<munit:validation>
+			<munit-tools:assert-that doc:name="400" expression="#[vars.httpStatus as Number]" is="#[MunitTools::equalTo(400)]" />
+			<munit-tools:verify-call doc:name="No item sent" processor="http:request" times="0">
+				<munit-tools:with-attributes>
+					<munit-tools:with-attribute attributeName="doc:name" whereValue="POST Item To Invoice Aggregator" />
+				</munit-tools:with-attributes>
+			</munit-tools:verify-call>
+		</munit:validation>
+	</munit:test>
+</mule>

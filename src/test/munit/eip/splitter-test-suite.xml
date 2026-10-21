@@ -1,0 +1,103 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<mule xmlns="http://www.mulesoft.org/schema/mule/core"
+	xmlns:munit="http://www.mulesoft.org/schema/mule/munit"
+	xmlns:munit-tools="http://www.mulesoft.org/schema/mule/munit-tools"
+	xmlns:http="http://www.mulesoft.org/schema/mule/http"
+	xmlns:os="http://www.mulesoft.org/schema/mule/os"
+	xmlns:doc="http://www.mulesoft.org/schema/mule/documentation"
+	xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+	xsi:schemaLocation="http://www.mulesoft.org/schema/mule/core http://www.mulesoft.org/schema/mule/core/current/mule.xsd
+		http://www.mulesoft.org/schema/mule/munit http://www.mulesoft.org/schema/mule/munit/current/mule-munit.xsd
+		http://www.mulesoft.org/schema/mule/munit-tools http://www.mulesoft.org/schema/mule/munit-tools/current/mule-munit-tools.xsd
+		http://www.mulesoft.org/schema/mule/http http://www.mulesoft.org/schema/mule/http/current/mule-http.xsd
+		http://www.mulesoft.org/schema/mule/os http://www.mulesoft.org/schema/mule/os/current/mule-os.xsd">
+
+	<!--
+		Splitter: one order of three items (SKU-BOOK x2 in stock, SKU-POSTER x1 out of stock, SKU-MUG x3 exactly in
+		stock), split with For Each and with Parallel For Each. Both give the same per-item results in input order;
+		checking SKU-BOOK takes 300 ms, so under Parallel For Each it finishes last and still comes back first. What
+		differs is what each scope leaves behind: the payload and the variables after the scope.
+	-->
+	<munit:config name="splitter-test-suite.xml" />
+
+	<munit:test name="splitter-for-each-checks-every-item-and-keeps-the-original-payload" description="Splitter with For Each: each item is checked in order; after the scope the payload is the original order and a variable set inside is still visible">
+		<munit:execution>
+			<munit:set-event doc:name="Order of three items">
+				<munit:payload value="#[output application/json --- {orderId: 'ORD-SPL-FE', items: [{sku: 'SKU-BOOK', quantity: 2}, {sku: 'SKU-POSTER', quantity: 1}, {sku: 'SKU-MUG', quantity: 3}]}]" mediaType="application/json" />
+			</munit:set-event>
+			<flow-ref doc:name="POST /eip/stock/availability/for-each" name="stock-check-availability-for-each" />
+		</munit:execution>
+		<munit:validation>
+			<munit-tools:assert-that doc:name="orderId read from the payload after the scope" expression="#[payload.orderId]" is="#[MunitTools::equalTo('ORD-SPL-FE')]" />
+			<munit-tools:assert-that doc:name="Items in input order" expression="#[payload.items map $.sku]" is="#[MunitTools::equalTo(['SKU-BOOK', 'SKU-POSTER', 'SKU-MUG'])]" />
+			<munit-tools:assert-that doc:name="Availability per item" expression="#[payload.items map $.available]" is="#[MunitTools::equalTo([true, false, true])]" />
+			<munit-tools:assert-that doc:name="vars.counter per item" expression="#[payload.items map $.position]" is="#[MunitTools::equalTo([1, 2, 3])]" />
+			<munit-tools:assert-that doc:name="Not all available" expression="#[payload.allAvailable]" is="#[MunitTools::equalTo(false)]" />
+			<munit-tools:assert-that doc:name="Variable set inside is visible after" expression="#[payload.lastCheckedSku]" is="#[MunitTools::equalTo('SKU-MUG')]" />
+			<munit-tools:verify-call doc:name="One check per item" processor="flow-ref" times="3">
+				<munit-tools:with-attributes>
+					<munit-tools:with-attribute attributeName="name" whereValue="sf-check-item-availability" />
+				</munit-tools:with-attributes>
+			</munit-tools:verify-call>
+		</munit:validation>
+	</munit:test>
+
+	<munit:test name="splitter-parallel-for-each-returns-the-route-messages-in-input-order" description="Splitter with Parallel For Each: the payload after the scope is the list of route messages in input order, even though SKU-BOOK (slow) finishes after SKU-MUG, and a variable set inside a route is not visible after it">
+		<munit:execution>
+			<munit:set-event doc:name="Order of three items">
+				<munit:payload value="#[output application/json --- {orderId: 'ORD-SPL-PFE', items: [{sku: 'SKU-BOOK', quantity: 2}, {sku: 'SKU-POSTER', quantity: 1}, {sku: 'SKU-MUG', quantity: 3}]}]" mediaType="application/json" />
+			</munit:set-event>
+			<flow-ref doc:name="POST /eip/stock/availability/parallel-for-each" name="stock-check-availability-parallel-for-each" />
+		</munit:execution>
+		<munit:validation>
+			<munit-tools:assert-that doc:name="orderId kept in a variable before the scope" expression="#[payload.orderId]" is="#[MunitTools::equalTo('ORD-SPL-PFE')]" />
+			<munit-tools:assert-that doc:name="Items in input order" expression="#[payload.items map $.sku]" is="#[MunitTools::equalTo(['SKU-BOOK', 'SKU-POSTER', 'SKU-MUG'])]" />
+			<munit-tools:assert-that doc:name="Availability per item" expression="#[payload.items map $.available]" is="#[MunitTools::equalTo([true, false, true])]" />
+			<munit-tools:assert-that doc:name="Not all available" expression="#[payload.allAvailable]" is="#[MunitTools::equalTo(false)]" />
+			<munit-tools:assert-that doc:name="SKU-BOOK finished after SKU-MUG" expression="#[(payload.items[0].checkedAt as DateTime) &gt; (payload.items[2].checkedAt as DateTime)]" is="#[MunitTools::equalTo(true)]" />
+			<munit-tools:assert-that doc:name="Variable set inside a route is not visible after" expression="#[payload.lastCheckedSku]" is="#[MunitTools::nullValue()]" />
+			<munit-tools:verify-call doc:name="One check per item" processor="flow-ref" times="3">
+				<munit-tools:with-attributes>
+					<munit-tools:with-attribute attributeName="name" whereValue="sf-check-item-availability" />
+				</munit-tools:with-attributes>
+			</munit-tools:verify-call>
+		</munit:validation>
+	</munit:test>
+
+	<munit:test name="splitter-parallel-for-each-payload-is-a-list-of-messages" description="Splitter with Parallel For Each: right after the scope the payload is no longer the order but one message per item">
+		<munit:behavior>
+			<!-- Captures the payload the scope hands to the next processor. -->
+			<munit-tools:spy doc:name="Spy on the response builder" processor="ee:transform">
+				<munit-tools:with-attributes>
+					<munit-tools:with-attribute attributeName="doc:name" whereValue="Build Availability Response" />
+				</munit-tools:with-attributes>
+				<munit-tools:before-call>
+					<munit-tools:assert-that doc:name="One message per item" expression="#[sizeOf(payload)]" is="#[MunitTools::equalTo(3)]" />
+					<munit-tools:assert-that doc:name="No orderId on the payload" expression="#[payload.orderId default null]" is="#[MunitTools::nullValue()]" />
+					<munit-tools:assert-that doc:name="Each element carries its route's payload" expression="#[payload[0].payload.sku]" is="#[MunitTools::equalTo('SKU-BOOK')]" />
+				</munit-tools:before-call>
+			</munit-tools:spy>
+		</munit:behavior>
+		<munit:execution>
+			<munit:set-event doc:name="Order of three items">
+				<munit:payload value="#[output application/json --- {orderId: 'ORD-SPL-PFE-SPY', items: [{sku: 'SKU-BOOK', quantity: 2}, {sku: 'SKU-POSTER', quantity: 1}, {sku: 'SKU-MUG', quantity: 3}]}]" mediaType="application/json" />
+			</munit:set-event>
+			<flow-ref doc:name="POST /eip/stock/availability/parallel-for-each" name="stock-check-availability-parallel-for-each" />
+		</munit:execution>
+		<munit:validation>
+			<munit-tools:assert-that doc:name="Response built" expression="#[payload.splitter]" is="#[MunitTools::equalTo('PARALLEL_FOR_EACH')]" />
+		</munit:validation>
+	</munit:test>
+
+	<munit:test name="splitter-order-without-items-returns-400" description="Splitter: an order without items is rejected with 400 and nothing is split">
+		<munit:execution>
+			<munit:set-event doc:name="Order without items">
+				<munit:payload value="#[output application/json --- {orderId: 'ORD-SPL-BAD', items: []}]" mediaType="application/json" />
+			</munit:set-event>
+			<flow-ref doc:name="POST /eip/stock/availability/for-each" name="stock-check-availability-for-each" />
+		</munit:execution>
+		<munit:validation>
+			<munit-tools:assert-that doc:name="400" expression="#[vars.httpStatus as Number]" is="#[MunitTools::equalTo(400)]" />
+		</munit:validation>
+	</munit:test>
+</mule>

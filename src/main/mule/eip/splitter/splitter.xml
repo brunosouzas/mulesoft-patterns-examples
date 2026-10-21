@@ -1,0 +1,118 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<mule xmlns="http://www.mulesoft.org/schema/mule/core"
+	xmlns:http="http://www.mulesoft.org/schema/mule/http"
+	xmlns:ee="http://www.mulesoft.org/schema/mule/ee/core"
+	xmlns:doc="http://www.mulesoft.org/schema/mule/documentation"
+	xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+	xsi:schemaLocation="http://www.mulesoft.org/schema/mule/core http://www.mulesoft.org/schema/mule/core/current/mule.xsd
+		http://www.mulesoft.org/schema/mule/http http://www.mulesoft.org/schema/mule/http/current/mule-http.xsd
+		http://www.mulesoft.org/schema/mule/ee/core http://www.mulesoft.org/schema/mule/ee/core/current/mule-ee.xsd">
+
+	<!--
+		SPLITTER (Hohpe and Woolf): breaks one message into a message per element, so each one can be processed
+		on its own. An order is split into its items and each item is checked against the stock.
+		POST /eip/stock/availability/for-each           { orderId, items: [ { sku, quantity } ] }
+		POST /eip/stock/availability/parallel-for-each  (same body)
+
+		Mule splits with two scopes, and they hand back different things. Only For Each is a Splitter alone:
+		Parallel For Each also collects the results, in input order, so it is closer to a Splitter followed by an
+		Aggregator.
+		- For Each runs the items one after another. Inside the scope the payload is the item, and vars.counter
+		  its position (from 1). After the scope the payload is the ORIGINAL message again: For Each does not
+		  collect results. Whatever must survive is put in a variable, and variables set inside the scope are
+		  still there after it.
+		- Parallel For Each runs the items at the same time (up to maxConcurrency). After the scope the payload is
+		  the list of the messages each route produced, in the order of the input items, not the order they
+		  finished: payload map $.payload gives the results. The original order is no longer the payload, so
+		  anything needed from it is kept in a variable before the scope. Variables set inside the routes do not
+		  come out of the scope (see the MUnit suite).
+		The aggregator example (aggregator/) puts the items back together.
+
+		The stock levels are synthetic, in sf-check-item-availability. Checking SKU-BOOK takes 300 ms and every
+		result carries checkedAt, the moment its check finished: under Parallel For Each the book is checked
+		last but still comes back first (see the MUnit suite).
+	-->
+	<flow name="stock-check-availability-for-each" doc:description="Splitter with For Each: splits an order into its items and checks each item's stock in sequence, collecting the results in a variable.">
+		<http:listener doc:name="POST /eip/stock/availability/for-each" config-ref="http-listener-config" path="/eip/stock/availability/for-each" allowedMethods="POST">
+			<http:response statusCode="#[vars.httpStatus default 200]" />
+		</http:listener>
+		<logger doc:name="INFO: Log availability request" level="INFO" message="#['Stock availability (For Each) for orderId=' ++ (payload.orderId default 'none') ++ ', correlationId=' ++ correlationId]" />
+		<flow-ref doc:name="Refer to sf-validate-order-items" name="sf-validate-order-items" />
+		<set-variable doc:name="SET vItemResults" variableName="vItemResults" value="#[[]]" />
+		<foreach doc:name="For Each Order Item" collection="#[payload.items]">
+			<flow-ref doc:name="Refer to sf-check-item-availability" name="sf-check-item-availability" />
+			<set-variable doc:name="SET vItemResults" variableName="vItemResults" value="#[output application/java --- vars.vItemResults ++ [payload ++ { position: vars.counter }]]" />
+			<set-variable doc:name="SET vLastCheckedSku" variableName="vLastCheckedSku" value="#[payload.sku]" />
+		</foreach>
+		<ee:transform doc:name="Build Availability Response">
+			<ee:message>
+				<ee:set-payload><![CDATA[%dw 2.0
+output application/json
+---
+{
+	// After For Each the payload is the original order again.
+	orderId: payload.orderId,
+	splitter: "FOR_EACH",
+	items: vars.vItemResults,
+	allAvailable: isEmpty(vars.vItemResults filter (not $.available)),
+	lastCheckedSku: vars.vLastCheckedSku default null
+}]]></ee:set-payload>
+			</ee:message>
+		</ee:transform>
+	</flow>
+
+	<flow name="stock-check-availability-parallel-for-each" doc:description="Splitter with Parallel For Each: splits an order into its items and checks their stock concurrently; the results come back as the list of route messages.">
+		<http:listener doc:name="POST /eip/stock/availability/parallel-for-each" config-ref="http-listener-config" path="/eip/stock/availability/parallel-for-each" allowedMethods="POST">
+			<http:response statusCode="#[vars.httpStatus default 200]" />
+		</http:listener>
+		<logger doc:name="INFO: Log availability request" level="INFO" message="#['Stock availability (Parallel For Each) for orderId=' ++ (payload.orderId default 'none') ++ ', correlationId=' ++ correlationId]" />
+		<flow-ref doc:name="Refer to sf-validate-order-items" name="sf-validate-order-items" />
+		<!-- After the scope the payload is the list of results, so the orderId is kept here. -->
+		<set-variable doc:name="SET vOrderId" variableName="vOrderId" value="#[payload.orderId]" />
+		<parallel-foreach doc:name="Parallel For Each Order Item" collection="#[payload.items]" maxConcurrency="4">
+			<flow-ref doc:name="Refer to sf-check-item-availability" name="sf-check-item-availability" />
+			<!-- Set inside a route: not visible after the scope. -->
+			<set-variable doc:name="SET vLastCheckedSku" variableName="vLastCheckedSku" value="#[payload.sku]" />
+		</parallel-foreach>
+		<ee:transform doc:name="Build Availability Response">
+			<ee:message>
+				<ee:set-payload><![CDATA[%dw 2.0
+output application/json
+var results = payload map $.payload
+---
+{
+	orderId: vars.vOrderId,
+	splitter: "PARALLEL_FOR_EACH",
+	items: results,
+	allAvailable: isEmpty(results filter (not $.available)),
+	lastCheckedSku: vars.vLastCheckedSku default null
+}]]></ee:set-payload>
+			</ee:message>
+		</ee:transform>
+	</flow>
+
+	<sub-flow name="sf-validate-order-items" doc:description="Validates an order sent to a splitter endpoint: orderId and a non-empty items array, each item with a sku and a numeric quantity.">
+		<choice doc:name="Validate Order Items">
+			<when expression="#[(not (payload is Object)) or isEmpty(payload.orderId) or (not (payload.items is Array)) or isEmpty(payload.items) or not isEmpty(payload.items filter (isEmpty($.sku) or not ($.quantity is Number)))]">
+				<raise-error doc:name="Raise BAD_REQUEST Error - Missing order items" type="APP:BAD_REQUEST" description="orderId and a non-empty items array (sku, quantity) are required" />
+			</when>
+		</choice>
+	</sub-flow>
+
+	<sub-flow name="sf-check-item-availability" doc:description="Checks one order item against the synthetic stock levels; called once per item by both splitters, with the item as payload.">
+		<ee:transform doc:name="Check Item Against Stock (simulated)">
+			<ee:message>
+				<ee:set-payload><![CDATA[%dw 2.0
+output application/java
+import wait from dw::Runtime
+var stockLevels = { "SKU-BOOK": 10, "SKU-MUG": 3, "SKU-EBOOK": 9999, "SKU-POSTER": 0 }
+var inStock = stockLevels[payload.sku] default 0
+// SKU-BOOK is a slow lookup (300 ms), so under Parallel For Each it finishes after the items behind it.
+var lookupMillis = if (payload.sku == "SKU-BOOK") 300 else 0
+---
+({ sku: payload.sku, quantity: payload.quantity, inStock: inStock, available: inStock >= payload.quantity } wait lookupMillis)
+	++ { checkedAt: now() }]]></ee:set-payload>
+			</ee:message>
+		</ee:transform>
+	</sub-flow>
+</mule>

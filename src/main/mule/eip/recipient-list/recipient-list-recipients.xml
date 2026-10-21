@@ -1,0 +1,69 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<mule xmlns="http://www.mulesoft.org/schema/mule/core"
+	xmlns:http="http://www.mulesoft.org/schema/mule/http"
+	xmlns:os="http://www.mulesoft.org/schema/mule/os"
+	xmlns:ee="http://www.mulesoft.org/schema/mule/ee/core"
+	xmlns:doc="http://www.mulesoft.org/schema/mule/documentation"
+	xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+	xsi:schemaLocation="http://www.mulesoft.org/schema/mule/core http://www.mulesoft.org/schema/mule/core/current/mule.xsd
+		http://www.mulesoft.org/schema/mule/http http://www.mulesoft.org/schema/mule/http/current/mule-http.xsd
+		http://www.mulesoft.org/schema/mule/os http://www.mulesoft.org/schema/mule/os/current/mule-os.xsd
+		http://www.mulesoft.org/schema/mule/ee/core http://www.mulesoft.org/schema/mule/ee/core/current/mule-ee.xsd">
+
+	<!--
+		RECIPIENT LIST: the downstream systems, simulated on this application.
+		POST /eip/recipients/{recipient}/orders   one endpoint per recipient (invoicing, warehouse, digitalDelivery,
+		                                          customs); an unknown recipient gets 404
+		GET  /eip/orders/{orderId}/notifications  which recipients received the order
+
+		Every order a recipient receives is recorded in an inbox ("<recipient>|<orderId>"), so the tests can check
+		who was told and who was not. To simulate a recipient that is down, the warehouse answers 503 (and records
+		nothing) to an order whose orderId starts with ORD-WAREHOUSE-DOWN.
+	-->
+	<os:object-store name="eip-recipient-inbox-store" doc:name="Recipient Inbox Object Store" persistent="false" />
+
+	<flow name="recipient-receive-order" doc:description="Simulated downstream system: receives an order on POST /eip/recipients/{recipient}/orders and records it in that recipient's inbox; 404 for an unknown recipient, 503 from the warehouse for an ORD-WAREHOUSE-DOWN order.">
+		<http:listener doc:name="POST /eip/recipients/{recipient}/orders" config-ref="http-listener-config" path="/eip/recipients/{recipient}/orders" allowedMethods="POST">
+			<http:response statusCode="#[vars.httpStatus default 202]" />
+		</http:listener>
+		<set-variable doc:name="SET vRecipient" variableName="vRecipient" value="#[attributes.uriParams.recipient]" />
+		<choice doc:name="Check Recipient And Order">
+			<when expression="#[p('eip.recipientList.paths.' ++ vars.vRecipient) == null]">
+				<raise-error doc:name="Raise NOT_FOUND Error - Unknown recipient" type="APP:NOT_FOUND" description="Unknown recipient" />
+			</when>
+			<when expression="#[(not (payload is Object)) or isEmpty(payload.orderId)]">
+				<raise-error doc:name="Raise BAD_REQUEST Error - Missing orderId" type="APP:BAD_REQUEST" description="orderId is required" />
+			</when>
+			<when expression="#[vars.vRecipient == 'warehouse' and (payload.orderId startsWith 'ORD-WAREHOUSE-DOWN')]">
+				<logger doc:name="WARN: Log warehouse unavailable" level="WARN" message="#['Recipient warehouse is down (simulated) for orderId=' ++ payload.orderId ++ ', correlationId=' ++ correlationId]" />
+				<set-variable doc:name="SET httpStatus" variableName="httpStatus" value="503" />
+				<set-payload doc:name="Set Unavailable Response" value="#[output application/json --- { recipient: vars.vRecipient, orderId: payload.orderId, status: 'UNAVAILABLE' }]" />
+			</when>
+			<otherwise>
+				<os:store doc:name="Record Order In Inbox" key="#[vars.vRecipient ++ '|' ++ payload.orderId]" objectStore="eip-recipient-inbox-store">
+					<os:value><![CDATA[#[output application/java --- { recipient: vars.vRecipient, orderId: payload.orderId, receivedAt: now() as String }]]]></os:value>
+				</os:store>
+				<logger doc:name="INFO: Log order received" level="INFO" message="#['Recipient ' ++ vars.vRecipient ++ ' received orderId=' ++ payload.orderId ++ ', correlationId=' ++ correlationId]" />
+				<set-payload doc:name="Set Received Response" value="#[output application/json --- { recipient: vars.vRecipient, orderId: payload.orderId, status: 'RECEIVED' }]" />
+			</otherwise>
+		</choice>
+	</flow>
+
+	<flow name="recipient-get-order-notifications" doc:description="GET /eip/orders/{orderId}/notifications: lists the recipients whose inbox holds the order.">
+		<http:listener doc:name="GET /eip/orders/{orderId}/notifications" config-ref="http-listener-config" path="/eip/orders/{orderId}/notifications" allowedMethods="GET" />
+		<set-variable doc:name="SET vNotifiedOrderId" variableName="vNotifiedOrderId" value="#[attributes.uriParams.orderId]" />
+		<os:retrieve-all-keys doc:name="Read Inbox Keys" objectStore="eip-recipient-inbox-store" />
+		<ee:transform doc:name="List Recipients Of The Order">
+			<ee:message>
+				<ee:set-payload><![CDATA[%dw 2.0
+output application/json
+var suffix = "|" ++ vars.vNotifiedOrderId
+---
+{
+	orderId: vars.vNotifiedOrderId,
+	receivedBy: (payload filter ($ endsWith suffix) map ($[0 to (sizeOf($) - sizeOf(suffix) - 1)])) orderBy $
+}]]></ee:set-payload>
+			</ee:message>
+		</ee:transform>
+	</flow>
+</mule>
