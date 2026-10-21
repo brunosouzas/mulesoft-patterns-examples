@@ -1,0 +1,188 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<mule xmlns="http://www.mulesoft.org/schema/mule/core"
+	xmlns:munit="http://www.mulesoft.org/schema/mule/munit"
+	xmlns:munit-tools="http://www.mulesoft.org/schema/mule/munit-tools"
+	xmlns:http="http://www.mulesoft.org/schema/mule/http"
+	xmlns:os="http://www.mulesoft.org/schema/mule/os"
+	xmlns:doc="http://www.mulesoft.org/schema/mule/documentation"
+	xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+	xsi:schemaLocation="http://www.mulesoft.org/schema/mule/core http://www.mulesoft.org/schema/mule/core/current/mule.xsd
+		http://www.mulesoft.org/schema/mule/munit http://www.mulesoft.org/schema/mule/munit/current/mule-munit.xsd
+		http://www.mulesoft.org/schema/mule/munit-tools http://www.mulesoft.org/schema/mule/munit-tools/current/mule-munit-tools.xsd
+		http://www.mulesoft.org/schema/mule/http http://www.mulesoft.org/schema/mule/http/current/mule-http.xsd
+		http://www.mulesoft.org/schema/mule/os http://www.mulesoft.org/schema/mule/os/current/mule-os.xsd">
+
+	<!--
+		Recipient list: the recipients are computed from the order and the order is sent to each of them over
+		HTTP; the simulated recipients record what they received. Home country: BR (app.yaml).
+	-->
+	<munit:config name="recipient-list-test-suite.xml" />
+
+	<munit:test name="rl-domestic-physical-order-goes-to-invoicing-and-warehouse" description="Recipient list: a domestic order of physical items is sent to invoicing and the warehouse only">
+		<munit:enable-flow-sources>
+			<munit:enable-flow-source value="recipient-receive-order" />
+		</munit:enable-flow-sources>
+		<munit:execution>
+			<munit:set-event doc:name="Order ORD-RL-DOM">
+				<munit:payload value="#[output application/json --- {orderId: 'ORD-RL-DOM', country: 'BR', items: [{sku: 'SKU-0', quantity: 1, unitPrice: 10, 'type': 'PHYSICAL'}, {sku: 'SKU-1', quantity: 1, unitPrice: 10, 'type': 'PHYSICAL'}]}]" mediaType="application/json" />
+			</munit:set-event>
+			<flow-ref doc:name="POST /eip/orders/notifications" name="order-notify-recipients" />
+			<set-variable doc:name="Notification response" variableName="response" value="#[payload]" />
+			<munit:set-event doc:name="GET notifications" cloneOriginalEvent="true">
+				<munit:attributes value="#[{ uriParams: { orderId: 'ORD-RL-DOM' } }]" />
+			</munit:set-event>
+			<flow-ref doc:name="GET /eip/orders/ORD-RL-DOM/notifications" name="recipient-get-order-notifications" />
+		</munit:execution>
+		<munit:validation>
+			<munit-tools:assert-that doc:name="Recipient list" expression="#[vars.response.recipients]" is="#[MunitTools::equalTo(['invoicing', 'warehouse'])]" />
+			<munit-tools:assert-that doc:name="All delivered" expression="#[vars.response.allDelivered]" is="#[MunitTools::equalTo(true)]" />
+			<munit-tools:assert-that doc:name="Delivered in list order" expression="#[vars.response.deliveries map $.recipient]" is="#[MunitTools::equalTo(['invoicing', 'warehouse'])]" />
+			<munit-tools:assert-that doc:name="Received by exactly these" expression="#[payload.receivedBy]" is="#[MunitTools::equalTo(['invoicing', 'warehouse'])]" />
+			<munit-tools:verify-call doc:name="One delivery per recipient" processor="http:request" times="2">
+				<munit-tools:with-attributes>
+					<munit-tools:with-attribute attributeName="doc:name" whereValue="POST Order To Recipient" />
+				</munit-tools:with-attributes>
+			</munit-tools:verify-call>
+		</munit:validation>
+	</munit:test>
+
+	<munit:test name="rl-international-mixed-order-goes-to-every-recipient" description="Recipient list: an international order with physical and digital items is sent to invoicing, warehouse, digital delivery and customs">
+		<munit:enable-flow-sources>
+			<munit:enable-flow-source value="recipient-receive-order" />
+		</munit:enable-flow-sources>
+		<munit:execution>
+			<munit:set-event doc:name="Order ORD-RL-INT">
+				<munit:payload value="#[output application/json --- {orderId: 'ORD-RL-INT', country: 'US', items: [{sku: 'SKU-0', quantity: 1, unitPrice: 10, 'type': 'PHYSICAL'}, {sku: 'SKU-1', quantity: 1, unitPrice: 10, 'type': 'DIGITAL'}]}]" mediaType="application/json" />
+			</munit:set-event>
+			<flow-ref doc:name="POST /eip/orders/notifications" name="order-notify-recipients" />
+			<set-variable doc:name="Notification response" variableName="response" value="#[payload]" />
+			<munit:set-event doc:name="GET notifications" cloneOriginalEvent="true">
+				<munit:attributes value="#[{ uriParams: { orderId: 'ORD-RL-INT' } }]" />
+			</munit:set-event>
+			<flow-ref doc:name="GET /eip/orders/ORD-RL-INT/notifications" name="recipient-get-order-notifications" />
+		</munit:execution>
+		<munit:validation>
+			<munit-tools:assert-that doc:name="Recipient list" expression="#[vars.response.recipients]" is="#[MunitTools::equalTo(['invoicing', 'warehouse', 'digitalDelivery', 'customs'])]" />
+			<munit-tools:assert-that doc:name="All delivered" expression="#[vars.response.allDelivered]" is="#[MunitTools::equalTo(true)]" />
+			<munit-tools:assert-that doc:name="Delivered in list order" expression="#[vars.response.deliveries map $.recipient]" is="#[MunitTools::equalTo(['invoicing', 'warehouse', 'digitalDelivery', 'customs'])]" />
+			<munit-tools:assert-that doc:name="Received by exactly these" expression="#[payload.receivedBy]" is="#[MunitTools::equalTo(['customs', 'digitalDelivery', 'invoicing', 'warehouse'])]" />
+			<munit-tools:verify-call doc:name="One delivery per recipient" processor="http:request" times="4">
+				<munit-tools:with-attributes>
+					<munit-tools:with-attribute attributeName="doc:name" whereValue="POST Order To Recipient" />
+				</munit-tools:with-attributes>
+			</munit-tools:verify-call>
+		</munit:validation>
+	</munit:test>
+
+	<munit:test name="rl-international-digital-order-needs-no-customs" description="Recipient list: an international order of digital items only is sent to invoicing and digital delivery, not to the warehouse or customs">
+		<munit:enable-flow-sources>
+			<munit:enable-flow-source value="recipient-receive-order" />
+		</munit:enable-flow-sources>
+		<munit:execution>
+			<munit:set-event doc:name="Order ORD-RL-DIG">
+				<munit:payload value="#[output application/json --- {orderId: 'ORD-RL-DIG', country: 'US', items: [{sku: 'SKU-0', quantity: 1, unitPrice: 10, 'type': 'DIGITAL'}]}]" mediaType="application/json" />
+			</munit:set-event>
+			<flow-ref doc:name="POST /eip/orders/notifications" name="order-notify-recipients" />
+			<set-variable doc:name="Notification response" variableName="response" value="#[payload]" />
+			<munit:set-event doc:name="GET notifications" cloneOriginalEvent="true">
+				<munit:attributes value="#[{ uriParams: { orderId: 'ORD-RL-DIG' } }]" />
+			</munit:set-event>
+			<flow-ref doc:name="GET /eip/orders/ORD-RL-DIG/notifications" name="recipient-get-order-notifications" />
+		</munit:execution>
+		<munit:validation>
+			<munit-tools:assert-that doc:name="Recipient list" expression="#[vars.response.recipients]" is="#[MunitTools::equalTo(['invoicing', 'digitalDelivery'])]" />
+			<munit-tools:assert-that doc:name="All delivered" expression="#[vars.response.allDelivered]" is="#[MunitTools::equalTo(true)]" />
+			<munit-tools:assert-that doc:name="Delivered in list order" expression="#[vars.response.deliveries map $.recipient]" is="#[MunitTools::equalTo(['invoicing', 'digitalDelivery'])]" />
+			<munit-tools:assert-that doc:name="Received by exactly these" expression="#[payload.receivedBy]" is="#[MunitTools::equalTo(['digitalDelivery', 'invoicing'])]" />
+			<munit-tools:verify-call doc:name="One delivery per recipient" processor="http:request" times="2">
+				<munit-tools:with-attributes>
+					<munit-tools:with-attribute attributeName="doc:name" whereValue="POST Order To Recipient" />
+				</munit-tools:with-attributes>
+			</munit-tools:verify-call>
+		</munit:validation>
+	</munit:test>
+
+	<!-- Stands in for the HTTP requester: the warehouse is down, the other recipients answer as usual. -->
+	<flow name="test-recipient-list-warehouse-down" doc:description="Test double for POST Order To Recipient: raises an error for the warehouse and accepts the order for any other recipient.">
+		<choice doc:name="Check Recipient Is Warehouse">
+			<when expression="#[vars.vRecipient == 'warehouse']">
+				<raise-error doc:name="Raise RECIPIENT_DOWN Error - Warehouse down" type="TEST:RECIPIENT_DOWN" description="Warehouse is down" />
+			</when>
+			<otherwise>
+				<set-payload doc:name="Set Received Response" value="#[output application/json --- { recipient: vars.vRecipient, status: 'RECEIVED' }]" />
+			</otherwise>
+		</choice>
+		<!-- Without this the app's default error handler (on-error-continue) would turn the failure into a success. -->
+		<error-handler>
+			<on-error-propagate doc:name="On Error Propagate (recipient down)" type="ANY" logException="false" />
+		</error-handler>
+	</flow>
+
+	<munit:test name="rl-failed-recipient-does-not-stop-the-others" description="Recipient list: when the warehouse fails, its delivery is recorded FAILED and the recipient after it is still notified">
+		<munit:behavior>
+			<munit-tools:mock-when doc:name="Warehouse down" processor="http:request">
+				<munit-tools:with-attributes>
+					<munit-tools:with-attribute attributeName="doc:name" whereValue="POST Order To Recipient" />
+				</munit-tools:with-attributes>
+				<munit-tools:then-call flow="test-recipient-list-warehouse-down" />
+			</munit-tools:mock-when>
+		</munit:behavior>
+		<munit:execution>
+			<munit:set-event doc:name="Domestic order, physical and digital">
+				<munit:payload value="#[output application/json --- {orderId: 'ORD-RL-DOWN', country: 'BR', items: [{sku: 'SKU-0', quantity: 1, unitPrice: 10, 'type': 'PHYSICAL'}, {sku: 'SKU-1', quantity: 1, unitPrice: 10, 'type': 'DIGITAL'}]}]" mediaType="application/json" />
+			</munit:set-event>
+			<flow-ref doc:name="POST /eip/orders/notifications" name="order-notify-recipients" />
+		</munit:execution>
+		<munit:validation>
+			<munit-tools:assert-that doc:name="Recipient list" expression="#[payload.recipients]" is="#[MunitTools::equalTo(['invoicing', 'warehouse', 'digitalDelivery'])]" />
+			<munit-tools:assert-that doc:name="Statuses" expression="#[payload.deliveries map $.status]" is="#[MunitTools::equalTo(['DELIVERED', 'FAILED', 'DELIVERED'])]" />
+			<!-- MUnit's then-call hands the double's error back as MULE:UNKNOWN, so only its presence is asserted. -->
+			<munit-tools:assert-that doc:name="Failure recorded with its error type" expression="#[payload.deliveries[1].errorType]" is="#[MunitTools::notNullValue()]" />
+			<munit-tools:assert-that doc:name="Failed recipient named" expression="#[payload.deliveries[1].recipient]" is="#[MunitTools::equalTo('warehouse')]" />
+			<munit-tools:assert-that doc:name="Not all delivered" expression="#[payload.allDelivered]" is="#[MunitTools::equalTo(false)]" />
+			<munit-tools:verify-call doc:name="Every recipient attempted" processor="http:request" times="3">
+				<munit-tools:with-attributes>
+					<munit-tools:with-attribute attributeName="doc:name" whereValue="POST Order To Recipient" />
+				</munit-tools:with-attributes>
+			</munit-tools:verify-call>
+		</munit:validation>
+	</munit:test>
+
+	<munit:test name="rl-unknown-recipient-returns-404" description="Recipient list: the simulated recipient endpoint answers 404 to a recipient that is not configured">
+		<munit:execution>
+			<munit:set-event doc:name="Order for an unknown recipient">
+				<munit:payload value="#[output application/json --- {orderId: 'ORD-RL-ERP'}]" mediaType="application/json" />
+				<munit:attributes value="#[{ uriParams: { recipient: 'erp' } }]" />
+			</munit:set-event>
+			<flow-ref doc:name="POST /eip/recipients/erp/orders" name="recipient-receive-order" />
+		</munit:execution>
+		<munit:validation>
+			<munit-tools:assert-that doc:name="404" expression="#[vars.httpStatus as Number]" is="#[MunitTools::equalTo(404)]" />
+		</munit:validation>
+	</munit:test>
+
+	<munit:test name="rl-recipient-rejects-order-without-id" description="Recipient list: a known recipient answers 400 to a body without orderId">
+		<munit:execution>
+			<munit:set-event doc:name="Body without orderId">
+				<munit:payload value="#[output application/json --- {country: 'BR'}]" mediaType="application/json" />
+				<munit:attributes value="#[{ uriParams: { recipient: 'warehouse' } }]" />
+			</munit:set-event>
+			<flow-ref doc:name="POST /eip/recipients/warehouse/orders" name="recipient-receive-order" />
+		</munit:execution>
+		<munit:validation>
+			<munit-tools:assert-that doc:name="400" expression="#[vars.httpStatus as Number]" is="#[MunitTools::equalTo(400)]" />
+		</munit:validation>
+	</munit:test>
+
+	<munit:test name="rl-item-without-type-returns-400" description="Recipient list: an order with an item that is neither PHYSICAL nor DIGITAL cannot be routed and is rejected with 400">
+		<munit:execution>
+			<munit:set-event doc:name="Item without type">
+				<munit:payload value="#[output application/json --- {orderId: 'ORD-RL-BAD', country: 'BR', items: [{sku: 'SKU-BOOK', quantity: 1}]}]" mediaType="application/json" />
+			</munit:set-event>
+			<flow-ref doc:name="POST /eip/orders/notifications" name="order-notify-recipients" />
+		</munit:execution>
+		<munit:validation>
+			<munit-tools:assert-that doc:name="400" expression="#[vars.httpStatus as Number]" is="#[MunitTools::equalTo(400)]" />
+		</munit:validation>
+	</munit:test>
+</mule>

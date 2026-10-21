@@ -1,0 +1,96 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<mule xmlns="http://www.mulesoft.org/schema/mule/core"
+	xmlns:http="http://www.mulesoft.org/schema/mule/http"
+	xmlns:ee="http://www.mulesoft.org/schema/mule/ee/core"
+	xmlns:doc="http://www.mulesoft.org/schema/mule/documentation"
+	xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+	xsi:schemaLocation="http://www.mulesoft.org/schema/mule/core http://www.mulesoft.org/schema/mule/core/current/mule.xsd
+		http://www.mulesoft.org/schema/mule/http http://www.mulesoft.org/schema/mule/http/current/mule-http.xsd
+		http://www.mulesoft.org/schema/mule/ee/core http://www.mulesoft.org/schema/mule/ee/core/current/mule-ee.xsd">
+
+	<!--
+		RECIPIENT LIST (Hohpe and Woolf): works out, for each message, the list of recipients that must receive it,
+		and sends the message to each of them. Here: which downstream systems must hear about a new order.
+		POST /eip/orders/notifications { orderId, country, items: [ { sku, quantity, unitPrice, type } ] }
+		GET  /eip/orders/{orderId}/notifications   which recipients received the order
+
+		The rules (a DataWeave expression over the order):
+		- invoicing: always;
+		- warehouse: when the order has a PHYSICAL item;
+		- digitalDelivery: when the order has a DIGITAL item;
+		- customs: when a PHYSICAL item ships outside eip.orders.homeCountry.
+
+		The Mule way: compute the list, then For Each over it with an HTTP requester whose path is looked up in
+		configuration (eip.recipientList.paths.<recipient>). The list is data, so a new rule or recipient changes
+		the expression and the configuration, not the shape of the flow. Scatter-Gather is not the tool here:
+		its routes are fixed in the XML and all of them always run.
+
+		Each delivery is in its own Try. Without it, For Each stops at the first recipient that fails and the
+		recipients after it are never told. With it, a failed delivery is recorded (FAILED, with the error type)
+		and the others still go out; the response says which ones failed (allDelivered false), so the caller
+		can retry just those. For Each delivers one recipient after the other; Parallel For Each would deliver
+		them at the same time.
+
+		In the book, Scatter-Gather is a Recipient List (or a broadcast) followed by an Aggregator that combines
+		the replies into one message. Here the replies are only delivery statuses, collected in vars.vDeliveries;
+		scatter-gather/ shows Mule's Scatter-Gather router, which does both in one scope.
+
+		The recipients are simulated by recipient-list-recipients.xml, on this same application.
+	-->
+	<flow name="order-notify-recipients" doc:description="Recipient list: computes from an order which downstream systems must be notified (invoicing, warehouse, digital delivery, customs) and sends the order to each of them over HTTP.">
+		<http:listener doc:name="POST /eip/orders/notifications" config-ref="http-listener-config" path="/eip/orders/notifications" allowedMethods="POST">
+			<http:response statusCode="#[vars.httpStatus default 200]" />
+		</http:listener>
+		<logger doc:name="INFO: Log notification request" level="INFO" message="#['Notify recipients of orderId=' ++ (payload.orderId default 'none') ++ ', correlationId=' ++ correlationId]" />
+		<choice doc:name="Validate Order To Notify">
+			<when expression="#[(not (payload is Object)) or isEmpty(payload.orderId) or isEmpty(payload.country) or (not (payload.items is Array)) or isEmpty(payload.items) or not isEmpty(payload.items filter (not (['PHYSICAL', 'DIGITAL'] contains $.'type')))]">
+				<raise-error doc:name="Raise BAD_REQUEST Error - Missing order fields" type="APP:BAD_REQUEST" description="orderId, country and a non-empty items array, each item of type PHYSICAL or DIGITAL, are required" />
+			</when>
+		</choice>
+		<set-variable doc:name="SET vOrder" variableName="vOrder" value="#[output application/java --- payload]" />
+		<ee:transform doc:name="Compute Recipient List">
+			<ee:variables>
+				<ee:set-variable variableName="vRecipients"><![CDATA[%dw 2.0
+output application/java
+var physical = not isEmpty(vars.vOrder.items filter ($.'type' == "PHYSICAL"))
+var digital = not isEmpty(vars.vOrder.items filter ($.'type' == "DIGITAL"))
+var international = upper(vars.vOrder.country) != upper(p('eip.orders.homeCountry'))
+---
+["invoicing"]
+	++ (if (physical) ["warehouse"] else [])
+	++ (if (digital) ["digitalDelivery"] else [])
+	++ (if (physical and international) ["customs"] else [])]]></ee:set-variable>
+			</ee:variables>
+		</ee:transform>
+		<set-variable doc:name="SET vDeliveries" variableName="vDeliveries" value="#[[]]" />
+		<foreach doc:name="For Each Recipient" collection="#[vars.vRecipients]">
+			<set-variable doc:name="SET vRecipient" variableName="vRecipient" value="#[payload]" />
+			<try doc:name="Try Deliver To Recipient">
+				<http:request doc:name="POST Order To Recipient" config-ref="eip-self-http-request-config" method="POST" path="#[p('eip.recipientList.paths.' ++ vars.vRecipient)]">
+					<http:body><![CDATA[#[output application/json --- vars.vOrder]]]></http:body>
+				</http:request>
+				<set-variable doc:name="SET vDeliveries" variableName="vDeliveries" value="#[output application/java --- vars.vDeliveries ++ [{ recipient: vars.vRecipient, status: 'DELIVERED' }]]" />
+				<error-handler>
+					<on-error-continue doc:name="On Error Continue (recipient failed)" type="ANY" logException="false">
+						<logger doc:name="WARN: Log failed delivery" level="WARN" message="#['Recipient ' ++ vars.vRecipient ++ ' did not receive orderId=' ++ vars.vOrder.orderId ++ ' (' ++ error.errorType.namespace ++ ':' ++ error.errorType.identifier ++ '), correlationId=' ++ correlationId]" />
+						<set-variable doc:name="SET vDeliveries" variableName="vDeliveries" value="#[output application/java --- vars.vDeliveries ++ [{ recipient: vars.vRecipient, status: 'FAILED', errorType: error.errorType.namespace ++ ':' ++ error.errorType.identifier }]]" />
+					</on-error-continue>
+				</error-handler>
+			</try>
+		</foreach>
+		<ee:transform doc:name="Build Notification Response">
+			<ee:message>
+				<ee:set-payload><![CDATA[%dw 2.0
+output application/json
+---
+{
+	orderId: vars.vOrder.orderId,
+	recipients: vars.vRecipients,
+	deliveries: vars.vDeliveries,
+	allDelivered: isEmpty(vars.vDeliveries filter ($.status != "DELIVERED"))
+}]]></ee:set-payload>
+			</ee:message>
+		</ee:transform>
+		<logger doc:name="INFO: Log notification result" level="INFO" message="#['Order ' ++ payload.orderId ++ ' sent to ' ++ (vars.vRecipients joinBy ',') ++ ', allDelivered=' ++ payload.allDelivered ++ ', correlationId=' ++ correlationId]" />
+	</flow>
+</mule>
