@@ -23,6 +23,12 @@
 		the flow runs once per request, nothing runs between requests, and the event is processed by the time
 		the sender gets its answer. Compare polling-consumer/, where an order waits until the next poll.
 
+		Each event overwrites the order's state, so the last event stored decides it. The flow imposes no order of
+		its own: the tests send events one after the other, so there the last one sent wins; events sent at the
+		same time would run concurrently and the last write would win. Nothing checks eventId either, so a
+		repeated event is applied again (edc-repeated-event-is-applied-again); idempotent-receiver/ (wave 1) shows
+		how to reject a repeat.
+
 		The messaging equivalents are the VM Listener (<vm:listener>, https://docs.mulesoft.com/vm-connector/latest/vm-reference)
 		and the Anypoint MQ Subscriber (<anypoint-mq:subscriber>,
 		https://docs.mulesoft.com/anypoint-mq-connector/latest/anypoint-mq-listener): the same flow shape with another
