@@ -16,7 +16,7 @@
 
 	<configuration doc:name="Configuration" defaultErrorHandler-ref="global-error-handler" />
 
-	<!-- Examples raise APP:BAD_REQUEST (400), APP:NOT_FOUND (404), APP:CONFLICT (409) or APP:SERVICE_UNAVAILABLE (503); this turns them into JSON responses. -->
+	<!-- Examples raise APP:BAD_REQUEST (400), APP:NOT_FOUND (404), APP:CONFLICT (409), APP:SERVICE_UNAVAILABLE (503) or APP:COMPENSATION_FAILED (500 with its own description); this turns them into JSON responses. -->
 	<error-handler name="global-error-handler">
 		<on-error-continue type="APP:BAD_REQUEST" logException="false">
 			<set-variable variableName="httpStatus" value="400" />
@@ -53,6 +53,17 @@ output application/json
 		</on-error-continue>
 		<on-error-continue type="APP:SERVICE_UNAVAILABLE" logException="false">
 			<set-variable variableName="httpStatus" value="503" />
+			<ee:transform doc:name="Error body">
+				<ee:message>
+					<ee:set-payload><![CDATA[%dw 2.0
+output application/json
+---
+{ error: error.description }]]></ee:set-payload>
+				</ee:message>
+			</ee:transform>
+		</on-error-continue>
+		<on-error-continue type="APP:COMPENSATION_FAILED" logException="false">
+			<set-variable variableName="httpStatus" value="500" />
 			<ee:transform doc:name="Error body">
 				<ee:message>
 					<ee:set-payload><![CDATA[%dw 2.0

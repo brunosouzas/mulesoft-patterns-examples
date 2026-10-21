@@ -280,3 +280,66 @@ GET {{base}}/eip/legacy/orders/ORD-LEGACY-1001
 
 ###
 GET {{base}}/eip/adapters/legacy-orders/ORD-LEGACY-1001
+
+### EIP guaranteed delivery — stored first, forwarded by the Scheduler (every second)
+PUT {{base}}/eip/fulfilment/availability
+Content-Type: application/json
+
+{ "available": false }
+
+###
+POST {{base}}/eip/orders/guaranteed
+Content-Type: application/json
+
+{ "orderId": "ORD-5101", "amount": 120 }
+
+###
+GET {{base}}/eip/orders/guaranteed/ORD-5101
+
+###
+PUT {{base}}/eip/fulfilment/availability
+Content-Type: application/json
+
+{ "available": true }
+
+###
+GET {{base}}/eip/fulfilment/orders/ORD-5101
+
+### EIP transactional client — before: Try with ALWAYS_BEGIN; after: compensation
+POST {{base}}/eip/payments/transactional/before
+Content-Type: application/json
+
+{ "orderId": "ORD-5201", "amount": 50 }
+
+###
+POST {{base}}/eip/payments/transactional/after
+Content-Type: application/json
+
+{ "orderId": "ORD-5202", "amount": 70 }
+
+###
+GET {{base}}/eip/payments/transactional/ORD-5201
+
+### EIP message expiration — set expiresAt a few seconds ahead, or in the past
+POST {{base}}/eip/stock/expiring-requests
+Content-Type: application/json
+
+{ "orderId": "ORD-5301", "sku": "SKU-BOOK", "quantity": 1, "expiresAt": "2020-01-01T00:00:00Z" }
+
+###
+GET {{base}}/eip/stock/expiring-requests/ORD-5301
+
+### EIP invalid message channel — a valid request, a malformed one, then the channel
+POST {{base}}/eip/invoices/requests
+Content-Type: application/json
+
+{ "orderId": "ORD-5401", "amount": 99.9, "currency": "BRL" }
+
+###
+POST {{base}}/eip/invoices/requests
+Content-Type: application/json
+
+{ "orderId": "ORD-5402", "amount":
+
+###
+GET {{base}}/eip/invoices/invalid-messages
