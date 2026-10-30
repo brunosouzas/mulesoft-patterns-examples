@@ -1,6 +1,10 @@
 # mulesoft-patterns-examples: project context
 
 Stack: Mule 4, MUnit, Maven
+Delivery: E reference
+Integration branch: `main`
+Trivial: none
+Deliver and verify: nothing runs on merge; verify with `mvn clean test` (MUnit; needs the MuleSoft Enterprise repository credentials in `~/.m2/settings.xml`) and, with the app running locally, that the endpoints in `requests.http` the published articles cite still answer. Merges stay with Bruno (`rules/README.md`), stricter than the playbook's level 1 on purpose
 
 ## Purpose
 
