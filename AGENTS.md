@@ -1,6 +1,10 @@
 # mulesoft-patterns-examples: project context
 
 Stack: Mule 4, MUnit, Maven
+Delivery: E reference
+Integration branch: `main`
+Trivial: none
+Deliver and verify: nothing runs on merge; verify with `mvn -q test` (MUnit) and that the HTTP endpoints the published articles cite still answer (`requests.http`)
 
 ## Purpose
 
