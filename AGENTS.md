@@ -1,10 +1,16 @@
 # mulesoft-patterns-examples: project context
 
-Stack: Mule 4, MUnit, Maven
+Stack: Mule 4, MUnit, Maven, GitHub Actions
 Delivery: E reference
+Model: reference
 Integration branch: `main`
-Trivial: none
-Deliver and verify: nothing runs on merge; verify with `mvn clean test` (MUnit; needs the MuleSoft Enterprise repository credentials in `~/.m2/settings.xml`) and, with the app running locally, that the endpoints in `requests.http` the published articles cite still answer. Merges stay with Bruno (`rules/README.md`), stricter than the playbook's level 1 on purpose
+Data: none
+Article: none
+
+- Build: `mvn -B clean package -DskipMunitTests` (what CI runs on every pull request, `.github/workflows/ci.yml`; no credentials needed)
+- Test: `mvn clean test` (MUnit, fails below 80% application coverage; needs the MuleSoft Enterprise repository credentials in `~/.m2/settings.xml`, so it runs locally before each pull request, not in CI)
+- Run locally: `mvn clean package`, run the app on a local Mule 4.9 runtime and call the endpoints in `requests.http`
+- Deliver and verify: `nothing is deployed; CI green on the merge commit, and the paths and requests.http endpoints that 50-writing/solid-in-mulesoft/ and integration-patterns-in-mulesoft/ cite still resolve on main`
 
 ## Purpose
 
@@ -45,3 +51,9 @@ GitHub default branch inspected on 2026-10-06: `main`. Release bases are defined
 ## Project rules
 
 Before planning, reviewing or changing this project, read [the applicable project rules](rules/README.md).
+
+- Board area: `mulesoft` (Azure Boards, project `brunosouzas`).
+- OpenSpec: no: every change takes the small path.
+- Merges stay with Bruno (`rules/README.md`), stricter than the playbook's level 1 on purpose.
+- Releases: none. When an article cites a version, Bruno creates an `article-<slug>` tag (not `v*`).
+- Articles cite this repository (`50-writing/solid-in-mulesoft/`, `50-writing/integration-patterns-in-mulesoft/`): keep the endpoints in `requests.http` and the paths they link answering after a merge.
