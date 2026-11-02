@@ -10,7 +10,7 @@ Article: none
 - Build: `mvn -B clean package -DskipMunitTests` (what CI runs on every pull request, `.github/workflows/ci.yml`; no credentials needed)
 - Test: `mvn clean test` (MUnit, fails below 80% application coverage; needs the MuleSoft Enterprise repository credentials in `~/.m2/settings.xml`, so it runs locally before each pull request, not in CI)
 - Run locally: `mvn clean package`, run the app on a local Mule 4.9 runtime and call the endpoints in `requests.http`
-- Deliver and verify: `nothing is deployed; CI green on the merge commit`
+- Deliver and verify: `nothing is deployed; CI green on the merge commit, and the paths and requests.http endpoints that 50-writing/solid-in-mulesoft/ and integration-patterns-in-mulesoft/ cite still resolve on main`
 
 ## Purpose
 
