@@ -19,32 +19,32 @@
 		- Different orders sent by one flow in a loop (one correlation ID, propagated in X-CORRELATION-ID)
 		  are rejected as duplicates.
 	-->
-	<flow name="payment-before-charge-endpoint">
+	<flow name="payment-before-charge-endpoint" doc:description="Idempotent receiver, before: charges an order on POST /eip/payments/before/charges behind an idempotent validator with no configuration, which keys on the correlationId instead of the order.">
 		<http:listener doc:name="POST /eip/payments/before/charges" config-ref="http-listener-config" path="/eip/payments/before/charges" allowedMethods="POST">
 			<http:response statusCode="#[vars.httpStatus default 200]" />
 		</http:listener>
-		<logger doc:name="Log charge request" level="INFO" message="#['Charge request (before), correlationId=' ++ correlationId]" />
-		<flow-ref doc:name="Validate request" name="payment-validate-charge-request" />
-		<try doc:name="Charge once">
-			<idempotent-message-validator doc:name="Reject duplicates (default: by correlation ID)" />
-			<flow-ref doc:name="Charge" name="payment-charge-order" />
-			<set-variable doc:name="Accepted" variableName="chargeResult" value="accepted" />
+		<logger doc:name="INFO: Log charge request" level="INFO" message="#['Charge request (before), correlationId=' ++ correlationId]" />
+		<flow-ref doc:name="Refer to sf-validate-charge-request" name="sf-validate-charge-request" />
+		<try doc:name="Try Charge Once">
+			<idempotent-message-validator doc:name="Reject Duplicates (default: by correlation ID)" />
+			<flow-ref doc:name="Refer to sf-charge-order" name="sf-charge-order" />
+			<set-variable doc:name="SET vChargeResult" variableName="vChargeResult" value="accepted" />
 			<error-handler>
-				<on-error-continue doc:name="Duplicate: 409" type="MULE:DUPLICATE_MESSAGE" logException="false">
-					<flow-ref doc:name="Record duplicate" name="payment-record-duplicate" />
-					<set-variable doc:name="Duplicate" variableName="chargeResult" value="duplicate" />
-					<set-variable doc:name="409" variableName="httpStatus" value="409" />
+				<on-error-continue doc:name="On Error Continue (duplicate)" type="MULE:DUPLICATE_MESSAGE" logException="false">
+					<flow-ref doc:name="Refer to sf-record-duplicate-charge" name="sf-record-duplicate-charge" />
+					<set-variable doc:name="SET vChargeResult" variableName="vChargeResult" value="duplicate" />
+					<set-variable doc:name="SET httpStatus" variableName="httpStatus" value="409" />
 				</on-error-continue>
 			</error-handler>
 		</try>
-		<ee:transform doc:name="Charge response">
+		<ee:transform doc:name="Build Charge Response">
 			<ee:message>
 				<ee:set-payload><![CDATA[%dw 2.0
 output application/json
 ---
-{ orderId: payload.orderId, result: vars.chargeResult }]]></ee:set-payload>
+{ orderId: payload.orderId, result: vars.vChargeResult }]]></ee:set-payload>
 			</ee:message>
 		</ee:transform>
-		<logger doc:name="Log charge result" level="INFO" message="#['Charge (before) ' ++ vars.chargeResult ++ ', orderId=' ++ payload.orderId ++ ', correlationId=' ++ correlationId]" />
+		<logger doc:name="INFO: Log charge result" level="INFO" message="#['Charge (before) ' ++ vars.vChargeResult ++ ', orderId=' ++ payload.orderId ++ ', correlationId=' ++ correlationId]" />
 	</flow>
 </mule>

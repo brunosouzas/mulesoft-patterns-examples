@@ -13,49 +13,49 @@
 	<!--
 		IDEMPOTENT RECEIVER: payment pieces shared by the before and the after endpoints.
 
-		- payment-charge-order: the simulated charge. Every charge is recorded in a ledger, so tests (and
+		- sf-charge-order: the simulated charge. Every charge is recorded in a ledger, so tests (and
 		  GET /eip/payments/{orderId}/charges) can count how many times an order was charged.
-		- payment-record-duplicate: records a request the idempotent validator rejected.
+		- sf-record-duplicate-charge: records a request the idempotent validator rejected.
 		- payment-charge-batch-client: a client flow that calls a charge endpoint over HTTP once per order,
 		  inside a For Each, the way a batch job or an upstream API would.
 
 		The ledger keeps one entry per charge ("<orderId>|charge|<chargeId>") instead of a counter, so two
 		requests for the same order handled at the same time cannot overwrite each other's count.
 	-->
-	<os:object-store name="eip-payment-ledger-store" doc:name="Payment ledger" persistent="false" />
+	<os:object-store name="eip-payment-ledger-store" doc:name="Payment Ledger Object Store" persistent="false" />
 
 	<!-- The simulated charge. The card gateway step is where a real charge would call the card processor. -->
-	<sub-flow name="payment-charge-order">
-		<ee:transform doc:name="Call card gateway (simulated)">
+	<sub-flow name="sf-charge-order" doc:description="Simulated charge of the order in the payload: records one ledger entry per charge; called by both charge endpoints after the idempotent validator.">
+		<ee:transform doc:name="Call Card Gateway (simulated)">
 			<ee:variables>
-				<ee:set-variable variableName="chargeId"><![CDATA["CHG-" ++ uuid()]]></ee:set-variable>
+				<ee:set-variable variableName="vChargeId"><![CDATA["CHG-" ++ uuid()]]></ee:set-variable>
 			</ee:variables>
 		</ee:transform>
-		<os:store doc:name="Record charge" key="#[payload.orderId ++ '|charge|' ++ vars.chargeId]" objectStore="eip-payment-ledger-store">
-			<os:value><![CDATA[#[output application/java --- { orderId: payload.orderId, chargeId: vars.chargeId, amount: payload.amount, chargedAt: now() as String }]]]></os:value>
+		<os:store doc:name="Record Charge" key="#[payload.orderId ++ '|charge|' ++ vars.vChargeId]" objectStore="eip-payment-ledger-store">
+			<os:value><![CDATA[#[output application/java --- { orderId: payload.orderId, chargeId: vars.vChargeId, amount: payload.amount, chargedAt: now() as String }]]]></os:value>
 		</os:store>
-		<logger doc:name="Log charge" level="INFO" message="#['Charged orderId=' ++ payload.orderId ++ ', chargeId=' ++ vars.chargeId ++ ', correlationId=' ++ correlationId]" />
+		<logger doc:name="INFO: Log charge" level="INFO" message="#['Charged orderId=' ++ payload.orderId ++ ', chargeId=' ++ vars.vChargeId ++ ', correlationId=' ++ correlationId]" />
 	</sub-flow>
 
 	<!-- A rejected duplicate is recorded too: "charged once" is only proven if the second request was seen. -->
-	<sub-flow name="payment-record-duplicate">
-		<os:store doc:name="Record rejected duplicate" key="#[payload.orderId ++ '|duplicate|' ++ uuid()]" objectStore="eip-payment-ledger-store">
+	<sub-flow name="sf-record-duplicate-charge" doc:description="Records in the ledger a charge request the idempotent validator rejected as a duplicate; called from the charge endpoints' error handler.">
+		<os:store doc:name="Record Rejected Duplicate" key="#[payload.orderId ++ '|duplicate|' ++ uuid()]" objectStore="eip-payment-ledger-store">
 			<os:value><![CDATA[#[output application/java --- { orderId: payload.orderId, correlationId: correlationId, rejectedAt: now() as String }]]]></os:value>
 		</os:store>
-		<logger doc:name="Log duplicate" level="WARN" message="#['Duplicate rejected, orderId=' ++ payload.orderId ++ ', correlationId=' ++ correlationId]" />
+		<logger doc:name="WARN: Log duplicate" level="WARN" message="#['Duplicate rejected, orderId=' ++ payload.orderId ++ ', correlationId=' ++ correlationId]" />
 	</sub-flow>
 
-	<!-- Ledger summary for vars.ledgerOrderId: how many charges and how many rejected duplicates. -->
-	<sub-flow name="payment-ledger-summary">
-		<os:retrieve-all-keys doc:name="Read ledger keys" objectStore="eip-payment-ledger-store" />
-		<ee:transform doc:name="Count charges and duplicates">
+	<!-- Ledger summary for vars.vLedgerOrderId: how many charges and how many rejected duplicates. -->
+	<sub-flow name="sf-summarise-payment-ledger" doc:description="Counts the charges and rejected duplicates recorded for the order in vars.vLedgerOrderId; called by GET /eip/payments/{orderId}/charges and the MUnit suite.">
+		<os:retrieve-all-keys doc:name="Read Ledger Keys" objectStore="eip-payment-ledger-store" />
+		<ee:transform doc:name="Count Charges And Duplicates">
 			<ee:message>
 				<ee:set-payload><![CDATA[%dw 2.0
 output application/json
-var orderKeys = payload filter ($ startsWith (vars.ledgerOrderId ++ "|"))
+var orderKeys = payload filter ($ startsWith (vars.vLedgerOrderId ++ "|"))
 ---
 {
-	orderId: vars.ledgerOrderId,
+	orderId: vars.vLedgerOrderId,
 	charges: sizeOf(orderKeys filter ($ contains "|charge|")),
 	duplicatesRejected: sizeOf(orderKeys filter ($ contains "|duplicate|"))
 }]]></ee:set-payload>
@@ -63,17 +63,17 @@ var orderKeys = payload filter ($ startsWith (vars.ledgerOrderId ++ "|"))
 		</ee:transform>
 	</sub-flow>
 
-	<flow name="payment-get-ledger">
+	<flow name="payment-get-ledger" doc:description="GET /eip/payments/{orderId}/charges: how many times an order was charged and how many duplicates were rejected.">
 		<http:listener doc:name="GET /eip/payments/{orderId}/charges" config-ref="http-listener-config" path="/eip/payments/{orderId}/charges" allowedMethods="GET" />
-		<set-variable doc:name="Order to summarise" variableName="ledgerOrderId" value="#[attributes.uriParams.orderId]" />
-		<flow-ref doc:name="Ledger summary" name="payment-ledger-summary" />
+		<set-variable doc:name="SET vLedgerOrderId" variableName="vLedgerOrderId" value="#[attributes.uriParams.orderId]" />
+		<flow-ref doc:name="Refer to sf-summarise-payment-ledger" name="sf-summarise-payment-ledger" />
 	</flow>
 
 	<!-- Validates the body of a charge request: { orderId, amount }. -->
-	<sub-flow name="payment-validate-charge-request">
-		<choice doc:name="Valid charge?">
+	<sub-flow name="sf-validate-charge-request" doc:description="Validates the body of a charge request: orderId and a numeric amount are required.">
+		<choice doc:name="Validate Charge Request">
 			<when expression="#[(not (payload is Object)) or isEmpty(payload.orderId) or not (payload.amount is Number)]">
-				<raise-error doc:name="Bad request" type="APP:BAD_REQUEST" description="orderId and amount (number) are required" />
+				<raise-error doc:name="Raise BAD_REQUEST Error - Missing charge fields" type="APP:BAD_REQUEST" description="orderId and amount (number) are required" />
 			</when>
 		</choice>
 	</sub-flow>
@@ -84,37 +84,37 @@ var orderKeys = payload filter ($ startsWith (vars.ledgerOrderId ++ "|"))
 		leaves this flow with the SAME correlation ID (the batch request's), sent in X-CORRELATION-ID, which
 		is exactly what fools the default idempotent validator of the "before" endpoint.
 	-->
-	<flow name="payment-charge-batch-client">
+	<flow name="payment-charge-batch-client" doc:description="Batch client: POST /eip/payments/{version}/charges/batch posts each charge of the array to the before or after charge endpoint over HTTP, inside a For Each, and collects the results.">
 		<http:listener doc:name="POST /eip/payments/{version}/charges/batch" config-ref="http-listener-config" path="/eip/payments/{version}/charges/batch" allowedMethods="POST">
 			<http:response statusCode="#[vars.httpStatus default 200]" />
 		</http:listener>
-		<set-variable doc:name="Endpoint version" variableName="version" value="#[attributes.uriParams.version]" />
-		<choice doc:name="Valid batch?">
-			<when expression="#[not (['before', 'after'] contains vars.version)]">
-				<raise-error doc:name="Unknown version" type="APP:NOT_FOUND" description="Version must be 'before' or 'after'" />
+		<set-variable doc:name="SET vVersion" variableName="vVersion" value="#[attributes.uriParams.version]" />
+		<choice doc:name="Validate Batch">
+			<when expression="#[not (['before', 'after'] contains vars.vVersion)]">
+				<raise-error doc:name="Raise NOT_FOUND Error - Unknown version" type="APP:NOT_FOUND" description="Version must be 'before' or 'after'" />
 			</when>
 			<when expression="#[(not (payload is Array)) or isEmpty(payload)]">
-				<raise-error doc:name="Bad request" type="APP:BAD_REQUEST" description="The body must be a non-empty array of charges" />
+				<raise-error doc:name="Raise BAD_REQUEST Error - Empty batch" type="APP:BAD_REQUEST" description="The body must be a non-empty array of charges" />
 			</when>
 		</choice>
-		<logger doc:name="Log batch start" level="INFO" message="#['Charge batch (' ++ vars.version ++ ') of ' ++ sizeOf(payload) ++ ', correlationId=' ++ correlationId]" />
-		<set-variable doc:name="No results yet" variableName="results" value="#[[]]" />
-		<foreach doc:name="For each charge">
-			<http:request doc:name="POST charge over HTTP" config-ref="eip-self-http-request-config" method="POST" path="#['/eip/payments/' ++ vars.version ++ '/charges']">
+		<logger doc:name="INFO: Log batch start" level="INFO" message="#['Charge batch (' ++ vars.vVersion ++ ') of ' ++ sizeOf(payload) ++ ', correlationId=' ++ correlationId]" />
+		<set-variable doc:name="SET vResults" variableName="vResults" value="#[[]]" />
+		<foreach doc:name="For Each Charge">
+			<http:request doc:name="POST Charge Over HTTP" config-ref="eip-self-http-request-config" method="POST" path="#['/eip/payments/' ++ vars.vVersion ++ '/charges']">
 				<http:body><![CDATA[#[output application/json --- payload]]]></http:body>
 				<!-- 409 means "duplicate": a normal answer for this demo, not a failure. -->
 				<http:response-validator>
 					<http:success-status-code-validator values="200,409" />
 				</http:response-validator>
 			</http:request>
-			<set-variable doc:name="Collect result" variableName="results" value="#[output application/java --- vars.results ++ [payload.result]]" />
+			<set-variable doc:name="SET vResults" variableName="vResults" value="#[output application/java --- vars.vResults ++ [payload.result]]" />
 		</foreach>
-		<ee:transform doc:name="Batch results">
+		<ee:transform doc:name="Build Batch Results">
 			<ee:message>
 				<ee:set-payload><![CDATA[%dw 2.0
 output application/json
 ---
-{ version: vars.version, results: vars.results }]]></ee:set-payload>
+{ version: vars.vVersion, results: vars.vResults }]]></ee:set-payload>
 			</ee:message>
 		</ee:transform>
 	</flow>

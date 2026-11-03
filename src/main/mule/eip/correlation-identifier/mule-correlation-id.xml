@@ -21,9 +21,9 @@
 	-->
 
 	<!-- Callee: reports the header it received and the correlationId its own event got. -->
-	<flow name="mule-correlation-id-echo">
+	<flow name="mule-correlation-id-echo" doc:description="Callee of the Mule correlation ID demo: GET /eip/correlation-id/echo reports the X-CORRELATION-ID header it received and its own correlationId.">
 		<http:listener doc:name="GET /eip/correlation-id/echo" config-ref="http-listener-config" path="/eip/correlation-id/echo" allowedMethods="GET" />
-		<ee:transform doc:name="What arrived">
+		<ee:transform doc:name="Report What Arrived">
 			<ee:message>
 				<ee:set-payload><![CDATA[%dw 2.0
 output application/json
@@ -34,10 +34,10 @@ output application/json
 	</flow>
 
 	<!-- Caller with the default (sendCorrelationId AUTO): the callee receives this flow's correlationId. -->
-	<flow name="mule-correlation-id-call-default">
+	<flow name="mule-correlation-id-call-default" doc:description="Mule correlation ID demo: GET /eip/correlation-id/call/default calls the echo with the requester's default (sendCorrelationId AUTO), so the callee gets this flow's correlationId.">
 		<http:listener doc:name="GET /eip/correlation-id/call/default" config-ref="http-listener-config" path="/eip/correlation-id/call/default" allowedMethods="GET" />
-		<http:request doc:name="Call echo (default)" config-ref="eip-self-http-request-config" method="GET" path="/eip/correlation-id/echo" />
-		<ee:transform doc:name="Compare IDs">
+		<http:request doc:name="Call Echo (default)" config-ref="eip-self-http-request-config" method="GET" path="/eip/correlation-id/echo" />
+		<ee:transform doc:name="Compare Correlation IDs">
 			<ee:message>
 				<ee:set-payload><![CDATA[%dw 2.0
 output application/json
@@ -48,10 +48,10 @@ output application/json
 	</flow>
 
 	<!-- Caller with sendCorrelationId="NEVER": no header, so the callee gets a new correlationId. -->
-	<flow name="mule-correlation-id-call-never">
+	<flow name="mule-correlation-id-call-never" doc:description="Mule correlation ID demo: GET /eip/correlation-id/call/never calls the echo with sendCorrelationId NEVER, so the callee starts a new correlationId.">
 		<http:listener doc:name="GET /eip/correlation-id/call/never" config-ref="http-listener-config" path="/eip/correlation-id/call/never" allowedMethods="GET" />
-		<http:request doc:name="Call echo (NEVER)" config-ref="eip-self-http-request-config" method="GET" path="/eip/correlation-id/echo" sendCorrelationId="NEVER" />
-		<ee:transform doc:name="Compare IDs">
+		<http:request doc:name="Call Echo (NEVER)" config-ref="eip-self-http-request-config" method="GET" path="/eip/correlation-id/echo" sendCorrelationId="NEVER" />
+		<ee:transform doc:name="Compare Correlation IDs">
 			<ee:message>
 				<ee:set-payload><![CDATA[%dw 2.0
 output application/json

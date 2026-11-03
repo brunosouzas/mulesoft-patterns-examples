@@ -32,36 +32,36 @@
 
 		After a successful charge the order is sent to the payment provider: see correlation-identifier.xml.
 	-->
-	<os:object-store name="eip-processed-orders-store" doc:name="Processed order IDs"
+	<os:object-store name="eip-processed-orders-store" doc:name="Processed Order IDs Object Store"
 		persistent="false" entryTtl="24" entryTtlUnit="HOURS" expirationInterval="10" expirationIntervalUnit="MINUTES" />
 
-	<flow name="payment-after-charge-endpoint">
+	<flow name="payment-after-charge-endpoint" doc:description="Idempotent receiver, after: charges an order once on POST /eip/payments/after/charges, rejecting a repeat of the same orderId with 409, then requests the payment from the provider.">
 		<http:listener doc:name="POST /eip/payments/after/charges" config-ref="http-listener-config" path="/eip/payments/after/charges" allowedMethods="POST">
 			<http:response statusCode="#[vars.httpStatus default 200]" />
 		</http:listener>
-		<logger doc:name="Log charge request" level="INFO" message="#['Charge request (after), correlationId=' ++ correlationId]" />
-		<flow-ref doc:name="Validate request" name="payment-validate-charge-request" />
-		<try doc:name="Charge once">
-			<idempotent-message-validator doc:name="Reject duplicates by orderId" idExpression="#[payload.orderId]" objectStore="eip-processed-orders-store" />
-			<flow-ref doc:name="Charge" name="payment-charge-order" />
-			<flow-ref doc:name="Request payment from provider" name="payment-request-from-provider" />
-			<set-variable doc:name="Accepted" variableName="chargeResult" value="accepted" />
+		<logger doc:name="INFO: Log charge request" level="INFO" message="#['Charge request (after), correlationId=' ++ correlationId]" />
+		<flow-ref doc:name="Refer to sf-validate-charge-request" name="sf-validate-charge-request" />
+		<try doc:name="Try Charge Once">
+			<idempotent-message-validator doc:name="Reject Duplicates By orderId" idExpression="#[payload.orderId]" objectStore="eip-processed-orders-store" />
+			<flow-ref doc:name="Refer to sf-charge-order" name="sf-charge-order" />
+			<flow-ref doc:name="Refer to sf-request-payment-from-provider" name="sf-request-payment-from-provider" />
+			<set-variable doc:name="SET vChargeResult" variableName="vChargeResult" value="accepted" />
 			<error-handler>
-				<on-error-continue doc:name="Duplicate: 409" type="MULE:DUPLICATE_MESSAGE" logException="false">
-					<flow-ref doc:name="Record duplicate" name="payment-record-duplicate" />
-					<set-variable doc:name="Duplicate" variableName="chargeResult" value="duplicate" />
-					<set-variable doc:name="409" variableName="httpStatus" value="409" />
+				<on-error-continue doc:name="On Error Continue (duplicate)" type="MULE:DUPLICATE_MESSAGE" logException="false">
+					<flow-ref doc:name="Refer to sf-record-duplicate-charge" name="sf-record-duplicate-charge" />
+					<set-variable doc:name="SET vChargeResult" variableName="vChargeResult" value="duplicate" />
+					<set-variable doc:name="SET httpStatus" variableName="httpStatus" value="409" />
 				</on-error-continue>
 			</error-handler>
 		</try>
-		<ee:transform doc:name="Charge response">
+		<ee:transform doc:name="Build Charge Response">
 			<ee:message>
 				<ee:set-payload><![CDATA[%dw 2.0
 output application/json
 ---
-{ orderId: payload.orderId, result: vars.chargeResult }]]></ee:set-payload>
+{ orderId: payload.orderId, result: vars.vChargeResult }]]></ee:set-payload>
 			</ee:message>
 		</ee:transform>
-		<logger doc:name="Log charge result" level="INFO" message="#['Charge (after) ' ++ vars.chargeResult ++ ', orderId=' ++ payload.orderId ++ ', correlationId=' ++ correlationId]" />
+		<logger doc:name="INFO: Log charge result" level="INFO" message="#['Charge (after) ' ++ vars.vChargeResult ++ ', orderId=' ++ payload.orderId ++ ', correlationId=' ++ correlationId]" />
 	</flow>
 </mule>
