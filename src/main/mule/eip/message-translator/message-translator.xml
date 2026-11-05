@@ -35,7 +35,9 @@
 		whose keys are the header's column names: https://docs.mulesoft.com/dataweave/latest/dataweave-formats-csv
 	-->
 	<flow name="order-translate-partner-csv" doc:description="Message translator: POST /eip/orders/translate takes a partner order as CSV lines and answers it translated into this app's JSON order.">
-		<http:listener doc:name="POST /eip/orders/translate" config-ref="http-listener-config" path="/eip/orders/translate" allowedMethods="POST" />
+		<http:listener doc:name="POST /eip/orders/translate" config-ref="http-listener-config" path="/eip/orders/translate" allowedMethods="POST">
+			<http:response statusCode="#[vars.httpStatus default 200]" />
+		</http:listener>
 		<logger doc:name="INFO: Log partner order received" level="INFO" message="#['Partner order received for translation, correlationId=' ++ correlationId]" />
 		<flow-ref doc:name="Refer to sf-validate-partner-order-csv" name="sf-validate-partner-order-csv" />
 		<ee:transform doc:name="Translate Partner CSV To Order">

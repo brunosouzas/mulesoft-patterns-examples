@@ -34,7 +34,9 @@
 		two target documents it produced.
 	-->
 	<flow name="canonical-order-from-marketplace" doc:description="Canonical data model: POST /eip/canonical/orders/marketplace translates a marketplace JSON order into the canonical order and from it into the invoicing and warehouse documents.">
-		<http:listener doc:name="POST /eip/canonical/orders/marketplace" config-ref="http-listener-config" path="/eip/canonical/orders/marketplace" allowedMethods="POST" />
+		<http:listener doc:name="POST /eip/canonical/orders/marketplace" config-ref="http-listener-config" path="/eip/canonical/orders/marketplace" allowedMethods="POST">
+			<http:response statusCode="#[vars.httpStatus default 200]" />
+		</http:listener>
 		<ee:transform doc:name="Translate Marketplace Order To Canonical">
 			<ee:message>
 				<ee:set-payload><![CDATA[%dw 2.0
@@ -48,7 +50,9 @@ toCanonical(payload)]]></ee:set-payload>
 	</flow>
 
 	<flow name="canonical-order-from-partner" doc:description="Canonical data model: POST /eip/canonical/orders/partner translates a partner XML purchase order into the canonical order and from it into the invoicing and warehouse documents.">
-		<http:listener doc:name="POST /eip/canonical/orders/partner" config-ref="http-listener-config" path="/eip/canonical/orders/partner" allowedMethods="POST" />
+		<http:listener doc:name="POST /eip/canonical/orders/partner" config-ref="http-listener-config" path="/eip/canonical/orders/partner" allowedMethods="POST">
+			<http:response statusCode="#[vars.httpStatus default 200]" />
+		</http:listener>
 		<ee:transform doc:name="Translate Partner Purchase Order To Canonical">
 			<ee:message>
 				<ee:set-payload><![CDATA[%dw 2.0
