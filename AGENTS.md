@@ -10,7 +10,7 @@ Article: none
 - Build: `mvn -B clean package -DskipMunitTests` (what CI runs on every pull request, `.github/workflows/ci.yml`; no credentials needed)
 - Test: `mvn clean test` (MUnit, fails below 80% application coverage; needs the MuleSoft Enterprise repository credentials in `~/.m2/settings.xml`, so it runs locally before each pull request, not in CI)
 - Run locally: `mvn clean package`, run the app on a local Mule 4.9 runtime and call the endpoints in `requests.http`
-- Deliver and verify: `nothing is deployed; CI green on the merge commit, and the paths and requests.http endpoints that 50-writing/solid-in-mulesoft/ and integration-patterns-in-mulesoft/ cite still resolve on main`
+- Deliver and verify: `nothing is deployed; CI green on the merge commit, and the paths and requests.http endpoints that brunosouzas-content: writing/solid-in-mulesoft/ and writing/integration-patterns-in-mulesoft/ cite still resolve on main`
 
 ## Purpose
 
@@ -56,4 +56,4 @@ Before planning, reviewing or changing this project, read [the applicable projec
 - OpenSpec: no: every change takes the small path.
 - Merges stay with Bruno (`rules/README.md`), stricter than the playbook's level 1 on purpose.
 - Releases: none. When an article cites a version, Bruno creates an `article-<slug>` tag (not `v*`).
-- Articles cite this repository (`50-writing/solid-in-mulesoft/`, `50-writing/integration-patterns-in-mulesoft/`): keep the endpoints in `requests.http` and the paths they link answering after a merge.
+- Articles cite this repository (`brunosouzas-content: writing/solid-in-mulesoft/`, `brunosouzas-content: writing/integration-patterns-in-mulesoft/`): keep the endpoints in `requests.http` and the paths they link answering after a merge.
