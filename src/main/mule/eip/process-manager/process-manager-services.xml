@@ -1,0 +1,68 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<mule xmlns="http://www.mulesoft.org/schema/mule/core"
+	xmlns:http="http://www.mulesoft.org/schema/mule/http"
+	xmlns:ee="http://www.mulesoft.org/schema/mule/ee/core"
+	xmlns:doc="http://www.mulesoft.org/schema/mule/documentation"
+	xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+	xsi:schemaLocation="http://www.mulesoft.org/schema/mule/core http://www.mulesoft.org/schema/mule/core/current/mule.xsd
+		http://www.mulesoft.org/schema/mule/http http://www.mulesoft.org/schema/mule/http/current/mule-http.xsd
+		http://www.mulesoft.org/schema/mule/ee/core http://www.mulesoft.org/schema/mule/ee/core/current/mule-ee.xsd">
+
+	<!--
+		PROCESS MANAGER: the processing units, simulated on this application. Each answers 202 at once and
+		replies later, from an Async scope, by POSTing { processId, step, outcome, reference } to the manager's
+		reply endpoint (eip.processManager.replyPath). "The Async scope executes its message processors in a
+		different thread, while the main flow continues"
+		(https://docs.mulesoft.com/mule-runtime/latest/async-scope-reference).
+		POST /eip/process-manager/services/{payment|stock|invoice|refund}
+		Outcomes, from the command so the demo and the tests can choose them:
+		  payment  APPROVED, or DECLINED when amount is above eip.processManager.paymentLimit (1000)
+		  stock    RESERVED, or UNAVAILABLE when the sku starts with SKU-OUT
+		  invoice  ISSUED;  refund  REFUNDED
+		A reply that fails to be sent is lost (logged) and the process stays waiting at the step (the suite's
+		pm-reply-lost-leaves-process-waiting shows it). The refund service always answers REFUNDED; REFUND
+		FAILED, which ends the process COMPENSATION_FAILED, is sent by the test itself.
+	-->
+	<flow name="process-manager-simulated-service" doc:description="Simulated processing unit of the process manager: accepts a step command with 202 and, from an Async scope, posts the step's outcome back to the manager's reply endpoint with the processId.">
+		<http:listener doc:name="POST /eip/process-manager/services/{service}" config-ref="http-listener-config" path="/eip/process-manager/services/{service}" allowedMethods="POST">
+			<http:response statusCode="#[vars.httpStatus default 202]" />
+		</http:listener>
+		<set-variable doc:name="SET vStep" variableName="vStep" value="#[upper(attributes.uriParams.service)]" />
+		<choice doc:name="Check Known Service">
+			<when expression="#[not (['PAYMENT', 'STOCK', 'INVOICE', 'REFUND'] contains vars.vStep)]">
+				<raise-error doc:name="Raise NOT_FOUND Error - Unknown service" type="APP:NOT_FOUND" description="No such service" />
+			</when>
+		</choice>
+		<set-variable doc:name="SET vCommand" variableName="vCommand" value="#[output application/java --- payload]" />
+		<async doc:name="Async Reply Later">
+			<ee:transform doc:name="Perform Step">
+				<ee:message>
+					<ee:set-payload><![CDATA[%dw 2.0
+output application/json
+var c = vars.vCommand
+---
+{
+	processId: c.processId,
+	step: vars.vStep,
+	outcome: vars.vStep match {
+		case "PAYMENT" -> if (c.amount > (p('eip.processManager.paymentLimit') as Number)) "DECLINED" else "APPROVED"
+		case "STOCK" -> if ((c.sku default "") startsWith "SKU-OUT") "UNAVAILABLE" else "RESERVED"
+		case "INVOICE" -> "ISSUED"
+		else -> "REFUNDED"
+	},
+	reference: vars.vStep ++ "-" ++ uuid()
+}]]></ee:set-payload>
+				</ee:message>
+			</ee:transform>
+			<try doc:name="Try Send Reply">
+				<http:request doc:name="POST Reply To Process Manager" config-ref="eip-self-http-request-config" method="POST" path="${eip.processManager.replyPath}" />
+				<error-handler>
+					<on-error-continue doc:name="On Error Continue (reply lost)" type="ANY" logException="false">
+						<logger doc:name="WARN: Log reply lost" level="WARN" message="#['Reply ' ++ vars.vStep ++ ' for process ' ++ (vars.vCommand.processId default '') ++ ' not delivered (' ++ error.errorType.namespace ++ ':' ++ error.errorType.identifier ++ '), correlationId=' ++ correlationId]" />
+					</on-error-continue>
+				</error-handler>
+			</try>
+		</async>
+		<set-payload doc:name="Set Accepted Response" value="#[output application/json --- { processId: vars.vCommand.processId, step: vars.vStep, status: 'ACCEPTED' }]" />
+	</flow>
+</mule>
