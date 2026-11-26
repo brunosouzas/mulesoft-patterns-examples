@@ -27,44 +27,44 @@
 	-->
 
 	<!-- Pending requests by requestId. TTL 1 hour: a callback later than that is treated as unknown. -->
-	<os:object-store name="eip-pending-payment-requests-store" doc:name="Pending payment requests"
+	<os:object-store name="eip-pending-payment-requests-store" doc:name="Pending Payment Requests Object Store"
 		persistent="false" entryTtl="1" entryTtlUnit="HOURS" expirationInterval="5" expirationIntervalUnit="MINUTES" />
 	<!-- Payment status by orderId: PAYMENT_REQUESTED, then PAID, PAYMENT_DECLINED or PAYMENT_REVIEW. -->
-	<os:object-store name="eip-order-payment-status-store" doc:name="Order payment status" persistent="false" />
+	<os:object-store name="eip-order-payment-status-store" doc:name="Order Payment Status Object Store" persistent="false" />
 
 	<!-- Requestor: called by the payment flow after a successful charge. Expects the order as payload and leaves it there. -->
-	<sub-flow name="payment-request-from-provider">
-		<ee:transform doc:name="Build payment request">
+	<sub-flow name="sf-request-payment-from-provider" doc:description="Correlation identifier, requestor: after a charge, stores a pending payment request under its own requestId and sends it to the provider; leaves the order as payload.">
+		<ee:transform doc:name="Build Payment Request">
 			<ee:variables>
-				<ee:set-variable variableName="paymentRequest"><![CDATA[%dw 2.0
+				<ee:set-variable variableName="vPaymentRequest"><![CDATA[%dw 2.0
 output application/java
 ---
 { requestId: "PRQ-" ++ uuid(), orderId: payload.orderId, amount: payload.amount }]]></ee:set-variable>
 			</ee:variables>
 		</ee:transform>
-		<ee:transform doc:name="Build provider request body">
+		<ee:transform doc:name="Build Provider Request Body">
 			<ee:variables>
 				<!-- What is sent: only the ID the provider must send back, and the amount. No orderId. -->
-				<ee:set-variable variableName="providerRequestBody"><![CDATA[%dw 2.0
+				<ee:set-variable variableName="vProviderRequestBody"><![CDATA[%dw 2.0
 output application/java
 ---
-{ requestId: vars.paymentRequest.requestId, amount: vars.paymentRequest.amount }]]></ee:set-variable>
+{ requestId: vars.vPaymentRequest.requestId, amount: vars.vPaymentRequest.amount }]]></ee:set-variable>
 			</ee:variables>
 		</ee:transform>
 		<!-- Stored before the call: the callback can arrive before the provider's 202 does. -->
-		<os:store doc:name="Remember pending request" key="#[vars.paymentRequest.requestId]" objectStore="eip-pending-payment-requests-store">
-			<os:value><![CDATA[#[vars.paymentRequest]]]></os:value>
+		<os:store doc:name="Remember Pending Request" key="#[vars.vPaymentRequest.requestId]" objectStore="eip-pending-payment-requests-store">
+			<os:value><![CDATA[#[vars.vPaymentRequest]]]></os:value>
 		</os:store>
-		<os:store doc:name="Order is waiting for payment" key="#[vars.paymentRequest.orderId]" objectStore="eip-order-payment-status-store">
-			<os:value><![CDATA[#[output application/java --- { orderId: vars.paymentRequest.orderId, status: "PAYMENT_REQUESTED", requestId: vars.paymentRequest.requestId }]]]></os:value>
+		<os:store doc:name="Record Order Waiting For Payment" key="#[vars.vPaymentRequest.orderId]" objectStore="eip-order-payment-status-store">
+			<os:value><![CDATA[#[output application/java --- { orderId: vars.vPaymentRequest.orderId, status: "PAYMENT_REQUESTED", requestId: vars.vPaymentRequest.requestId }]]]></os:value>
 		</os:store>
 		<!-- The order is kept aside and put back after the call, so the caller still has it as payload. -->
-		<set-variable doc:name="Keep the order" variableName="chargedOrder" value="#[payload]" />
-		<http:request doc:name="Send payment request to provider" config-ref="eip-self-http-request-config" method="POST" path="/eip/provider/payments">
-			<http:body><![CDATA[#[output application/json --- vars.providerRequestBody]]]></http:body>
+		<set-variable doc:name="SET vChargedOrder" variableName="vChargedOrder" value="#[payload]" />
+		<http:request doc:name="Send Payment Request To Provider" config-ref="eip-self-http-request-config" method="POST" path="/eip/provider/payments">
+			<http:body><![CDATA[#[output application/json --- vars.vProviderRequestBody]]]></http:body>
 		</http:request>
-		<set-payload doc:name="Order back as payload" value="#[vars.chargedOrder]" />
-		<logger doc:name="Log request sent" level="INFO" message="#['Payment requested, orderId=' ++ vars.paymentRequest.orderId ++ ', requestId=' ++ vars.paymentRequest.requestId ++ ', correlationId=' ++ correlationId]" />
+		<set-payload doc:name="Set Order Back As Payload" value="#[vars.vChargedOrder]" />
+		<logger doc:name="INFO: Log request sent" level="INFO" message="#['Payment requested, orderId=' ++ vars.vPaymentRequest.orderId ++ ', requestId=' ++ vars.vPaymentRequest.requestId ++ ', correlationId=' ++ correlationId]" />
 	</sub-flow>
 
 	<!--
@@ -72,28 +72,28 @@ output application/java
 		approves the payment later, in an async scope, by calling the callback path it was configured with
 		(eip.provider.callbackPath), the way a provider calls a webhook registered with it.
 	-->
-	<flow name="payment-provider-simulator">
+	<flow name="payment-provider-simulator" doc:description="Simulated payment provider: POST /eip/provider/payments answers 202 at once and later approves the payment by calling the configured callback path with correlationId = requestId.">
 		<http:listener doc:name="POST /eip/provider/payments" config-ref="http-listener-config" path="/eip/provider/payments" allowedMethods="POST">
 			<http:response statusCode="#[vars.httpStatus default 202]" />
 		</http:listener>
-		<logger doc:name="Log request received" level="INFO" message="#['Provider received requestId=' ++ (payload.requestId default 'none') ++ ', correlationId=' ++ correlationId]" />
-		<choice doc:name="Valid request?">
+		<logger doc:name="INFO: Log request received" level="INFO" message="#['Provider received requestId=' ++ (payload.requestId default 'none') ++ ', correlationId=' ++ correlationId]" />
+		<choice doc:name="Validate Provider Request">
 			<when expression="#[(not (payload is Object)) or isEmpty(payload.requestId) or not (payload.amount is Number)]">
-				<raise-error doc:name="Bad request" type="APP:BAD_REQUEST" description="requestId and amount (number) are required" />
+				<raise-error doc:name="Raise BAD_REQUEST Error - Missing request fields" type="APP:BAD_REQUEST" description="requestId and amount (number) are required" />
 			</when>
 		</choice>
-		<set-variable doc:name="Provider request" variableName="providerRequest" value="#[payload]" />
-		<async doc:name="Approve later">
-			<http:request doc:name="Call back the requestor" config-ref="eip-self-http-request-config" method="POST" path="${eip.provider.callbackPath}">
+		<set-variable doc:name="SET vProviderRequest" variableName="vProviderRequest" value="#[payload]" />
+		<async doc:name="Approve Payment Later">
+			<http:request doc:name="Call Back The Requestor" config-ref="eip-self-http-request-config" method="POST" path="${eip.provider.callbackPath}">
 				<http:body><![CDATA[#[output application/json --- {
-	correlationId: vars.providerRequest.requestId,
+	correlationId: vars.vProviderRequest.requestId,
 	status: "APPROVED",
-	approvedAmount: vars.providerRequest.amount,
+	approvedAmount: vars.vProviderRequest.amount,
 	providerReference: "PRV-" ++ uuid()
 }]]]></http:body>
 			</http:request>
 		</async>
-		<set-payload doc:name="Accepted" value="#[output application/json --- { requestId: vars.providerRequest.requestId, status: 'ACCEPTED' }]" />
+		<set-payload doc:name="Set Accepted Response" value="#[output application/json --- { requestId: vars.vProviderRequest.requestId, status: 'ACCEPTED' }]" />
 	</flow>
 
 	<!--
@@ -121,83 +121,83 @@ output application/java
 		The cost of claiming first: if updating the order fails after the claim, the provider's retry gets
 		404 and the order stays PAYMENT_REQUESTED until someone checks it.
 	-->
-	<flow name="payment-confirm-from-provider-callback">
+	<flow name="payment-confirm-from-provider-callback" doc:description="Correlation identifier, callback: POST /eip/payments/callback matches the provider's answer to its pending request by correlationId, claims it, and records PAID, PAYMENT_DECLINED or PAYMENT_REVIEW on the order; 404 when nothing is pending.">
 		<http:listener doc:name="POST /eip/payments/callback" config-ref="http-listener-config" path="/eip/payments/callback" allowedMethods="POST">
 			<http:response statusCode="#[vars.httpStatus default 200]" />
 		</http:listener>
-		<logger doc:name="Log callback received" level="INFO" message="#['Provider callback for requestId=' ++ (payload.correlationId default 'none') ++ ', correlationId=' ++ correlationId]" />
-		<choice doc:name="Valid callback?">
+		<logger doc:name="INFO: Log callback received" level="INFO" message="#['Provider callback for requestId=' ++ (payload.correlationId default 'none') ++ ', correlationId=' ++ correlationId]" />
+		<choice doc:name="Validate Callback">
 			<when expression="#[(not (payload is Object)) or isEmpty(payload.correlationId)]">
-				<raise-error doc:name="Bad request" type="APP:BAD_REQUEST" description="correlationId is required" />
+				<raise-error doc:name="Raise BAD_REQUEST Error - Missing correlationId" type="APP:BAD_REQUEST" description="correlationId is required" />
 			</when>
 		</choice>
-		<set-variable doc:name="Callback" variableName="callback" value="#[payload]" />
-		<set-variable doc:name="Not matched yet" variableName="unmatched" value="#[false]" />
+		<set-variable doc:name="SET vCallback" variableName="vCallback" value="#[payload]" />
+		<set-variable doc:name="SET vUnmatched" variableName="vUnmatched" value="#[false]" />
 		<!-- Set only by a successful retrieve below; tells a lost claim apart from an unknown correlationId. -->
-		<remove-variable doc:name="No pending request read yet" variableName="pendingRequest" />
-		<try doc:name="Match and claim the pending request">
-			<os:retrieve doc:name="Find pending request" key="#[vars.callback.correlationId]" objectStore="eip-pending-payment-requests-store" target="pendingRequest" />
-			<os:remove doc:name="Claim the pending request" key="#[vars.callback.correlationId]" objectStore="eip-pending-payment-requests-store" />
+		<remove-variable doc:name="Remove vPendingRequest" variableName="vPendingRequest" />
+		<try doc:name="Try Match And Claim Pending Request">
+			<os:retrieve doc:name="Find Pending Request" key="#[vars.vCallback.correlationId]" objectStore="eip-pending-payment-requests-store" target="vPendingRequest" />
+			<os:remove doc:name="Claim Pending Request" key="#[vars.vCallback.correlationId]" objectStore="eip-pending-payment-requests-store" />
 			<error-handler>
 				<!-- Unknown, expired, already matched, or claimed by another copy in between: all the same 404. -->
-				<on-error-continue doc:name="No pending request" type="OS:KEY_NOT_FOUND" logException="false">
-					<set-variable doc:name="Not matched" variableName="unmatched" value="#[true]" />
+				<on-error-continue doc:name="On Error Continue (no pending request)" type="OS:KEY_NOT_FOUND" logException="false">
+					<set-variable doc:name="SET vUnmatched" variableName="vUnmatched" value="#[true]" />
 				</on-error-continue>
 			</error-handler>
 		</try>
-		<choice doc:name="Matched?">
-			<when expression="#[(vars.unmatched default false) and vars.pendingRequest != null]">
+		<choice doc:name="Check Callback Matched">
+			<when expression="#[(vars.vUnmatched default false) and vars.vPendingRequest != null]">
 				<!-- The retrieve found the request but the remove did not: another copy claimed it in between. -->
-				<logger doc:name="Log lost claim" level="WARN" message="#['Provider callback lost the claim (concurrent duplicate), correlationId in body=' ++ vars.callback.correlationId ++ ', correlationId=' ++ correlationId]" />
-				<raise-error doc:name="Claimed by another copy" type="APP:NOT_FOUND" description="No pending payment request for this correlationId" />
+				<logger doc:name="WARN: Log lost claim" level="WARN" message="#['Provider callback lost the claim (concurrent duplicate), correlationId in body=' ++ vars.vCallback.correlationId ++ ', correlationId=' ++ correlationId]" />
+				<raise-error doc:name="Raise NOT_FOUND Error - Claimed by another copy" type="APP:NOT_FOUND" description="No pending payment request for this correlationId" />
 			</when>
-			<when expression="#[vars.unmatched default false]">
-				<logger doc:name="Log unmatched callback" level="WARN" message="#['Unmatched provider callback, correlationId in body=' ++ vars.callback.correlationId ++ ', correlationId=' ++ correlationId]" />
-				<raise-error doc:name="Unknown correlationId" type="APP:NOT_FOUND" description="No pending payment request for this correlationId" />
+			<when expression="#[vars.vUnmatched default false]">
+				<logger doc:name="WARN: Log unmatched callback" level="WARN" message="#['Unmatched provider callback, correlationId in body=' ++ vars.vCallback.correlationId ++ ', correlationId=' ++ correlationId]" />
+				<raise-error doc:name="Raise NOT_FOUND Error - Unknown correlationId" type="APP:NOT_FOUND" description="No pending payment request for this correlationId" />
 			</when>
 		</choice>
-		<choice doc:name="Route on callback status">
-			<when expression="#[vars.callback.status == 'APPROVED' and vars.callback.approvedAmount == vars.pendingRequest.amount]">
-				<set-variable doc:name="Paid" variableName="outcome" value="#[{ status: 'PAID' }]" />
+		<choice doc:name="Route On Callback Status">
+			<when expression="#[vars.vCallback.status == 'APPROVED' and vars.vCallback.approvedAmount == vars.vPendingRequest.amount]">
+				<set-variable doc:name="SET vOutcome (PAID)" variableName="vOutcome" value="#[{ status: 'PAID' }]" />
 			</when>
-			<when expression="#[vars.callback.status == 'DECLINED']">
-				<set-variable doc:name="Declined" variableName="outcome" value="#[{ status: 'PAYMENT_DECLINED' }]" />
+			<when expression="#[vars.vCallback.status == 'DECLINED']">
+				<set-variable doc:name="SET vOutcome (PAYMENT_DECLINED)" variableName="vOutcome" value="#[{ status: 'PAYMENT_DECLINED' }]" />
 			</when>
-			<when expression="#[vars.callback.status == 'APPROVED']">
-				<set-variable doc:name="Review: amount mismatch" variableName="outcome" value="#[{ status: 'PAYMENT_REVIEW', reviewReason: 'AMOUNT_MISMATCH' }]" />
+			<when expression="#[vars.vCallback.status == 'APPROVED']">
+				<set-variable doc:name="SET vOutcome (PAYMENT_REVIEW, AMOUNT_MISMATCH)" variableName="vOutcome" value="#[{ status: 'PAYMENT_REVIEW', reviewReason: 'AMOUNT_MISMATCH' }]" />
 			</when>
 			<otherwise>
-				<set-variable doc:name="Review: unknown status" variableName="outcome" value="#[{ status: 'PAYMENT_REVIEW', reviewReason: 'UNKNOWN_STATUS' }]" />
+				<set-variable doc:name="SET vOutcome (PAYMENT_REVIEW, UNKNOWN_STATUS)" variableName="vOutcome" value="#[{ status: 'PAYMENT_REVIEW', reviewReason: 'UNKNOWN_STATUS' }]" />
 			</otherwise>
 		</choice>
-		<os:store doc:name="Record payment outcome" key="#[vars.pendingRequest.orderId]" objectStore="eip-order-payment-status-store">
+		<os:store doc:name="Record Payment Outcome" key="#[vars.vPendingRequest.orderId]" objectStore="eip-order-payment-status-store">
 			<os:value><![CDATA[#[output application/java --- {
-	orderId: vars.pendingRequest.orderId,
-	status: vars.outcome.status,
-	(reviewReason: vars.outcome.reviewReason) if (vars.outcome.reviewReason != null),
-	requestId: vars.pendingRequest.requestId,
-	requestedAmount: vars.pendingRequest.amount,
-	providerStatus: vars.callback.status default null,
-	approvedAmount: vars.callback.approvedAmount default null,
-	providerReference: vars.callback.providerReference default null
+	orderId: vars.vPendingRequest.orderId,
+	status: vars.vOutcome.status,
+	(reviewReason: vars.vOutcome.reviewReason) if (vars.vOutcome.reviewReason != null),
+	requestId: vars.vPendingRequest.requestId,
+	requestedAmount: vars.vPendingRequest.amount,
+	providerStatus: vars.vCallback.status default null,
+	approvedAmount: vars.vCallback.approvedAmount default null,
+	providerReference: vars.vCallback.providerReference default null
 }]]]></os:value>
 		</os:store>
-		<logger doc:name="Log payment outcome" level="INFO" message="#['Payment outcome ' ++ vars.outcome.status ++ ', orderId=' ++ vars.pendingRequest.orderId ++ ', requestId=' ++ vars.callback.correlationId ++ ', correlationId=' ++ correlationId]" />
-		<set-payload doc:name="Matched" value="#[output application/json --- { result: 'MATCHED', orderStatus: vars.outcome.status }]" />
+		<logger doc:name="INFO: Log payment outcome" level="INFO" message="#['Payment outcome ' ++ vars.vOutcome.status ++ ', orderId=' ++ vars.vPendingRequest.orderId ++ ', requestId=' ++ vars.vCallback.correlationId ++ ', correlationId=' ++ correlationId]" />
+		<set-payload doc:name="Set Matched Response" value="#[output application/json --- { result: 'MATCHED', orderStatus: vars.vOutcome.status }]" />
 	</flow>
 
 	<!-- GET /eip/payments/{orderId}/status: PAYMENT_REQUESTED, PAID, PAYMENT_DECLINED or PAYMENT_REVIEW; 404 when no payment was requested. -->
-	<flow name="payment-get-status">
+	<flow name="payment-get-status" doc:description="GET /eip/payments/{orderId}/status: the order's payment status; 404 when no payment was requested.">
 		<http:listener doc:name="GET /eip/payments/{orderId}/status" config-ref="http-listener-config" path="/eip/payments/{orderId}/status" allowedMethods="GET">
 			<http:response statusCode="#[vars.httpStatus default 200]" />
 		</http:listener>
-		<os:contains doc:name="Known order?" key="#[attributes.uriParams.orderId]" objectStore="eip-order-payment-status-store" target="known" />
-		<choice doc:name="Found?">
-			<when expression="#[not vars.known]">
-				<raise-error doc:name="Not found" type="APP:NOT_FOUND" description="No payment for this order" />
+		<os:contains doc:name="Check Order Known" key="#[attributes.uriParams.orderId]" objectStore="eip-order-payment-status-store" target="vKnown" />
+		<choice doc:name="Check Order Found">
+			<when expression="#[not vars.vKnown]">
+				<raise-error doc:name="Raise NOT_FOUND Error - No payment for order" type="APP:NOT_FOUND" description="No payment for this order" />
 			</when>
 		</choice>
-		<os:retrieve doc:name="Read status" key="#[attributes.uriParams.orderId]" objectStore="eip-order-payment-status-store" />
-		<set-payload doc:name="Status as JSON" value="#[output application/json --- payload]" />
+		<os:retrieve doc:name="Read Payment Status" key="#[attributes.uriParams.orderId]" objectStore="eip-order-payment-status-store" />
+		<set-payload doc:name="Set Status As JSON" value="#[output application/json --- payload]" />
 	</flow>
 </mule>

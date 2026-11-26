@@ -2,11 +2,13 @@
 <mule xmlns="http://www.mulesoft.org/schema/mule/core"
 	xmlns:munit="http://www.mulesoft.org/schema/mule/munit"
 	xmlns:munit-tools="http://www.mulesoft.org/schema/mule/munit-tools"
+	xmlns:http="http://www.mulesoft.org/schema/mule/http"
 	xmlns:doc="http://www.mulesoft.org/schema/mule/documentation"
 	xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
 	xsi:schemaLocation="http://www.mulesoft.org/schema/mule/core http://www.mulesoft.org/schema/mule/core/current/mule.xsd
 		http://www.mulesoft.org/schema/mule/munit http://www.mulesoft.org/schema/mule/munit/current/mule-munit.xsd
-		http://www.mulesoft.org/schema/mule/munit-tools http://www.mulesoft.org/schema/mule/munit-tools/current/mule-munit-tools.xsd">
+		http://www.mulesoft.org/schema/mule/munit-tools http://www.mulesoft.org/schema/mule/munit-tools/current/mule-munit-tools.xsd
+		http://www.mulesoft.org/schema/mule/http http://www.mulesoft.org/schema/mule/http/current/mule-http.xsd">
 
 	<!--
 		Message translator: a partner order in CSV (one row per line) becomes this app's JSON order. The tests show the
@@ -67,6 +69,34 @@
 		</munit:execution>
 		<munit:validation>
 			<munit-tools:assert-that doc:name="400" expression="#[vars.httpStatus as Number]" is="#[MunitTools::equalTo(400)]" />
+		</munit:validation>
+	</munit:test>
+	<munit:test name="mt-over-http-error-answers-400-and-success-200" description="Message translator over HTTP: the listener answers the status the error handler set, so an unknown product code is 400 in JSON, not 200; a valid order is 200">
+		<munit:enable-flow-sources>
+			<munit:enable-flow-source value="order-translate-partner-csv" />
+		</munit:enable-flow-sources>
+		<munit:execution>
+			<http:request doc:name="POST valid CSV" config-ref="eip-self-http-request-config" method="POST" path="/eip/orders/translate" target="vOk" targetValue="#[output application/java --- { status: attributes.statusCode, contentType: attributes.headers.'content-type' default '', body: payload }]">
+				<http:body><![CDATA[#[output text/plain --- 'partnerOrderRef,buyerCode,shipToCountry,productCode,qty,unitPriceCents\nP-81,B-100,BR,BOOK-01,2,3000\n']]]></http:body>
+				<http:headers><![CDATA[#[{ 'Content-Type': 'application/csv' }]]]></http:headers>
+				<http:response-validator>
+					<http:success-status-code-validator values="200..599" />
+				</http:response-validator>
+			</http:request>
+			<http:request doc:name="POST unknown product CSV" config-ref="eip-self-http-request-config" method="POST" path="/eip/orders/translate" target="vBad" targetValue="#[output application/java --- { status: attributes.statusCode, contentType: attributes.headers.'content-type' default '', body: payload }]">
+				<http:body><![CDATA[#[output text/plain --- 'partnerOrderRef,buyerCode,shipToCountry,productCode,qty,unitPriceCents\nP-82,B-100,BR,LAMP-99,1,5000\n']]]></http:body>
+				<http:headers><![CDATA[#[{ 'Content-Type': 'application/csv' }]]]></http:headers>
+				<http:response-validator>
+					<http:success-status-code-validator values="200..599" />
+				</http:response-validator>
+			</http:request>
+		</munit:execution>
+		<munit:validation>
+			<munit-tools:assert-that doc:name="Valid 200" expression="#[vars.vOk.status]" is="#[MunitTools::equalTo(200)]" />
+			<munit-tools:assert-that doc:name="Valid order id" expression="#[vars.vOk.body.orderId]" is="#[MunitTools::equalTo('ORD-P-81')]" />
+			<munit-tools:assert-that doc:name="Unknown code 400" expression="#[vars.vBad.status]" is="#[MunitTools::equalTo(400)]" />
+			<munit-tools:assert-that doc:name="JSON" expression="#[vars.vBad.contentType]" is="#[MunitTools::startsWith('application/json')]" />
+			<munit-tools:assert-that doc:name="Names the code" expression="#[vars.vBad.body.error]" is="#[MunitTools::equalTo('unknown product code: LAMP-99')]" />
 		</munit:validation>
 	</munit:test>
 </mule>
