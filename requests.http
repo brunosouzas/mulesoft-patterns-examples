@@ -343,3 +343,20 @@ Content-Type: application/json
 
 ###
 GET {{base}}/eip/invoices/invalid-messages
+
+### EIP process manager — start a process (amount above 1000 is declined; sku SKU-OUT... is out of stock), then read it
+POST {{base}}/eip/process-manager/orders
+Content-Type: application/json
+
+{ "orderId": "ORD-6101", "amount": 120, "sku": "SKU-BOOK", "quantity": 2 }
+
+###
+# Replace PM-... with the processId from the response above
+GET {{base}}/eip/process-manager/processes/PM-replace-me
+
+###
+# A late reply after the process ended gets 409; an unknown processId 404
+POST {{base}}/eip/process-manager/replies
+Content-Type: application/json
+
+{ "processId": "PM-replace-me", "step": "INVOICE", "outcome": "ISSUED" }
