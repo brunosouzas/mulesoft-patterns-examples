@@ -156,3 +156,190 @@ POST {{base}}/eip/orders/checks
 Content-Type: application/json
 
 { "orderId": "ORD-3501", "customerId": "CUS-100", "items": [ { "sku": "SKU-BOOK", "quantity": 2, "unitPrice": 30 }, { "sku": "SKU-MUG", "quantity": 1, "unitPrice": 12.5 } ] }
+
+### EIP message translator — a partner order as CSV becomes this app's order
+POST {{base}}/eip/orders/translate
+Content-Type: application/csv
+
+partnerOrderRef,buyerCode,shipToCountry,productCode,qty,unitPriceCents
+P-77,B-100,BR,BOOK-01,2,3000
+P-77,B-100,BR,MUG-02,1,1250
+
+### EIP canonical data model — a marketplace JSON order: canonical order, invoicing request, warehouse CSV
+POST {{base}}/eip/canonical/orders/marketplace
+Content-Type: application/json
+
+{ "id": "MK-501", "buyer": { "accountId": "A-9" }, "shipping": { "country": "BR" }, "lines": [ { "listing": { "sku": "SKU-BOOK" }, "units": 2, "price": { "amount": "30.00", "currency": "BRL" } }, { "listing": { "sku": "SKU-MUG" }, "units": 1, "price": { "amount": "12.50", "currency": "BRL" } } ] }
+
+### ...the same order as a partner XML purchase order gives the same target documents
+POST {{base}}/eip/canonical/orders/partner
+Content-Type: application/xml
+
+<PurchaseOrder number="PO-77" currency="BRL"><Customer code="A-9"/><ShipTo country="BR"/><Lines><Line sku="SKU-BOOK" quantity="2" unitPrice="30.00"/><Line sku="SKU-MUG" quantity="1" unitPrice="12.50"/></Lines></PurchaseOrder>
+
+### EIP content filter — invoicing gets only what it needs (no card, contact or cost data)
+POST {{base}}/eip/billing/invoice-requests
+Content-Type: application/json
+
+{ "orderId": "ORD-3601", "customer": { "id": "CUS-100", "name": "Ana Lima", "email": "ana@example.com", "phone": "+55 11 99999-0000", "taxId": "123.456.789-09", "address": { "street": "Rua A, 1", "city": "Sao Paulo", "country": "BR" } }, "payment": { "method": "CARD", "authorizationCode": "AUTH-777", "card": { "number": "4111111111111111", "holder": "ANA LIMA", "expiry": "12/29" } }, "items": [ { "sku": "SKU-BOOK", "quantity": 2, "unitPrice": 30, "unitCost": 18, "supplier": "SUP-1" } ], "internalNotes": "VIP" }
+
+### What invoicing received
+GET {{base}}/eip/invoicing/invoices/ORD-3601
+
+### EIP claim check — check a document in; the archive gets only the claim key (the claim expires after 3 seconds)
+POST {{base}}/eip/orders/documents
+Content-Type: application/json
+
+{ "orderId": "ORD-3701", "document": { "fileName": "po-3701.pdf", "mediaType": "application/pdf", "contentBase64": "JVBERi0xLjQKJcfsj6IKMSAwIG9iago8PC9UeXBlL0NhdGFsb2c+PgplbmRvYmoK" } }
+
+### Check the document out: replace the key with the claimKey above (404 once it has expired)
+GET {{base}}/eip/orders/documents/CLM-replace-with-the-claim-key
+
+### EIP content enricher — the order gains the customer from the CRM
+POST {{base}}/eip/orders/enrich
+Content-Type: application/json
+
+{ "orderId": "ORD-3801", "customerId": "CUS-100", "items": [ { "sku": "SKU-BOOK", "quantity": 2, "unitPrice": 30 } ] }
+
+### The CRM is down for CUS-DOWN... customers: 503, enrichment FAILED
+POST {{base}}/eip/orders/enrich
+Content-Type: application/json
+
+{ "orderId": "ORD-3802", "customerId": "CUS-DOWN-1", "items": [ { "sku": "SKU-BOOK", "quantity": 2, "unitPrice": 30 } ] }
+
+### EIP request-reply — synchronous: the requestor waits for the warehouse (waitedMillis >= 300)
+POST {{base}}/eip/stock/reservations/sync
+Content-Type: application/json
+
+{ "orderId": "ORD-4101", "sku": "SKU-BOOK", "quantity": 2 }
+
+### Asynchronous: 202 PENDING now, the warehouse calls the reply channel later
+POST {{base}}/eip/stock/reservations/async
+Content-Type: application/json
+
+{ "orderId": "ORD-4102", "sku": "SKU-MUG", "quantity": 1 }
+
+###
+GET {{base}}/eip/stock/reservation-replies/ORD-4102
+
+### EIP return address — the invoice goes to the address in X-Reply-To
+POST {{base}}/eip/invoice-requests
+Content-Type: application/json
+X-Reply-To: /eip/requestors/checkout/invoice-replies
+
+{ "orderId": "ORD-4201", "amount": 72.5 }
+
+###
+POST {{base}}/eip/invoice-requests
+Content-Type: application/json
+X-Reply-To: /eip/requestors/backoffice/invoice-replies
+
+{ "orderId": "ORD-4202", "amount": 30 }
+
+###
+GET {{base}}/eip/requestors/checkout/invoice-replies
+
+###
+GET {{base}}/eip/requestors/backoffice/invoice-replies
+
+### EIP event-driven consumer — processed when it arrives
+POST {{base}}/eip/payment-events
+Content-Type: application/json
+
+{ "eventId": "EVT-4301", "orderId": "ORD-4301", "type": "PAYMENT_CONFIRMED" }
+
+###
+GET {{base}}/eip/payment-events/ORD-4301
+
+### EIP polling consumer — added now, allocated by the next poll (every second)
+POST {{base}}/eip/stock/pending-orders
+Content-Type: application/json
+
+{ "orderId": "ORD-4401" }
+
+###
+GET {{base}}/eip/stock/polled-orders
+
+### EIP competing consumers — put work on the list, then run three consumers at once
+POST {{base}}/eip/invoice-work/items
+Content-Type: application/json
+
+{ "orderIds": ["ORD-4501", "ORD-4502", "ORD-4503", "ORD-4504", "ORD-4505", "ORD-4506"] }
+
+###
+POST {{base}}/eip/invoice-work/runs
+Content-Type: application/json
+
+{ "consumers": 3 }
+
+###
+GET {{base}}/eip/invoice-work/items/ORD-4503
+
+### EIP channel adapter — the legacy ERP's CSV, and the same order through the adapter
+GET {{base}}/eip/legacy/orders/ORD-LEGACY-1001
+
+###
+GET {{base}}/eip/adapters/legacy-orders/ORD-LEGACY-1001
+
+### EIP guaranteed delivery — stored first, forwarded by the Scheduler (every second)
+PUT {{base}}/eip/fulfilment/availability
+Content-Type: application/json
+
+{ "available": false }
+
+###
+POST {{base}}/eip/orders/guaranteed
+Content-Type: application/json
+
+{ "orderId": "ORD-5101", "amount": 120 }
+
+###
+GET {{base}}/eip/orders/guaranteed/ORD-5101
+
+###
+PUT {{base}}/eip/fulfilment/availability
+Content-Type: application/json
+
+{ "available": true }
+
+###
+GET {{base}}/eip/fulfilment/orders/ORD-5101
+
+### EIP transactional client — before: Try with ALWAYS_BEGIN; after: compensation
+POST {{base}}/eip/payments/transactional/before
+Content-Type: application/json
+
+{ "orderId": "ORD-5201", "amount": 50 }
+
+###
+POST {{base}}/eip/payments/transactional/after
+Content-Type: application/json
+
+{ "orderId": "ORD-5202", "amount": 70 }
+
+###
+GET {{base}}/eip/payments/transactional/ORD-5201
+
+### EIP message expiration — set expiresAt a few seconds ahead, or in the past
+POST {{base}}/eip/stock/expiring-requests
+Content-Type: application/json
+
+{ "orderId": "ORD-5301", "sku": "SKU-BOOK", "quantity": 1, "expiresAt": "2020-01-01T00:00:00Z" }
+
+###
+GET {{base}}/eip/stock/expiring-requests/ORD-5301
+
+### EIP invalid message channel — a valid request, a malformed one, then the channel
+POST {{base}}/eip/invoices/requests
+Content-Type: application/json
+
+{ "orderId": "ORD-5401", "amount": 99.9, "currency": "BRL" }
+
+###
+POST {{base}}/eip/invoices/requests
+Content-Type: application/json
+
+{ "orderId": "ORD-5402", "amount":
+
+###
+GET {{base}}/eip/invoices/invalid-messages

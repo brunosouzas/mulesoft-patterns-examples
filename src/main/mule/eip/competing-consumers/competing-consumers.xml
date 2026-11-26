@@ -1,0 +1,166 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<mule xmlns="http://www.mulesoft.org/schema/mule/core"
+	xmlns:http="http://www.mulesoft.org/schema/mule/http"
+	xmlns:os="http://www.mulesoft.org/schema/mule/os"
+	xmlns:ee="http://www.mulesoft.org/schema/mule/ee/core"
+	xmlns:doc="http://www.mulesoft.org/schema/mule/documentation"
+	xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+	xsi:schemaLocation="http://www.mulesoft.org/schema/mule/core http://www.mulesoft.org/schema/mule/core/current/mule.xsd
+		http://www.mulesoft.org/schema/mule/http http://www.mulesoft.org/schema/mule/http/current/mule-http.xsd
+		http://www.mulesoft.org/schema/mule/os http://www.mulesoft.org/schema/mule/os/current/mule-os.xsd
+		http://www.mulesoft.org/schema/mule/ee/core http://www.mulesoft.org/schema/mule/ee/core/current/mule-ee.xsd">
+
+	<!--
+		COMPETING CONSUMERS (Hohpe and Woolf): several consumers take work from one shared source, so the work is
+		spread among them, and each message goes to one of them. In the book the consumers are receivers on one
+		point-to-point channel and the messaging system delivers each message to only one; without a broker, the
+		claims store below stands in for that single delivery. Here: invoices to issue are put on
+		a shared work list, and several invoicing consumers run at the same time and take items from it.
+		POST /eip/invoice-work/items                        puts orders on the work list
+		POST /eip/invoice-work/runs                         starts N consumers at once (default eip.competingConsumers.consumers)
+		POST /eip/invoice-work/consumers/{consumerId}/runs  one consumer: takes every item it can claim and issues its invoice
+		GET  /eip/invoice-work/items/{orderId}              which consumer took the item and how many invoices were issued
+
+		The consumers run concurrently: the runs flow calls them from a Parallel For Each
+		(https://docs.mulesoft.com/mule-runtime/latest/parallel-foreach-scope), and the consumer flow's
+		maxConcurrency is the number of consumers ("Sets the maximum number of concurrent messages that a flow can
+		process": https://docs.mulesoft.com/mule-runtime/latest/flow-component).
+
+		Every consumer sees every item, so something must make sure only one of them takes each. That is an
+		atomic claim: os:store with failIfPresent="true" on a claims store, keyed by orderId. "If the parameter is
+		set to true, then an OS:KEY_ALREADY_EXISTS error is thrown instead", and the store "is synchronized on the
+		key level" (https://docs.mulesoft.com/object-store-connector/latest/object-store-connector-reference): the
+		first consumer to store the key owns the item; the others get OS:KEY_ALREADY_EXISTS and move on.
+		If invoicing a claimed item fails, the consumer removes its claim (os:remove) and the error ends its run,
+		so a later run claims and invoices the item again (cc-failed-item-is-processed-on-the-next-run). The
+		release runs only in the error handler: nothing here frees the claim of a consumer that stops between
+		claim and invoice (a broker would redeliver its message).
+		The same page warns that across nodes this holds only when the runtime is clustered: "Running the same
+		application with store operations across multiple nodes without clustering enabled might lead to
+		inconsistent results due to the absence of coordinated locking."
+
+		With a queue the broker does the claiming: it delivers each message to one of the listeners or subscribers
+		on the queue (VM Listener, Anypoint MQ Subscriber, whose docs talk of "competing consumers":
+		https://docs.mulesoft.com/anypoint-mq-connector/latest/anypoint-mq-listener), and the flow needs no claims
+		store. A queue is not simulated here: this project does not stand in a VM queue for a broker.
+	-->
+	<os:object-store name="eip-invoice-work-store" doc:name="Invoice Work List Object Store" persistent="false" />
+	<os:object-store name="eip-invoice-work-claims-store" doc:name="Invoice Work Claims Object Store" persistent="false" />
+	<os:object-store name="eip-invoice-work-issued-store" doc:name="Invoice Work Issued Object Store" persistent="false" />
+
+	<flow name="invoice-work-add-items" doc:description="Competing consumers: puts orders on the shared invoice work list.">
+		<http:listener doc:name="POST /eip/invoice-work/items" config-ref="http-listener-config" path="/eip/invoice-work/items" allowedMethods="POST">
+			<http:response statusCode="#[vars.httpStatus default 202]" />
+		</http:listener>
+		<choice doc:name="Validate Work Items">
+			<when expression="#[(not (payload is Object)) or (not (payload.orderIds is Array)) or isEmpty(payload.orderIds)]">
+				<raise-error doc:name="Raise BAD_REQUEST Error - Missing orderIds" type="APP:BAD_REQUEST" description="a non-empty orderIds array is required" />
+			</when>
+		</choice>
+		<set-variable doc:name="SET vOrderIds" variableName="vOrderIds" value="#[output application/java --- payload.orderIds]" />
+		<foreach doc:name="For Each Order Id" collection="#[vars.vOrderIds]">
+			<os:store doc:name="Store Work Item" key="#[payload]" objectStore="eip-invoice-work-store">
+				<os:value><![CDATA[#[output application/java --- { orderId: payload, addedAt: now() as String }]]]></os:value>
+			</os:store>
+		</foreach>
+		<set-payload doc:name="Set Queued Response" value="#[output application/json --- { queued: vars.vOrderIds }]" />
+	</flow>
+
+	<flow name="invoice-work-start-consumers" doc:description="Competing consumers: starts the consumers at the same time, from a Parallel For Each, and reports what each one processed.">
+		<http:listener doc:name="POST /eip/invoice-work/runs" config-ref="http-listener-config" path="/eip/invoice-work/runs" allowedMethods="POST">
+			<http:response statusCode="#[vars.httpStatus default 200]" />
+		</http:listener>
+		<set-variable doc:name="SET vConsumers" variableName="vConsumers" value="#[output application/java --- (if (payload is Object) payload.consumers else null) default (p('eip.competingConsumers.consumers') as Number)]" />
+		<choice doc:name="Validate Consumers">
+			<when expression="#[not ((vars.vConsumers is Number) and vars.vConsumers &gt;= 1 and vars.vConsumers &lt;= (p('eip.competingConsumers.consumers') as Number))]">
+				<raise-error doc:name="Raise BAD_REQUEST Error - Bad consumers" type="APP:BAD_REQUEST" description="consumers must be a number from 1 to the configured eip.competingConsumers.consumers" />
+			</when>
+		</choice>
+		<parallel-foreach doc:name="Parallel For Each Consumer" collection="#[1 to vars.vConsumers]">
+			<http:request doc:name="POST Run Consumer" config-ref="eip-self-http-request-config" method="POST" path="/eip/invoice-work/consumers/{consumerId}/runs">
+				<http:uri-params><![CDATA[#[output application/java --- { consumerId: "consumer-" ++ (payload as String) }]]]></http:uri-params>
+			</http:request>
+		</parallel-foreach>
+		<ee:transform doc:name="Build Runs Response">
+			<ee:message>
+				<ee:set-payload><![CDATA[%dw 2.0
+output application/json
+var runs = payload map $.payload
+---
+{
+	consumers: runs,
+	processedTotal: sum(runs map sizeOf($.processed))
+}]]></ee:set-payload>
+			</ee:message>
+		</ee:transform>
+	</flow>
+
+	<flow name="invoice-work-consumer" maxConcurrency="${eip.competingConsumers.consumers}" doc:description="Competing consumer: walks the shared work list, claims each item atomically (os:store failIfPresent) and issues the invoice only for the items it claimed; a failed invoice releases the claim.">
+		<http:listener doc:name="POST /eip/invoice-work/consumers/{consumerId}/runs" config-ref="http-listener-config" path="/eip/invoice-work/consumers/{consumerId}/runs" allowedMethods="POST">
+			<http:response statusCode="#[vars.httpStatus default 200]" />
+		</http:listener>
+		<set-variable doc:name="SET vConsumerId" variableName="vConsumerId" value="#[attributes.uriParams.consumerId]" />
+		<set-variable doc:name="SET vProcessed" variableName="vProcessed" value="#[[]]" />
+		<set-variable doc:name="SET vAlreadyClaimed" variableName="vAlreadyClaimed" value="#[0]" />
+		<os:retrieve-all-keys doc:name="Read Work List" objectStore="eip-invoice-work-store" />
+		<foreach doc:name="For Each Work Item" collection="#[payload orderBy $]">
+			<set-variable doc:name="SET vOrderId" variableName="vOrderId" value="#[payload]" />
+			<try doc:name="Try Claim Work Item">
+				<os:store doc:name="Claim Work Item" key="#[vars.vOrderId]" objectStore="eip-invoice-work-claims-store" failIfPresent="true">
+					<os:value><![CDATA[#[output application/java --- { orderId: vars.vOrderId, consumer: vars.vConsumerId, claimedAt: now() as String }]]]></os:value>
+				</os:store>
+				<flow-ref doc:name="Refer to sf-issue-claimed-invoice" name="sf-issue-claimed-invoice" />
+				<set-variable doc:name="SET vProcessed" variableName="vProcessed" value="#[output application/java --- vars.vProcessed ++ [vars.vOrderId]]" />
+				<error-handler>
+					<on-error-continue doc:name="On Error Continue (claimed by another consumer)" type="OS:KEY_ALREADY_EXISTS" logException="false">
+						<set-variable doc:name="SET vAlreadyClaimed" variableName="vAlreadyClaimed" value="#[vars.vAlreadyClaimed + 1]" />
+					</on-error-continue>
+					<on-error-propagate doc:name="On Error Propagate (invoicing failed, release the claim)">
+						<os:remove doc:name="Release Claim" key="#[vars.vOrderId]" objectStore="eip-invoice-work-claims-store" />
+						<logger doc:name="WARN: Log claim released" level="WARN" message="#['Consumer ' ++ vars.vConsumerId ++ ' released ' ++ vars.vOrderId ++ ' after ' ++ error.errorType.namespace ++ ':' ++ error.errorType.identifier ++ ', correlationId=' ++ correlationId]" />
+					</on-error-propagate>
+				</error-handler>
+			</try>
+		</foreach>
+		<logger doc:name="INFO: Log consumer run" level="INFO" message="#['Consumer ' ++ vars.vConsumerId ++ ' processed ' ++ sizeOf(vars.vProcessed) ++ ' items, ' ++ vars.vAlreadyClaimed ++ ' already claimed, correlationId=' ++ correlationId]" />
+		<set-payload doc:name="Set Run Response" value="#[output application/json --- { consumer: vars.vConsumerId, processed: vars.vProcessed, alreadyClaimed: vars.vAlreadyClaimed }]" />
+	</flow>
+
+	<sub-flow name="sf-issue-claimed-invoice" doc:description="Issues the invoice of one claimed work item (takes eip.competingConsumers.workMillis) and counts how many invoices the order got.">
+		<ee:transform doc:name="Issue Invoice">
+			<ee:message>
+				<ee:set-payload><![CDATA[%dw 2.0
+output application/java
+import wait from dw::Runtime
+---
+vars.vOrderId wait (p('eip.competingConsumers.workMillis') as Number)]]></ee:set-payload>
+			</ee:message>
+		</ee:transform>
+		<os:retrieve doc:name="Read Issued Count" key="#[vars.vOrderId]" objectStore="eip-invoice-work-issued-store" target="vIssued">
+			<os:default-value><![CDATA[#[0]]]></os:default-value>
+		</os:retrieve>
+		<os:store doc:name="Store Issued Count" key="#[vars.vOrderId]" objectStore="eip-invoice-work-issued-store">
+			<os:value><![CDATA[#[(vars.vIssued as Number) + 1]]]></os:value>
+		</os:store>
+	</sub-flow>
+
+	<flow name="invoice-work-get-item" doc:description="GET /eip/invoice-work/items/{orderId}: which consumer claimed the work item and how many invoices were issued for it; 404 for an unknown item.">
+		<http:listener doc:name="GET /eip/invoice-work/items/{orderId}" config-ref="http-listener-config" path="/eip/invoice-work/items/{orderId}" allowedMethods="GET">
+			<http:response statusCode="#[vars.httpStatus default 200]" />
+		</http:listener>
+		<set-variable doc:name="SET vOrderId" variableName="vOrderId" value="#[attributes.uriParams.orderId]" />
+		<os:contains doc:name="Check Known Item" key="#[vars.vOrderId]" objectStore="eip-invoice-work-store" target="vKnown" />
+		<choice doc:name="Check Found">
+			<when expression="#[not vars.vKnown]">
+				<raise-error doc:name="Raise NOT_FOUND Error - Unknown item" type="APP:NOT_FOUND" description="No work item for this order" />
+			</when>
+		</choice>
+		<os:retrieve doc:name="Read Claim" key="#[vars.vOrderId]" objectStore="eip-invoice-work-claims-store" target="vClaim">
+			<os:default-value><![CDATA[#[output application/java --- { consumer: null }]]]></os:default-value>
+		</os:retrieve>
+		<os:retrieve doc:name="Read Issued Count" key="#[vars.vOrderId]" objectStore="eip-invoice-work-issued-store" target="vIssued">
+			<os:default-value><![CDATA[#[0]]]></os:default-value>
+		</os:retrieve>
+		<set-payload doc:name="Set Item As JSON" value="#[output application/json --- { orderId: vars.vOrderId, claimedBy: vars.vClaim.consumer, invoicesIssued: vars.vIssued as Number }]" />
+	</flow>
+</mule>

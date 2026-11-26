@@ -1,0 +1,156 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<mule xmlns="http://www.mulesoft.org/schema/mule/core"
+	xmlns:munit="http://www.mulesoft.org/schema/mule/munit"
+	xmlns:munit-tools="http://www.mulesoft.org/schema/mule/munit-tools"
+	xmlns:http="http://www.mulesoft.org/schema/mule/http"
+	xmlns:os="http://www.mulesoft.org/schema/mule/os"
+	xmlns:doc="http://www.mulesoft.org/schema/mule/documentation"
+	xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+	xsi:schemaLocation="http://www.mulesoft.org/schema/mule/core http://www.mulesoft.org/schema/mule/core/current/mule.xsd
+		http://www.mulesoft.org/schema/mule/munit http://www.mulesoft.org/schema/mule/munit/current/mule-munit.xsd
+		http://www.mulesoft.org/schema/mule/munit-tools http://www.mulesoft.org/schema/mule/munit-tools/current/mule-munit-tools.xsd
+		http://www.mulesoft.org/schema/mule/http http://www.mulesoft.org/schema/mule/http/current/mule-http.xsd
+		http://www.mulesoft.org/schema/mule/os http://www.mulesoft.org/schema/mule/os/current/mule-os.xsd">
+
+	<!--
+		Return address: the invoice request carries the address of the requestor's reply channel in X-Reply-To,
+		and invoicing replies there. Every call goes over HTTP to this app.
+	-->
+	<munit:config name="return-address-test-suite.xml" />
+
+	<munit:test name="ra-each-requestor-gets-the-reply-at-its-own-address" description="Return address: two requestors send invoice requests with different X-Reply-To addresses and each receives only its own invoice">
+		<munit:enable-flow-sources>
+			<munit:enable-flow-source value="invoice-issue-to-return-address" />
+			<munit:enable-flow-source value="requestor-receive-invoice-reply" />
+			<munit:enable-flow-source value="requestor-get-invoice-replies" />
+		</munit:enable-flow-sources>
+		<munit:execution>
+			<http:request doc:name="POST request from checkout" config-ref="eip-self-http-request-config" method="POST" path="/eip/invoice-requests" target="vCheckout" targetValue="#[output application/java --- { status: attributes.statusCode, contentType: attributes.headers.'content-type' default '', body: payload }]">
+				<http:body><![CDATA[#[output application/json --- {orderId: 'ORD-RA-CHECKOUT', amount: 72.5}]]]></http:body>
+				<http:headers><![CDATA[#[output application/java --- { 'X-Reply-To': '/eip/requestors/checkout/invoice-replies' }]]]></http:headers>
+				<http:response-validator>
+					<http:success-status-code-validator values="200..499" />
+				</http:response-validator>
+			</http:request>
+			<http:request doc:name="POST request from backoffice" config-ref="eip-self-http-request-config" method="POST" path="/eip/invoice-requests" target="vBackoffice" targetValue="#[output application/java --- { status: attributes.statusCode, contentType: attributes.headers.'content-type' default '', body: payload }]">
+				<http:body><![CDATA[#[output application/json --- {orderId: 'ORD-RA-BACKOFFICE', amount: 30}]]]></http:body>
+				<http:headers><![CDATA[#[output application/java --- { 'X-Reply-To': '/eip/requestors/backoffice/invoice-replies' }]]]></http:headers>
+				<http:response-validator>
+					<http:success-status-code-validator values="200..499" />
+				</http:response-validator>
+			</http:request>
+			<until-successful doc:name="Wait for both replies" maxRetries="50" millisBetweenRetries="100">
+				<http:request doc:name="GET checkout replies" config-ref="eip-self-http-request-config" method="GET" path="/eip/requestors/checkout/invoice-replies" target="vCheckoutInbox" targetValue="#[output application/java --- { status: attributes.statusCode, contentType: attributes.headers.'content-type' default '', body: payload }]">
+					<http:response-validator>
+						<http:success-status-code-validator values="200..499" />
+					</http:response-validator>
+				</http:request>
+				<http:request doc:name="GET backoffice replies" config-ref="eip-self-http-request-config" method="GET" path="/eip/requestors/backoffice/invoice-replies" target="vBackofficeInbox" targetValue="#[output application/java --- { status: attributes.statusCode, contentType: attributes.headers.'content-type' default '', body: payload }]">
+					<http:response-validator>
+						<http:success-status-code-validator values="200..499" />
+					</http:response-validator>
+				</http:request>
+				<choice doc:name="Check Arrived">
+					<when expression="#[isEmpty(vars.vCheckoutInbox.body.invoices) or isEmpty(vars.vBackofficeInbox.body.invoices)]">
+						<raise-error doc:name="Raise TEST:NOT_YET Error" type="TEST:NOT_YET" description="Not yet" />
+					</when>
+				</choice>
+			</until-successful>
+		</munit:execution>
+		<munit:validation>
+			<munit-tools:assert-that doc:name="Checkout 202" expression="#[vars.vCheckout.status]" is="#[MunitTools::equalTo(202)]" />
+			<munit-tools:assert-that doc:name="Backoffice 202" expression="#[vars.vBackoffice.status]" is="#[MunitTools::equalTo(202)]" />
+			<munit-tools:assert-that doc:name="JSON" expression="#[vars.vCheckout.contentType]" is="#[MunitTools::startsWith('application/json')]" />
+			<munit-tools:assert-that doc:name="Echoes the return address" expression="#[vars.vCheckout.body.replyTo]" is="#[MunitTools::equalTo('/eip/requestors/checkout/invoice-replies')]" />
+			<munit-tools:assert-that doc:name="Checkout got only its invoice" expression="#[vars.vCheckoutInbox.body.invoices map $.orderId]" is="#[MunitTools::equalTo(['ORD-RA-CHECKOUT'])]" />
+			<munit-tools:assert-that doc:name="Backoffice got only its invoice" expression="#[vars.vBackofficeInbox.body.invoices map $.orderId]" is="#[MunitTools::equalTo(['ORD-RA-BACKOFFICE'])]" />
+			<munit-tools:assert-that doc:name="Invoice amount" expression="#[vars.vCheckoutInbox.body.invoices[0].amount]" is="#[MunitTools::equalTo(72.5)]" />
+			<munit-tools:assert-that doc:name="Invoice id" expression="#[vars.vBackofficeInbox.body.invoices[0].invoiceId]" is="#[MunitTools::notNullValue()]" />
+			<munit-tools:assert-that doc:name="Inbox JSON" expression="#[vars.vCheckoutInbox.contentType]" is="#[MunitTools::startsWith('application/json')]" />
+			<munit-tools:verify-call doc:name="One reply per request" processor="http:request" times="2">
+				<munit-tools:with-attributes>
+					<munit-tools:with-attribute attributeName="doc:name" whereValue="POST Invoice To Return Address" />
+				</munit-tools:with-attributes>
+			</munit-tools:verify-call>
+		</munit:validation>
+	</munit:test>
+
+	<munit:test name="ra-request-without-return-address-returns-400" description="Return address: an invoice request without X-Reply-To is rejected with 400 and no reply is sent">
+		<munit:enable-flow-sources>
+			<munit:enable-flow-source value="invoice-issue-to-return-address" />
+			<munit:enable-flow-source value="requestor-receive-invoice-reply" />
+			<munit:enable-flow-source value="requestor-get-invoice-replies" />
+		</munit:enable-flow-sources>
+		<munit:execution>
+			<http:request doc:name="POST request without X-Reply-To" config-ref="eip-self-http-request-config" method="POST" path="/eip/invoice-requests" target="vResponse" targetValue="#[output application/java --- { status: attributes.statusCode, contentType: attributes.headers.'content-type' default '', body: payload }]">
+				<http:body><![CDATA[#[output application/json --- {orderId: 'ORD-RA-NOWHERE', amount: 10}]]]></http:body>
+				<http:response-validator>
+					<http:success-status-code-validator values="200..499" />
+				</http:response-validator>
+			</http:request>
+		</munit:execution>
+		<munit:validation>
+			<munit-tools:assert-that doc:name="400" expression="#[vars.vResponse.status]" is="#[MunitTools::equalTo(400)]" />
+			<munit-tools:assert-that doc:name="JSON" expression="#[vars.vResponse.contentType]" is="#[MunitTools::startsWith('application/json')]" />
+			<munit-tools:assert-that doc:name="Says why" expression="#[vars.vResponse.body.error]" is="#[MunitTools::startsWith('X-Reply-To must be')]" />
+			<munit-tools:verify-call doc:name="No reply sent" processor="http:request" times="0">
+				<munit-tools:with-attributes>
+					<munit-tools:with-attribute attributeName="doc:name" whereValue="POST Invoice To Return Address" />
+				</munit-tools:with-attributes>
+			</munit-tools:verify-call>
+		</munit:validation>
+	</munit:test>
+
+	<munit:test name="ra-return-address-outside-the-allowed-paths-returns-400" description="Return address: an absolute URL or another path of this app as X-Reply-To is rejected with 400, so the replier cannot be made to call anywhere else">
+		<munit:enable-flow-sources>
+			<munit:enable-flow-source value="invoice-issue-to-return-address" />
+			<munit:enable-flow-source value="requestor-receive-invoice-reply" />
+			<munit:enable-flow-source value="requestor-get-invoice-replies" />
+		</munit:enable-flow-sources>
+		<munit:execution>
+			<http:request doc:name="POST with absolute URL" config-ref="eip-self-http-request-config" method="POST" path="/eip/invoice-requests" target="vAbsolute" targetValue="#[output application/java --- { status: attributes.statusCode, contentType: attributes.headers.'content-type' default '', body: payload }]">
+				<http:body><![CDATA[#[output application/json --- {orderId: 'ORD-RA-SSRF', amount: 10}]]]></http:body>
+				<http:headers><![CDATA[#[output application/java --- { 'X-Reply-To': 'http://attacker.example/eip/requestors/x/invoice-replies' }]]]></http:headers>
+				<http:response-validator>
+					<http:success-status-code-validator values="200..499" />
+				</http:response-validator>
+			</http:request>
+			<http:request doc:name="POST with another path" config-ref="eip-self-http-request-config" method="POST" path="/eip/invoice-requests" target="vOtherPath" targetValue="#[output application/java --- { status: attributes.statusCode, contentType: attributes.headers.'content-type' default '', body: payload }]">
+				<http:body><![CDATA[#[output application/json --- {orderId: 'ORD-RA-OTHER', amount: 10}]]]></http:body>
+				<http:headers><![CDATA[#[output application/java --- { 'X-Reply-To': '/eip/payments/callback' }]]]></http:headers>
+				<http:response-validator>
+					<http:success-status-code-validator values="200..499" />
+				</http:response-validator>
+			</http:request>
+			<http:request doc:name="POST without amount" config-ref="eip-self-http-request-config" method="POST" path="/eip/invoice-requests" target="vNoAmount" targetValue="#[output application/java --- { status: attributes.statusCode, contentType: attributes.headers.'content-type' default '', body: payload }]">
+				<http:body><![CDATA[#[output application/json --- {orderId: 'ORD-RA-NOAMOUNT'}]]]></http:body>
+				<http:headers><![CDATA[#[output application/java --- { 'X-Reply-To': '/eip/requestors/checkout/invoice-replies' }]]]></http:headers>
+				<http:response-validator>
+					<http:success-status-code-validator values="200..499" />
+				</http:response-validator>
+			</http:request>
+			<http:request doc:name="POST reply without orderId" config-ref="eip-self-http-request-config" method="POST" path="/eip/requestors/checkout/invoice-replies" target="vBadReply" targetValue="#[output application/java --- { status: attributes.statusCode, contentType: attributes.headers.'content-type' default '', body: payload }]">
+				<http:body><![CDATA[#[output application/json --- {amount: 1}]]]></http:body>
+				<http:response-validator>
+					<http:success-status-code-validator values="200..499" />
+				</http:response-validator>
+			</http:request>
+		</munit:execution>
+		<munit:validation>
+			<munit-tools:assert-that doc:name="Absolute URL 400" expression="#[vars.vAbsolute.status]" is="#[MunitTools::equalTo(400)]" />
+			<munit-tools:assert-that doc:name="Other path 400" expression="#[vars.vOtherPath.status]" is="#[MunitTools::equalTo(400)]" />
+			<munit-tools:assert-that doc:name="No amount 400" expression="#[vars.vNoAmount.status]" is="#[MunitTools::equalTo(400)]" />
+			<munit-tools:assert-that doc:name="Reply without orderId 400" expression="#[vars.vBadReply.status]" is="#[MunitTools::equalTo(400)]" />
+			<munit-tools:verify-call doc:name="Rejected addresses logged" processor="logger" times="2">
+				<munit-tools:with-attributes>
+					<munit-tools:with-attribute attributeName="doc:name" whereValue="WARN: Log rejected reply address" />
+				</munit-tools:with-attributes>
+			</munit-tools:verify-call>
+			<munit-tools:verify-call doc:name="No reply sent" processor="http:request" times="0">
+				<munit-tools:with-attributes>
+					<munit-tools:with-attribute attributeName="doc:name" whereValue="POST Invoice To Return Address" />
+				</munit-tools:with-attributes>
+			</munit-tools:verify-call>
+		</munit:validation>
+	</munit:test>
+</mule>

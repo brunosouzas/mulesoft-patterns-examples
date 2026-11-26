@@ -1,0 +1,154 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<mule xmlns="http://www.mulesoft.org/schema/mule/core"
+	xmlns:munit="http://www.mulesoft.org/schema/mule/munit"
+	xmlns:munit-tools="http://www.mulesoft.org/schema/mule/munit-tools"
+	xmlns:http="http://www.mulesoft.org/schema/mule/http"
+	xmlns:os="http://www.mulesoft.org/schema/mule/os"
+	xmlns:doc="http://www.mulesoft.org/schema/mule/documentation"
+	xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+	xsi:schemaLocation="http://www.mulesoft.org/schema/mule/core http://www.mulesoft.org/schema/mule/core/current/mule.xsd
+		http://www.mulesoft.org/schema/mule/munit http://www.mulesoft.org/schema/mule/munit/current/mule-munit.xsd
+		http://www.mulesoft.org/schema/mule/munit-tools http://www.mulesoft.org/schema/mule/munit-tools/current/mule-munit-tools.xsd
+		http://www.mulesoft.org/schema/mule/http http://www.mulesoft.org/schema/mule/http/current/mule-http.xsd
+		http://www.mulesoft.org/schema/mule/os http://www.mulesoft.org/schema/mule/os/current/mule-os.xsd">
+
+	<!--
+		Event-driven consumer: the HTTP Listener is the trigger, so each payment event is processed when it
+		arrives. Every call goes over HTTP to this app.
+	-->
+	<munit:config name="event-driven-consumer-test-suite.xml" />
+
+	<munit:test name="edc-event-is-processed-as-it-arrives" description="Event-driven consumer: the HTTP Listener runs the flow when the event arrives; by the time the sender has its 200 the order is PAID, with no polling">
+		<munit:enable-flow-sources>
+			<munit:enable-flow-source value="payment-consume-event" />
+			<munit:enable-flow-source value="payment-get-event-state" />
+		</munit:enable-flow-sources>
+		<munit:execution>
+			<http:request doc:name="POST payment event" config-ref="eip-self-http-request-config" method="POST" path="/eip/payment-events" target="vResponse" targetValue="#[output application/java --- { status: attributes.statusCode, contentType: attributes.headers.'content-type' default '', body: payload }]">
+				<http:body><![CDATA[#[output application/json --- {eventId: 'EVT-EDC-1', orderId: 'ORD-EDC-1', 'type': 'PAYMENT_CONFIRMED'}]]]></http:body>
+				<http:response-validator>
+					<http:success-status-code-validator values="200..499" />
+				</http:response-validator>
+			</http:request>
+			<http:request doc:name="GET state right away" config-ref="eip-self-http-request-config" method="GET" path="/eip/payment-events/ORD-EDC-1" target="vState" targetValue="#[output application/java --- { status: attributes.statusCode, contentType: attributes.headers.'content-type' default '', body: payload }]">
+				<http:response-validator>
+					<http:success-status-code-validator values="200..499" />
+				</http:response-validator>
+			</http:request>
+		</munit:execution>
+		<munit:validation>
+			<munit-tools:assert-that doc:name="200" expression="#[vars.vResponse.status]" is="#[MunitTools::equalTo(200)]" />
+			<munit-tools:assert-that doc:name="JSON" expression="#[vars.vResponse.contentType]" is="#[MunitTools::startsWith('application/json')]" />
+			<munit-tools:assert-that doc:name="Consumed" expression="#[vars.vResponse.body.result]" is="#[MunitTools::equalTo('CONSUMED')]" />
+			<munit-tools:assert-that doc:name="Order already PAID" expression="#[vars.vState.body.status]" is="#[MunitTools::equalTo('PAID')]" />
+			<munit-tools:assert-that doc:name="By this event" expression="#[vars.vState.body.lastEventId]" is="#[MunitTools::equalTo('EVT-EDC-1')]" />
+			<munit-tools:assert-that doc:name="State JSON" expression="#[vars.vState.contentType]" is="#[MunitTools::startsWith('application/json')]" />
+			<munit-tools:verify-call doc:name="One run per event" processor="logger" times="1">
+				<munit-tools:with-attributes>
+					<munit-tools:with-attribute attributeName="doc:name" whereValue="INFO: Log event consumed" />
+				</munit-tools:with-attributes>
+			</munit-tools:verify-call>
+		</munit:validation>
+	</munit:test>
+
+	<munit:test name="edc-each-event-runs-the-flow-once-and-the-last-one-stored-decides" description="Event-driven consumer: two events for one order, sent one after the other, each run the flow once; the one stored last decides the state">
+		<munit:enable-flow-sources>
+			<munit:enable-flow-source value="payment-consume-event" />
+			<munit:enable-flow-source value="payment-get-event-state" />
+		</munit:enable-flow-sources>
+		<munit:execution>
+			<http:request doc:name="POST PAYMENT_FAILED" config-ref="eip-self-http-request-config" method="POST" path="/eip/payment-events" target="vFirst" targetValue="#[output application/java --- { status: attributes.statusCode, contentType: attributes.headers.'content-type' default '', body: payload }]">
+				<http:body><![CDATA[#[output application/json --- {eventId: 'EVT-EDC-2A', orderId: 'ORD-EDC-2', 'type': 'PAYMENT_FAILED'}]]]></http:body>
+				<http:response-validator>
+					<http:success-status-code-validator values="200..499" />
+				</http:response-validator>
+			</http:request>
+			<http:request doc:name="GET state after first" config-ref="eip-self-http-request-config" method="GET" path="/eip/payment-events/ORD-EDC-2" target="vAfterFirst" targetValue="#[output application/java --- { status: attributes.statusCode, contentType: attributes.headers.'content-type' default '', body: payload }]">
+				<http:response-validator>
+					<http:success-status-code-validator values="200..499" />
+				</http:response-validator>
+			</http:request>
+			<http:request doc:name="POST PAYMENT_CONFIRMED" config-ref="eip-self-http-request-config" method="POST" path="/eip/payment-events" target="vSecond" targetValue="#[output application/java --- { status: attributes.statusCode, contentType: attributes.headers.'content-type' default '', body: payload }]">
+				<http:body><![CDATA[#[output application/json --- {eventId: 'EVT-EDC-2B', orderId: 'ORD-EDC-2', 'type': 'PAYMENT_CONFIRMED'}]]]></http:body>
+				<http:response-validator>
+					<http:success-status-code-validator values="200..499" />
+				</http:response-validator>
+			</http:request>
+			<http:request doc:name="GET state after second" config-ref="eip-self-http-request-config" method="GET" path="/eip/payment-events/ORD-EDC-2" target="vAfterSecond" targetValue="#[output application/java --- { status: attributes.statusCode, contentType: attributes.headers.'content-type' default '', body: payload }]">
+				<http:response-validator>
+					<http:success-status-code-validator values="200..499" />
+				</http:response-validator>
+			</http:request>
+		</munit:execution>
+		<munit:validation>
+			<munit-tools:assert-that doc:name="After first: failed" expression="#[vars.vAfterFirst.body.status]" is="#[MunitTools::equalTo('PAYMENT_FAILED')]" />
+			<munit-tools:assert-that doc:name="After second: paid" expression="#[vars.vAfterSecond.body.status]" is="#[MunitTools::equalTo('PAID')]" />
+			<munit-tools:assert-that doc:name="Last event" expression="#[vars.vAfterSecond.body.lastEventId]" is="#[MunitTools::equalTo('EVT-EDC-2B')]" />
+			<munit-tools:verify-call doc:name="Two runs" processor="logger" times="2">
+				<munit-tools:with-attributes>
+					<munit-tools:with-attribute attributeName="doc:name" whereValue="INFO: Log event consumed" />
+				</munit-tools:with-attributes>
+			</munit-tools:verify-call>
+		</munit:validation>
+	</munit:test>
+
+	<munit:test name="edc-invalid-event-returns-400-and-unknown-order-404" description="Event-driven consumer: an event without a known type is rejected with 400 and changes nothing; an order with no event gets 404">
+		<munit:enable-flow-sources>
+			<munit:enable-flow-source value="payment-consume-event" />
+			<munit:enable-flow-source value="payment-get-event-state" />
+		</munit:enable-flow-sources>
+		<munit:execution>
+			<http:request doc:name="POST event of unknown type" config-ref="eip-self-http-request-config" method="POST" path="/eip/payment-events" target="vBad" targetValue="#[output application/java --- { status: attributes.statusCode, contentType: attributes.headers.'content-type' default '', body: payload }]">
+				<http:body><![CDATA[#[output application/json --- {eventId: 'EVT-EDC-3', orderId: 'ORD-EDC-3', 'type': 'PAYMENT_MAYBE'}]]]></http:body>
+				<http:response-validator>
+					<http:success-status-code-validator values="200..499" />
+				</http:response-validator>
+			</http:request>
+			<http:request doc:name="GET state" config-ref="eip-self-http-request-config" method="GET" path="/eip/payment-events/ORD-EDC-3" target="vState" targetValue="#[output application/java --- { status: attributes.statusCode, contentType: attributes.headers.'content-type' default '', body: payload }]">
+				<http:response-validator>
+					<http:success-status-code-validator values="200..499" />
+				</http:response-validator>
+			</http:request>
+		</munit:execution>
+		<munit:validation>
+			<munit-tools:assert-that doc:name="400" expression="#[vars.vBad.status]" is="#[MunitTools::equalTo(400)]" />
+			<munit-tools:assert-that doc:name="JSON" expression="#[vars.vBad.contentType]" is="#[MunitTools::startsWith('application/json')]" />
+			<munit-tools:assert-that doc:name="404" expression="#[vars.vState.status]" is="#[MunitTools::equalTo(404)]" />
+			<munit-tools:verify-call doc:name="Not consumed" processor="logger" times="0">
+				<munit-tools:with-attributes>
+					<munit-tools:with-attribute attributeName="doc:name" whereValue="INFO: Log event consumed" />
+				</munit-tools:with-attributes>
+			</munit-tools:verify-call>
+		</munit:validation>
+	</munit:test>
+
+	<munit:test name="edc-repeated-event-is-applied-again" description="Event-driven consumer: nothing checks eventId, so the same event sent twice runs the flow twice (see idempotent-receiver for rejecting a repeat)">
+		<munit:enable-flow-sources>
+			<munit:enable-flow-source value="payment-consume-event" />
+			<munit:enable-flow-source value="payment-get-event-state" />
+		</munit:enable-flow-sources>
+		<munit:execution>
+			<http:request doc:name="POST event" config-ref="eip-self-http-request-config" method="POST" path="/eip/payment-events" target="vFirst" targetValue="#[output application/java --- { status: attributes.statusCode, contentType: attributes.headers.'content-type' default '', body: payload }]">
+				<http:body><![CDATA[#[output application/json --- {eventId: 'EVT-EDC-4', orderId: 'ORD-EDC-4', 'type': 'PAYMENT_CONFIRMED'}]]]></http:body>
+				<http:response-validator>
+					<http:success-status-code-validator values="200..499" />
+				</http:response-validator>
+			</http:request>
+			<http:request doc:name="POST same event again" config-ref="eip-self-http-request-config" method="POST" path="/eip/payment-events" target="vRepeat" targetValue="#[output application/java --- { status: attributes.statusCode, contentType: attributes.headers.'content-type' default '', body: payload }]">
+				<http:body><![CDATA[#[output application/json --- {eventId: 'EVT-EDC-4', orderId: 'ORD-EDC-4', 'type': 'PAYMENT_CONFIRMED'}]]]></http:body>
+				<http:response-validator>
+					<http:success-status-code-validator values="200..499" />
+				</http:response-validator>
+			</http:request>
+		</munit:execution>
+		<munit:validation>
+			<munit-tools:assert-that doc:name="First 200" expression="#[vars.vFirst.status]" is="#[MunitTools::equalTo(200)]" />
+			<munit-tools:assert-that doc:name="Repeat 200, consumed again" expression="#[vars.vRepeat.body.result]" is="#[MunitTools::equalTo('CONSUMED')]" />
+			<munit-tools:verify-call doc:name="Two runs for one event" processor="os:store" times="2">
+				<munit-tools:with-attributes>
+					<munit-tools:with-attribute attributeName="doc:name" whereValue="Store Payment State" />
+				</munit-tools:with-attributes>
+			</munit-tools:verify-call>
+		</munit:validation>
+	</munit:test>
+</mule>

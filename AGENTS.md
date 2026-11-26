@@ -1,13 +1,23 @@
 # mulesoft-patterns-examples: project context
 
-Stack: Mule 4, MUnit, Maven
+Stack: Mule 4, MUnit, Maven, GitHub Actions
+Delivery: E reference
+Model: reference
+Integration branch: `main`
+Data: none
+Article: none
+
+- Build: `mvn -B clean package -DskipMunitTests` (what CI runs on every pull request, `.github/workflows/ci.yml`; no credentials needed)
+- Test: `mvn clean test` (MUnit, fails below 80% application coverage; needs the MuleSoft Enterprise repository credentials in `~/.m2/settings.xml`, so it runs locally before each pull request, not in CI)
+- Run locally: `mvn clean package`, run the app on a local Mule 4.9 runtime and call the endpoints in `requests.http`
+- Deliver and verify: `nothing is deployed; CI green on the merge commit, and the paths and requests.http endpoints that brunosouzas-content: writing/solid-in-mulesoft/ and writing/integration-patterns-in-mulesoft/ cite still resolve on main`
 
 ## Purpose
 
 A catalogue of runnable Mule 4 examples of design and integration patterns, one series per folder, each with MUnit tests and an accompanying article series.
 
 - **SOLID** (`solid/`, complete): before-and-after examples of the five SOLID principles. Each principle has a **before** endpoint that breaks the principle and an **after** endpoint that follows it, and MUnit tests show where the two behave the same and where the "before" version causes problems.
-- **Enterprise Integration Patterns** (`eip/`, in progress): one folder and one MUnit suite per runnable pattern, using HTTP and object stores only (and the Aggregators module for the aggregator), so the app runs with no external systems. Wave 1 (idempotent receiver, correlation identifier) and wave 2 (content-based router, message filter, splitter, aggregator, recipient list, scatter-gather) are runnable; the patterns and their endpoints are listed in [README.md](README.md#enterprise-integration-patterns). Patterns that need a broker (publish-subscribe, dead letter channel) are documented with Anypoint MQ configuration in the wiki, not here; do not simulate a broker with VM queues.
+- **Enterprise Integration Patterns** (`eip/`, in progress): one folder and one MUnit suite per runnable pattern, using HTTP, object stores and the Scheduler only (and the Aggregators module for the aggregator), so the app runs with no external systems. Wave 1 (idempotent receiver, correlation identifier), wave 2 (content-based router, message filter, splitter, aggregator, recipient list, scatter-gather), wave 3 (message translator, canonical data model, content filter, claim check, content enricher) wave 4 (request-reply, return address, event-driven consumer, polling consumer, competing consumers, channel adapter) and wave 5 (guaranteed delivery, transactional client, message expiration, invalid message channel) are runnable; the patterns and their endpoints are listed in [README.md](README.md#enterprise-integration-patterns). Patterns that need a broker (publish-subscribe, dead letter channel, point-to-point channel) are documented with Anypoint MQ configuration in the wiki, not here; do not simulate a broker with VM queues. Object stores are in memory except the guaranteed delivery outbox, which is persistent by design; this app has no transactional connector, so the transactional client shows a compensation, not a rollback.
 
 HTTP endpoint paths are referenced by published articles; do not change them when moving files.
 
@@ -31,6 +41,7 @@ Top-level source/documentation directories: `docs`, `src`.
 
 - `src/main/mule/global.xml`: shared global configuration (HTTP listener, properties, error handler) for every series.
 - `src/main/mule/eip/eip-global.xml`: configuration shared by the EIP examples only (HTTP requester to this app).
+- `src/main/resources/dwl/<domain>/`: DataWeave modules (the canonical data model's translators, the message translator's code table).
 - `src/main/mule/eip/<pattern>/`: one folder per EIP pattern, holding its flows and its own global elements (object stores); `src/test/munit/eip/<pattern>-test-suite.xml` is its suite.
 - `src/main/mule/<series>/`, `src/test/munit/<series>/`, `docs/contracts/<series>/`: flows, MUnit suites and contracts of one series (`solid`, `eip`).
 - [README.md](README.md).
@@ -42,3 +53,9 @@ GitHub default branch inspected on 2026-10-06: `main`. Release bases are defined
 ## Project rules
 
 Before planning, reviewing or changing this project, read [the applicable project rules](rules/README.md).
+
+- Board area: `mulesoft` (Azure Boards, project `brunosouzas`).
+- OpenSpec: no: every change takes the small path.
+- Merges stay with Bruno (`rules/README.md`), stricter than the playbook's level 1 on purpose.
+- Releases: none. When an article cites a version, Bruno creates an `article-<slug>` tag (not `v*`).
+- Articles cite this repository (`brunosouzas-content: writing/solid-in-mulesoft/`, `brunosouzas-content: writing/integration-patterns-in-mulesoft/`): keep the endpoints in `requests.http` and the paths they link answering after a merge.

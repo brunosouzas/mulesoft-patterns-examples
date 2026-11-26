@@ -1,0 +1,169 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<mule xmlns="http://www.mulesoft.org/schema/mule/core"
+	xmlns:munit="http://www.mulesoft.org/schema/mule/munit"
+	xmlns:munit-tools="http://www.mulesoft.org/schema/mule/munit-tools"
+	xmlns:http="http://www.mulesoft.org/schema/mule/http"
+	xmlns:doc="http://www.mulesoft.org/schema/mule/documentation"
+	xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+	xsi:schemaLocation="http://www.mulesoft.org/schema/mule/core http://www.mulesoft.org/schema/mule/core/current/mule.xsd
+		http://www.mulesoft.org/schema/mule/munit http://www.mulesoft.org/schema/mule/munit/current/mule-munit.xsd
+		http://www.mulesoft.org/schema/mule/munit-tools http://www.mulesoft.org/schema/mule/munit-tools/current/mule-munit-tools.xsd
+		http://www.mulesoft.org/schema/mule/http http://www.mulesoft.org/schema/mule/http/current/mule-http.xsd">
+
+	<!--
+		Content enricher: an order with only a customerId is enriched over HTTP from the simulated CRM through a
+		target variable. The tests show that the order is still the payload after the call, that targetValue
+		keeps only the customer part of the answer, and what happens when the CRM is down (no target variable,
+		503, unreachable or timed out) or does not know the customer (400). The first test calls the endpoint over
+		real HTTP, so it checks the status code the listener answers.
+	-->
+	<munit:config name="content-enricher-test-suite.xml" />
+
+	<munit:test name="ce-order-is-enriched-with-the-customer" description="Content enricher, over real HTTP: POST /eip/orders/enrich answers 200 with the order's own fields and the customer's name, tier and shipping address from the CRM">
+		<munit:enable-flow-sources>
+			<munit:enable-flow-source value="order-enrich-with-customer" />
+			<munit:enable-flow-source value="service-get-customer" />
+		</munit:enable-flow-sources>
+		<munit:execution>
+			<http:request doc:name="POST /eip/orders/enrich" config-ref="eip-self-http-request-config" method="POST" path="/eip/orders/enrich" target="vReply" targetValue="#[output application/java --- { status: attributes.statusCode, mimeType: payload.^mimeType, body: payload }]">
+				<http:body><![CDATA[#[output application/json --- {orderId: 'ORD-CE-1', customerId: 'CUS-100', items: [{sku: 'SKU-BOOK', quantity: 2, unitPrice: 30}]}]]]></http:body>
+			</http:request>
+		</munit:execution>
+		<munit:validation>
+			<munit-tools:assert-that doc:name="200" expression="#[vars.vReply.status]" is="#[MunitTools::equalTo(200)]" />
+			<munit-tools:assert-that doc:name="Order fields kept" expression="#[[vars.vReply.body.orderId, vars.vReply.body.customerId, vars.vReply.body.items]]" is="#[MunitTools::equalTo(['ORD-CE-1', 'CUS-100', [{sku: 'SKU-BOOK', quantity: 2, unitPrice: 30}]])]" />
+			<munit-tools:assert-that doc:name="Customer added" expression="#[vars.vReply.body.customer]" is="#[MunitTools::equalTo({name: 'Ana Lima', tier: 'GOLD', shippingAddress: {street: 'Rua A, 1', city: 'Sao Paulo', country: 'BR'}})]" />
+		</munit:validation>
+	</munit:test>
+
+	<munit:test name="ce-target-variable-holds-only-the-target-value" description="Content enricher: vars.vCustomer holds the customer part of the CRM answer (targetValue), not its meta, and the payload after the call is still the order">
+		<munit:enable-flow-sources>
+			<munit:enable-flow-source value="service-get-customer" />
+		</munit:enable-flow-sources>
+		<munit:behavior>
+			<munit-tools:spy doc:name="Spy the merge" processor="ee:transform">
+				<munit-tools:with-attributes>
+					<munit-tools:with-attribute attributeName="doc:name" whereValue="Merge Customer Into Order" />
+				</munit-tools:with-attributes>
+				<munit-tools:before-call>
+					<munit-tools:assert-that doc:name="Payload is still the order" expression="#[payload.orderId]" is="#[MunitTools::equalTo('ORD-CE-2')]" />
+					<munit-tools:assert-that doc:name="Payload has only the order's fields" expression="#[keysOf(payload) map ($ as String)]" is="#[MunitTools::equalTo(['orderId', 'customerId', 'items'])]" />
+				</munit-tools:before-call>
+			</munit-tools:spy>
+		</munit:behavior>
+		<munit:execution>
+			<munit:set-event doc:name="Order ORD-CE-2 of CUS-200">
+				<munit:payload value="#[output application/json --- {orderId: 'ORD-CE-2', customerId: 'CUS-200', items: [{sku: 'SKU-BOOK', quantity: 2, unitPrice: 30}]}]" mediaType="application/json" />
+			</munit:set-event>
+			<flow-ref doc:name="POST /eip/orders/enrich" name="order-enrich-with-customer" />
+		</munit:execution>
+		<munit:validation>
+			<munit-tools:assert-that doc:name="Customer part only" expression="#[keysOf(vars.vCustomer) map ($ as String)]" is="#[MunitTools::equalTo(['id', 'name', 'tier', 'shippingAddress'])]" />
+			<munit-tools:assert-that doc:name="Enriched" expression="#[payload.customer.tier]" is="#[MunitTools::equalTo('STANDARD')]" />
+		</munit:validation>
+	</munit:test>
+
+	<munit:test name="ce-crm-down-sets-no-target-variable-and-returns-503" description="Content enricher: the CRM answers 503, the request raises HTTP:SERVICE_UNAVAILABLE, vars.vCustomer keeps the value it had before the call and the order is not passed on: 503 with enrichment FAILED">
+		<munit:enable-flow-sources>
+			<munit:enable-flow-source value="service-get-customer" />
+		</munit:enable-flow-sources>
+		<munit:execution>
+			<munit:set-event doc:name="Order ORD-CE-3 of CUS-DOWN-1, vCustomer already set">
+				<munit:payload value="#[output application/json --- {orderId: 'ORD-CE-3', customerId: 'CUS-DOWN-1', items: [{sku: 'SKU-BOOK', quantity: 2, unitPrice: 30}]}]" mediaType="application/json" />
+				<munit:variables>
+					<munit:variable key="vCustomer" value="#['VALUE BEFORE THE CALL']" />
+				</munit:variables>
+			</munit:set-event>
+			<flow-ref doc:name="POST /eip/orders/enrich" name="order-enrich-with-customer" />
+		</munit:execution>
+		<munit:validation>
+			<munit-tools:assert-that doc:name="503" expression="#[vars.httpStatus as Number]" is="#[MunitTools::equalTo(503)]" />
+			<munit-tools:assert-that doc:name="Failure response" expression="#[payload]" is="#[MunitTools::equalTo({orderId: 'ORD-CE-3', enrichment: 'FAILED', reason: 'HTTP:SERVICE_UNAVAILABLE'})]" />
+			<munit-tools:assert-that doc:name="Target variable not set by the failed call" expression="#[vars.vCustomer]" is="#[MunitTools::equalTo('VALUE BEFORE THE CALL')]" />
+			<munit-tools:verify-call doc:name="Merge never ran" processor="ee:transform" times="0">
+				<munit-tools:with-attributes>
+					<munit-tools:with-attribute attributeName="doc:name" whereValue="Merge Customer Into Order" />
+				</munit-tools:with-attributes>
+			</munit-tools:verify-call>
+		</munit:validation>
+	</munit:test>
+
+	<munit:test name="ce-crm-unreachable-returns-503" description="Content enricher: a CRM that cannot be reached (HTTP:CONNECTIVITY) is handled like one that is down: 503 naming the error type">
+		<munit:behavior>
+			<munit-tools:mock-when doc:name="CRM unreachable" processor="http:request">
+				<munit-tools:with-attributes>
+					<munit-tools:with-attribute attributeName="doc:name" whereValue="Look Up Customer In CRM" />
+				</munit-tools:with-attributes>
+				<munit-tools:then-return>
+					<munit-tools:error typeId="HTTP:CONNECTIVITY" />
+				</munit-tools:then-return>
+			</munit-tools:mock-when>
+		</munit:behavior>
+		<munit:execution>
+			<munit:set-event doc:name="Order ORD-CE-4 of CUS-100">
+				<munit:payload value="#[output application/json --- {orderId: 'ORD-CE-4', customerId: 'CUS-100', items: [{sku: 'SKU-BOOK', quantity: 2, unitPrice: 30}]}]" mediaType="application/json" />
+			</munit:set-event>
+			<flow-ref doc:name="POST /eip/orders/enrich" name="order-enrich-with-customer" />
+		</munit:execution>
+		<munit:validation>
+			<munit-tools:assert-that doc:name="503" expression="#[vars.httpStatus as Number]" is="#[MunitTools::equalTo(503)]" />
+			<munit-tools:assert-that doc:name="Reason" expression="#[payload.reason]" is="#[MunitTools::equalTo('HTTP:CONNECTIVITY')]" />
+		</munit:validation>
+	</munit:test>
+
+	<munit:test name="ce-crm-timeout-returns-503" description="Content enricher: a CRM that does not answer in time (HTTP:TIMEOUT) is handled like one that is down: 503 naming the error type">
+		<munit:behavior>
+			<munit-tools:mock-when doc:name="CRM times out" processor="http:request">
+				<munit-tools:with-attributes>
+					<munit-tools:with-attribute attributeName="doc:name" whereValue="Look Up Customer In CRM" />
+				</munit-tools:with-attributes>
+				<munit-tools:then-return>
+					<munit-tools:error typeId="HTTP:TIMEOUT" />
+				</munit-tools:then-return>
+			</munit-tools:mock-when>
+		</munit:behavior>
+		<munit:execution>
+			<munit:set-event doc:name="Order ORD-CE-7 of CUS-100">
+				<munit:payload value="#[output application/json --- {orderId: 'ORD-CE-7', customerId: 'CUS-100', items: [{sku: 'SKU-BOOK', quantity: 2, unitPrice: 30}]}]" mediaType="application/json" />
+			</munit:set-event>
+			<flow-ref doc:name="POST /eip/orders/enrich" name="order-enrich-with-customer" />
+		</munit:execution>
+		<munit:validation>
+			<munit-tools:assert-that doc:name="503" expression="#[vars.httpStatus as Number]" is="#[MunitTools::equalTo(503)]" />
+			<munit-tools:assert-that doc:name="Failure response" expression="#[payload]" is="#[MunitTools::equalTo({orderId: 'ORD-CE-7', enrichment: 'FAILED', reason: 'HTTP:TIMEOUT'})]" />
+		</munit:validation>
+	</munit:test>
+
+	<munit:test name="ce-unknown-customer-returns-400" description="Content enricher: the CRM answers 404 for an unknown customer, and the order is rejected with 400 naming the customer">
+		<munit:enable-flow-sources>
+			<munit:enable-flow-source value="service-get-customer" />
+		</munit:enable-flow-sources>
+		<munit:execution>
+			<munit:set-event doc:name="Order ORD-CE-5 of CUS-999">
+				<munit:payload value="#[output application/json --- {orderId: 'ORD-CE-5', customerId: 'CUS-999', items: [{sku: 'SKU-BOOK', quantity: 2, unitPrice: 30}]}]" mediaType="application/json" />
+			</munit:set-event>
+			<flow-ref doc:name="POST /eip/orders/enrich" name="order-enrich-with-customer" />
+		</munit:execution>
+		<munit:validation>
+			<munit-tools:assert-that doc:name="400" expression="#[vars.httpStatus as Number]" is="#[MunitTools::equalTo(400)]" />
+			<munit-tools:assert-that doc:name="Reason" expression="#[payload.error]" is="#[MunitTools::equalTo('customer CUS-999 not found')]" />
+		</munit:validation>
+	</munit:test>
+
+	<munit:test name="ce-order-without-customer-returns-400" description="Content enricher: an order without customerId is rejected with 400 and the CRM is not called">
+		<munit:execution>
+			<munit:set-event doc:name="Order without customerId">
+				<munit:payload value="#[output application/json --- {orderId: 'ORD-CE-6', items: [{sku: 'SKU-BOOK', quantity: 1, unitPrice: 30}]}]" mediaType="application/json" />
+			</munit:set-event>
+			<flow-ref doc:name="POST /eip/orders/enrich" name="order-enrich-with-customer" />
+		</munit:execution>
+		<munit:validation>
+			<munit-tools:assert-that doc:name="400" expression="#[vars.httpStatus as Number]" is="#[MunitTools::equalTo(400)]" />
+			<munit-tools:verify-call doc:name="CRM called 0x" processor="http:request" times="0">
+				<munit-tools:with-attributes>
+					<munit-tools:with-attribute attributeName="doc:name" whereValue="Look Up Customer In CRM" />
+				</munit-tools:with-attributes>
+			</munit-tools:verify-call>
+		</munit:validation>
+	</munit:test>
+</mule>

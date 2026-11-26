@@ -1,0 +1,117 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<mule xmlns="http://www.mulesoft.org/schema/mule/core"
+	xmlns:http="http://www.mulesoft.org/schema/mule/http"
+	xmlns:os="http://www.mulesoft.org/schema/mule/os"
+	xmlns:ee="http://www.mulesoft.org/schema/mule/ee/core"
+	xmlns:doc="http://www.mulesoft.org/schema/mule/documentation"
+	xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+	xsi:schemaLocation="http://www.mulesoft.org/schema/mule/core http://www.mulesoft.org/schema/mule/core/current/mule.xsd
+		http://www.mulesoft.org/schema/mule/http http://www.mulesoft.org/schema/mule/http/current/mule-http.xsd
+		http://www.mulesoft.org/schema/mule/os http://www.mulesoft.org/schema/mule/os/current/mule-os.xsd
+		http://www.mulesoft.org/schema/mule/ee/core http://www.mulesoft.org/schema/mule/ee/core/current/mule-ee.xsd">
+
+	<!--
+		RETURN ADDRESS (Hohpe and Woolf): the request says where the reply must go, so the replier needs no
+		hard-coded address and can serve any number of requestors. Here: invoicing issues an order's invoice and
+		sends it to whichever requestor asked for it.
+
+		POST /eip/invoice-requests                          the replier. The request carries its return address in
+		                                                    the X-Reply-To header; invoicing answers 202 and later,
+		                                                    from an Async scope, POSTs the invoice to that address
+		POST /eip/requestors/{requestor}/invoice-replies    a requestor's reply channel (checkout, backoffice, ...)
+		GET  /eip/requestors/{requestor}/invoice-replies    the invoices that requestor has received
+
+		The address is used as the path of the HTTP Request operation, which accepts an expression
+		(https://docs.mulesoft.com/http-connector/latest/http-request-ref). Compare request-reply/, where the warehouse
+		replies to a channel fixed in configuration.
+
+		A return address is an input: a replier that calls whatever URL it is given can be made to call anything
+		(server-side request forgery). This replier only accepts a path on this app of the form
+		/eip/requestors/{requestor}/invoice-replies and answers 400 to anything else, an absolute URL included.
+		The requester config has a fixed host (eip-global.xml), so only the path is taken from the request.
+
+		Mule has its own return addresses: an HTTP listener replies on the connection the request came in on, and
+		VM Connector's Publish Consume uses a temporary reply-to queue
+		(https://docs.mulesoft.com/vm-connector/latest/vm-reference). Both are implicit; this example makes the address
+		explicit, as an asynchronous reply needs. A reply that must also be matched to its request still needs a
+		Correlation Identifier (correlation-identifier/, wave 1); here the invoice carries the orderId.
+	-->
+	<os:object-store name="eip-requestor-invoice-inbox-store" doc:name="Requestor Invoice Inbox Object Store" persistent="false" />
+
+	<flow name="invoice-issue-to-return-address" doc:description="Return address: accepts an invoice request whose X-Reply-To header names the requestor's reply channel, and sends the invoice there asynchronously; 400 without a valid reply address.">
+		<http:listener doc:name="POST /eip/invoice-requests" config-ref="http-listener-config" path="/eip/invoice-requests" allowedMethods="POST">
+			<http:response statusCode="#[vars.httpStatus default 202]" />
+		</http:listener>
+		<set-variable doc:name="SET vReplyTo" variableName="vReplyTo" value="#[attributes.headers['x-reply-to'] default '']" />
+		<choice doc:name="Validate Invoice Request">
+			<when expression="#[(not (payload is Object)) or isEmpty(payload.orderId) or not (payload.amount is Number)]">
+				<raise-error doc:name="Raise BAD_REQUEST Error - Missing fields" type="APP:BAD_REQUEST" description="orderId and amount (number) are required" />
+			</when>
+			<when expression="#[not (vars.vReplyTo matches /^\/eip\/requestors\/[A-Za-z0-9-]+\/invoice-replies$/)]">
+				<logger doc:name="WARN: Log rejected reply address" level="WARN" message="#['Invoice request for orderId=' ++ payload.orderId ++ ' rejected, X-Reply-To not allowed: ' ++ vars.vReplyTo ++ ', correlationId=' ++ correlationId]" />
+				<raise-error doc:name="Raise BAD_REQUEST Error - Bad reply address" type="APP:BAD_REQUEST" description="X-Reply-To must be a path of the form /eip/requestors/{requestor}/invoice-replies" />
+			</when>
+		</choice>
+		<set-variable doc:name="SET vInvoiceRequest" variableName="vInvoiceRequest" value="#[output application/java --- payload]" />
+		<async doc:name="Async Reply To Return Address">
+			<ee:transform doc:name="Issue Invoice">
+				<ee:message>
+					<ee:set-payload><![CDATA[%dw 2.0
+output application/java
+---
+{
+	orderId: vars.vInvoiceRequest.orderId,
+	invoiceId: "INV-" ++ uuid(),
+	amount: vars.vInvoiceRequest.amount,
+	issuedAt: now() as String
+}]]></ee:set-payload>
+				</ee:message>
+			</ee:transform>
+			<http:request doc:name="POST Invoice To Return Address" config-ref="eip-self-http-request-config" method="POST" path="#[vars.vReplyTo]">
+				<http:body><![CDATA[#[output application/json --- payload]]]></http:body>
+			</http:request>
+			<logger doc:name="INFO: Log invoice sent" level="INFO" message="#['Invoice for orderId=' ++ vars.vInvoiceRequest.orderId ++ ' sent to ' ++ vars.vReplyTo ++ ', correlationId=' ++ correlationId]" />
+		</async>
+		<set-payload doc:name="Set Accepted Response" value="#[output application/json --- { orderId: vars.vInvoiceRequest.orderId, status: 'ACCEPTED', replyTo: vars.vReplyTo }]" />
+	</flow>
+
+	<flow name="requestor-receive-invoice-reply" doc:description="A requestor's reply channel: records an invoice received at /eip/requestors/{requestor}/invoice-replies in that requestor's inbox.">
+		<http:listener doc:name="POST /eip/requestors/{requestor}/invoice-replies" config-ref="http-listener-config" path="/eip/requestors/{requestor}/invoice-replies" allowedMethods="POST">
+			<http:response statusCode="#[vars.httpStatus default 200]" />
+		</http:listener>
+		<set-variable doc:name="SET vRequestor" variableName="vRequestor" value="#[attributes.uriParams.requestor]" />
+		<choice doc:name="Check Invoice">
+			<when expression="#[(not (payload is Object)) or isEmpty(payload.orderId)]">
+				<raise-error doc:name="Raise BAD_REQUEST Error - Missing orderId" type="APP:BAD_REQUEST" description="orderId is required" />
+			</when>
+		</choice>
+		<os:store doc:name="Store Invoice In Inbox" key="#[vars.vRequestor ++ '|' ++ payload.orderId]" objectStore="eip-requestor-invoice-inbox-store">
+			<os:value><![CDATA[#[output application/java --- payload ++ { receivedBy: vars.vRequestor }]]]></os:value>
+		</os:store>
+		<logger doc:name="INFO: Log invoice received" level="INFO" message="#['Requestor ' ++ vars.vRequestor ++ ' received the invoice of orderId=' ++ payload.orderId ++ ', correlationId=' ++ correlationId]" />
+		<set-payload doc:name="Set Received Response" value="#[output application/json --- { requestor: vars.vRequestor, orderId: payload.orderId, result: 'RECEIVED' }]" />
+	</flow>
+
+	<flow name="requestor-get-invoice-replies" doc:description="GET /eip/requestors/{requestor}/invoice-replies: the invoices this requestor has received, by orderId.">
+		<http:listener doc:name="GET /eip/requestors/{requestor}/invoice-replies" config-ref="http-listener-config" path="/eip/requestors/{requestor}/invoice-replies" allowedMethods="GET">
+			<http:response statusCode="#[vars.httpStatus default 200]" />
+		</http:listener>
+		<set-variable doc:name="SET vRequestor" variableName="vRequestor" value="#[attributes.uriParams.requestor]" />
+		<os:retrieve-all doc:name="Read Invoice Inboxes" objectStore="eip-requestor-invoice-inbox-store" />
+		<ee:transform doc:name="List This Requestor's Invoices">
+			<ee:message>
+				<ee:set-payload><![CDATA[%dw 2.0
+output application/json
+var prefix = vars.vRequestor ++ "|"
+---
+{
+	requestor: vars.vRequestor,
+	invoices: (payload pluck ((value, key) -> { key: key as String, value: value }))
+		filter ($.key startsWith prefix)
+		map $.value
+		orderBy $.orderId
+}]]></ee:set-payload>
+			</ee:message>
+		</ee:transform>
+	</flow>
+</mule>

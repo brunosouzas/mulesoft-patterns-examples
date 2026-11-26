@@ -1,0 +1,94 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<mule xmlns="http://www.mulesoft.org/schema/mule/core"
+	xmlns:http="http://www.mulesoft.org/schema/mule/http"
+	xmlns:ee="http://www.mulesoft.org/schema/mule/ee/core"
+	xmlns:doc="http://www.mulesoft.org/schema/mule/documentation"
+	xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+	xsi:schemaLocation="http://www.mulesoft.org/schema/mule/core http://www.mulesoft.org/schema/mule/core/current/mule.xsd
+		http://www.mulesoft.org/schema/mule/http http://www.mulesoft.org/schema/mule/http/current/mule-http.xsd
+		http://www.mulesoft.org/schema/mule/ee/core http://www.mulesoft.org/schema/mule/ee/core/current/mule-ee.xsd">
+
+	<!--
+		CONTENT ENRICHER (Hohpe and Woolf): when a message lacks data the receiver needs, the enricher looks the
+		data up in another system and adds it to the message. Here an order carries only a customerId; before it
+		is invoiced and shipped it needs the customer's name, tier and shipping address, which the customer
+		service (CRM, simulated in content-enricher-crm.xml) holds.
+		POST /eip/orders/enrich { orderId, customerId, items }
+		  -> 200 { orderId, customerId, items, customer: { name, tier, shippingAddress } }
+
+		Mule 3 had an enricher scope; in Mule 4 the enricher is a target variable on the operation. The HTTP
+		request below stores the CRM's answer in vars.vCustomer (target), and only its customer part
+		(targetValue="#[payload.customer]"; the CRM's metadata is left out). "When you set a variable from an
+		operation, the operation outputs to the next component in the flow the same message that it received as
+		input", so the order is still the payload after the call, and the Transform merges the two:
+		https://docs.mulesoft.com/mule-runtime/latest/target-variables
+
+		When the CRM cannot answer, the order cannot be enriched. The same page states that "target variables are
+		not set when an error occurs", so the failed call does not set vars.vCustomer
+		(it keeps whatever it held before) and there is no customer to merge. This flow
+		then answers 503 { orderId, enrichment: "FAILED", reason } and does not pass the order on without the
+		customer: invoicing and shipping need the address. (When the missing data is optional, the other choice
+		is to continue with the order marked for a later enrichment.) A customerId the CRM does not know is the
+		caller's error: 400.
+	-->
+	<flow name="order-enrich-with-customer" doc:description="Content enricher: POST /eip/orders/enrich adds the customer's name, tier and shipping address from the CRM to an order that carries only the customerId; 503 when the CRM is unavailable.">
+		<http:listener doc:name="POST /eip/orders/enrich" config-ref="http-listener-config" path="/eip/orders/enrich" allowedMethods="POST">
+			<http:response statusCode="#[vars.httpStatus default 200]" />
+		</http:listener>
+		<logger doc:name="INFO: Log enrichment request" level="INFO" message="#['Enrich orderId=' ++ (payload.orderId default 'none') ++ ', correlationId=' ++ correlationId]" />
+		<choice doc:name="Validate Order To Enrich">
+			<when expression="#[(not (payload is Object)) or isEmpty(payload.orderId) or isEmpty(payload.customerId) or (not (payload.items is Array)) or isEmpty(payload.items)]">
+				<raise-error doc:name="Raise BAD_REQUEST Error - Missing order fields" type="APP:BAD_REQUEST" description="orderId, customerId and a non-empty items array are required" />
+			</when>
+		</choice>
+		<try doc:name="Try Enrich Order With Customer">
+			<http:request doc:name="Look Up Customer In CRM" config-ref="eip-self-http-request-config" method="GET" path="/eip/services/customers/{customerId}" target="vCustomer" targetValue="#[payload.customer]">
+				<http:uri-params><![CDATA[#[{ customerId: payload.customerId }]]]></http:uri-params>
+			</http:request>
+			<ee:transform doc:name="Merge Customer Into Order">
+				<ee:message>
+					<ee:set-payload><![CDATA[%dw 2.0
+output application/json
+---
+payload ++ {
+	customer: {
+		name: vars.vCustomer.name,
+		tier: vars.vCustomer.tier,
+		shippingAddress: vars.vCustomer.shippingAddress
+	}
+}]]></ee:set-payload>
+				</ee:message>
+			</ee:transform>
+			<error-handler>
+				<on-error-continue doc:name="On Error Continue (customer not found)" type="HTTP:NOT_FOUND" logException="false">
+					<set-variable doc:name="SET httpStatus" variableName="httpStatus" value="400" />
+					<ee:transform doc:name="Build Unknown Customer Error">
+						<ee:message>
+							<ee:set-payload><![CDATA[%dw 2.0
+output application/json
+---
+{ error: "customer " ++ payload.customerId ++ " not found" }]]></ee:set-payload>
+						</ee:message>
+					</ee:transform>
+				</on-error-continue>
+				<on-error-continue doc:name="On Error Continue (CRM unavailable)" type="HTTP:SERVICE_UNAVAILABLE, HTTP:CONNECTIVITY, HTTP:TIMEOUT" logException="false">
+					<logger doc:name="WARN: Log enrichment failed" level="WARN" message="#['Order ' ++ payload.orderId ++ ' not enriched: ' ++ error.errorType.namespace ++ ':' ++ error.errorType.identifier ++ ', correlationId=' ++ correlationId]" />
+					<set-variable doc:name="SET httpStatus" variableName="httpStatus" value="503" />
+					<ee:transform doc:name="Build Enrichment Failed Response">
+						<ee:message>
+							<ee:set-payload><![CDATA[%dw 2.0
+output application/json
+---
+{
+	orderId: payload.orderId,
+	enrichment: "FAILED",
+	// The error type only: the description names the requester's URL.
+	reason: error.errorType.namespace ++ ":" ++ error.errorType.identifier
+}]]></ee:set-payload>
+						</ee:message>
+					</ee:transform>
+				</on-error-continue>
+			</error-handler>
+		</try>
+	</flow>
+</mule>

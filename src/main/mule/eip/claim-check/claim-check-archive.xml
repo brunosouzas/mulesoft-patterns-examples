@@ -1,0 +1,41 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<mule xmlns="http://www.mulesoft.org/schema/mule/core"
+	xmlns:http="http://www.mulesoft.org/schema/mule/http"
+	xmlns:ee="http://www.mulesoft.org/schema/mule/ee/core"
+	xmlns:doc="http://www.mulesoft.org/schema/mule/documentation"
+	xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+	xsi:schemaLocation="http://www.mulesoft.org/schema/mule/core http://www.mulesoft.org/schema/mule/core/current/mule.xsd
+		http://www.mulesoft.org/schema/mule/http http://www.mulesoft.org/schema/mule/http/current/mule-http.xsd
+		http://www.mulesoft.org/schema/mule/ee/core http://www.mulesoft.org/schema/mule/ee/core/current/mule-ee.xsd">
+
+	<!--
+		CLAIM CHECK: the document archive, simulated on this application. It receives the claim message
+		{ orderId, claimKey, fileName }, checks the document out with the key and answers what it archived,
+		including the fields of the message it received, so the tests can show that the content did not travel.
+		POST /eip/archive/documents -> 200 { orderId, fileName, sizeBytes, receivedFields }, or 404 for a claim
+		that is unknown or expired.
+	-->
+	<flow name="archive-store-order-document" doc:description="Simulated document archive: POST /eip/archive/documents takes a claim message, checks the order document out with its claim key and archives it.">
+		<http:listener doc:name="POST /eip/archive/documents" config-ref="http-listener-config" path="/eip/archive/documents" allowedMethods="POST">
+			<http:response statusCode="#[vars.httpStatus default 200]" />
+		</http:listener>
+		<set-variable doc:name="SET vReceivedFields" variableName="vReceivedFields" value="#[keysOf(payload) map ($ as String)]" />
+		<set-variable doc:name="SET vClaimKey" variableName="vClaimKey" value="#[payload.claimKey]" />
+		<flow-ref doc:name="Refer to sf-check-out-document" name="sf-check-out-document" />
+		<ee:transform doc:name="Archive Document (simulated)">
+			<ee:message>
+				<ee:set-payload><![CDATA[%dw 2.0
+import fromBase64 from dw::core::Binaries
+output application/json
+---
+{
+	orderId: payload.orderId,
+	fileName: payload.fileName,
+	sizeBytes: sizeOf(fromBase64(payload.contentBase64)),
+	receivedFields: vars.vReceivedFields
+}]]></ee:set-payload>
+			</ee:message>
+		</ee:transform>
+		<logger doc:name="INFO: Log document archived" level="INFO" message="#['Archived ' ++ payload.fileName ++ ' of orderId=' ++ payload.orderId ++ ', correlationId=' ++ correlationId]" />
+	</flow>
+</mule>

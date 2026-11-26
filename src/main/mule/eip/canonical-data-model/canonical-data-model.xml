@@ -1,0 +1,89 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<mule xmlns="http://www.mulesoft.org/schema/mule/core"
+	xmlns:http="http://www.mulesoft.org/schema/mule/http"
+	xmlns:os="http://www.mulesoft.org/schema/mule/os"
+	xmlns:ee="http://www.mulesoft.org/schema/mule/ee/core"
+	xmlns:doc="http://www.mulesoft.org/schema/mule/documentation"
+	xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+	xsi:schemaLocation="http://www.mulesoft.org/schema/mule/core http://www.mulesoft.org/schema/mule/core/current/mule.xsd
+		http://www.mulesoft.org/schema/mule/http http://www.mulesoft.org/schema/mule/http/current/mule-http.xsd
+		http://www.mulesoft.org/schema/mule/os http://www.mulesoft.org/schema/mule/os/current/mule-os.xsd
+		http://www.mulesoft.org/schema/mule/ee/core http://www.mulesoft.org/schema/mule/ee/core/current/mule-ee.xsd">
+
+	<!--
+		CANONICAL DATA MODEL (Hohpe and Woolf): a data model independent of any one application. Each application
+		translates between its own format and the canonical one, so a new application needs translators to and
+		from the canonical model only, instead of one translator for every application it exchanges data with.
+
+		Here orders arrive from two sources and go to two targets:
+		  sources: the marketplace (JSON)        POST /eip/canonical/orders/marketplace
+		           a partner (XML purchase order) POST /eip/canonical/orders/partner
+		  targets: invoicing (JSON invoice request) and the warehouse (CSV pick list)
+		Translating every source straight into every target takes N x M translators; through the canonical
+		order it takes N + M. With two and two both are 4, so the gain is in the next one: a third source is one
+		more translator (into the canonical order), not one per target, and nothing else changes.
+
+		The translators are DataWeave modules in src/main/resources/dwl/canonical/: FromMarketplace, FromPartnerXml
+		(source -> canonical), ToInvoicing, ToWarehouse (canonical -> target), and CanonicalOrder (the type, a
+		helper and the validation). A module saved within src/main/resources is accessible to any DataWeave script
+		in the app, and its functions are called after an import directive in the script's header:
+		https://docs.mulesoft.com/dataweave/latest/dataweave-create-module
+
+		The canonical order is validated once, after either source has been translated, so a rule about orders is
+		written once and not in every source translator. Each source flow answers with the canonical order and the
+		two target documents it produced.
+	-->
+	<flow name="canonical-order-from-marketplace" doc:description="Canonical data model: POST /eip/canonical/orders/marketplace translates a marketplace JSON order into the canonical order and from it into the invoicing and warehouse documents.">
+		<http:listener doc:name="POST /eip/canonical/orders/marketplace" config-ref="http-listener-config" path="/eip/canonical/orders/marketplace" allowedMethods="POST" />
+		<ee:transform doc:name="Translate Marketplace Order To Canonical">
+			<ee:message>
+				<ee:set-payload><![CDATA[%dw 2.0
+import toCanonical from dwl::canonical::FromMarketplace
+output application/java
+---
+toCanonical(payload)]]></ee:set-payload>
+			</ee:message>
+		</ee:transform>
+		<flow-ref doc:name="Refer to sf-deliver-canonical-order" name="sf-deliver-canonical-order" />
+	</flow>
+
+	<flow name="canonical-order-from-partner" doc:description="Canonical data model: POST /eip/canonical/orders/partner translates a partner XML purchase order into the canonical order and from it into the invoicing and warehouse documents.">
+		<http:listener doc:name="POST /eip/canonical/orders/partner" config-ref="http-listener-config" path="/eip/canonical/orders/partner" allowedMethods="POST" />
+		<ee:transform doc:name="Translate Partner Purchase Order To Canonical">
+			<ee:message>
+				<ee:set-payload><![CDATA[%dw 2.0
+import toCanonical from dwl::canonical::FromPartnerXml
+output application/java
+---
+toCanonical(payload)]]></ee:set-payload>
+			</ee:message>
+		</ee:transform>
+		<flow-ref doc:name="Refer to sf-deliver-canonical-order" name="sf-deliver-canonical-order" />
+	</flow>
+
+	<sub-flow name="sf-deliver-canonical-order" doc:description="Validates the canonical order in the payload and translates it into each target's document; called by every source flow, which knows nothing of the targets.">
+		<set-variable doc:name="SET vCanonicalProblems" variableName="vCanonicalProblems" value="#[dwl::canonical::CanonicalOrder::problems(payload)]" />
+		<choice doc:name="Validate Canonical Order">
+			<when expression="#[not isEmpty(vars.vCanonicalProblems)]">
+				<raise-error doc:name="Raise BAD_REQUEST Error - Invalid canonical order" type="APP:BAD_REQUEST" description="#[vars.vCanonicalProblems joinBy '; ']" />
+			</when>
+		</choice>
+		<logger doc:name="INFO: Log canonical order" level="INFO" message="#['Canonical order ' ++ payload.orderId ++ ' from ' ++ payload.source ++ ', correlationId=' ++ correlationId]" />
+		<ee:transform doc:name="Translate Canonical Order To Targets">
+			<ee:message>
+				<ee:set-payload><![CDATA[%dw 2.0
+import dwl::canonical::ToInvoicing
+import dwl::canonical::ToWarehouse
+output application/json
+---
+{
+	canonicalOrder: payload,
+	targets: {
+		invoicing: ToInvoicing::fromCanonical(payload),
+		warehouse: write(ToWarehouse::fromCanonical(payload), "application/csv")
+	}
+}]]></ee:set-payload>
+			</ee:message>
+		</ee:transform>
+	</sub-flow>
+</mule>

@@ -1,0 +1,135 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<mule xmlns="http://www.mulesoft.org/schema/mule/core"
+	xmlns:http="http://www.mulesoft.org/schema/mule/http"
+	xmlns:os="http://www.mulesoft.org/schema/mule/os"
+	xmlns:ee="http://www.mulesoft.org/schema/mule/ee/core"
+	xmlns:doc="http://www.mulesoft.org/schema/mule/documentation"
+	xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+	xsi:schemaLocation="http://www.mulesoft.org/schema/mule/core http://www.mulesoft.org/schema/mule/core/current/mule.xsd
+		http://www.mulesoft.org/schema/mule/http http://www.mulesoft.org/schema/mule/http/current/mule-http.xsd
+		http://www.mulesoft.org/schema/mule/os http://www.mulesoft.org/schema/mule/os/current/mule-os.xsd
+		http://www.mulesoft.org/schema/mule/ee/core http://www.mulesoft.org/schema/mule/ee/core/current/mule-ee.xsd">
+
+	<!--
+		REQUEST-REPLY (Hohpe and Woolf): a requestor sends a request and the replier answers on a reply channel.
+		Here: an order needs a stock reservation from the warehouse. Two ways, side by side:
+
+		SYNCHRONOUS  POST /eip/stock/reservations/sync    the requestor calls the warehouse with an HTTP request and
+		             waits: the reply is the HTTP response, on the same connection. The HTTP Request operation blocks
+		             the flow until the response arrives (or responseTimeout passes), so the requestor's own caller
+		             waits as long as the warehouse takes (waitedMillis in the response).
+		             https://docs.mulesoft.com/http-connector/latest/http-request-ref
+		ASYNCHRONOUS POST /eip/stock/reservations/async   the requestor sends the request and answers 202 at once;
+		             the warehouse accepts it (202) and replies later, from an Async scope, by POSTing the reservation
+		             to the requestor's reply channel, POST /eip/stock/reservation-replies. Until then
+		             GET /eip/stock/reservation-replies/{orderId} says PENDING.
+		             "The Async scope executes its message processors in a different thread, while the main flow
+		             continues": https://docs.mulesoft.com/mule-runtime/latest/async-scope-reference
+
+		The reply is matched to its request by orderId. That is enough for one reservation per order; when one
+		requestor can have several requests in flight, or the replier must not know our IDs, the reply needs a
+		Correlation Identifier: see correlation-identifier/ (wave 1), which this example does not duplicate.
+		The reply channel here is fixed in configuration (eip.requestReply.replyChannelPath); return-address/
+		shows the request naming its own reply channel.
+
+		With a broker the reply channel is a queue: VM Connector's Publish Consume operation publishes and waits
+		on a temporary reply-to queue (https://docs.mulesoft.com/vm-connector/latest/vm-reference). It is not used
+		here: this project does not simulate a broker with VM queues.
+		The warehouse is simulated on this app (request-reply-warehouse.xml).
+	-->
+	<os:object-store name="eip-reservation-replies-store" doc:name="Reservation Replies Object Store" persistent="false" />
+
+	<flow name="stock-reserve-request-reply-sync" doc:description="Request-reply, synchronous: asks the warehouse for a stock reservation over HTTP and waits for the reply in the HTTP response.">
+		<http:listener doc:name="POST /eip/stock/reservations/sync" config-ref="http-listener-config" path="/eip/stock/reservations/sync" allowedMethods="POST">
+			<http:response statusCode="#[vars.httpStatus default 200]" />
+		</http:listener>
+		<flow-ref doc:name="Refer to sf-validate-reservation-request" name="sf-validate-reservation-request" />
+		<set-variable doc:name="SET vRequest" variableName="vRequest" value="#[output application/java --- payload]" />
+		<set-variable doc:name="SET vStartedAt" variableName="vStartedAt" value="#[now()]" />
+		<http:request doc:name="POST Reservation To Warehouse And Wait" config-ref="eip-self-http-request-config" method="POST" path="/eip/warehouse/reservations">
+			<http:body><![CDATA[#[output application/json --- vars.vRequest]]]></http:body>
+		</http:request>
+		<ee:transform doc:name="Build Sync Response">
+			<ee:message>
+				<ee:set-payload><![CDATA[%dw 2.0
+output application/json
+---
+{
+	mode: "SYNC",
+	orderId: vars.vRequest.orderId,
+	reply: payload,
+	waitedMillis: (now() - vars.vStartedAt) as Number { unit: "milliseconds" }
+}]]></ee:set-payload>
+			</ee:message>
+		</ee:transform>
+		<logger doc:name="INFO: Log sync reply received" level="INFO" message="#['Sync reservation reply for orderId=' ++ vars.vRequest.orderId ++ ' after ' ++ payload.waitedMillis ++ ' ms, correlationId=' ++ correlationId]" />
+	</flow>
+
+	<flow name="stock-reserve-request-reply-async" doc:description="Request-reply, asynchronous: sends a stock reservation request to the warehouse and answers 202 at once; the reply arrives later on the reply channel.">
+		<http:listener doc:name="POST /eip/stock/reservations/async" config-ref="http-listener-config" path="/eip/stock/reservations/async" allowedMethods="POST">
+			<http:response statusCode="#[vars.httpStatus default 202]" />
+		</http:listener>
+		<flow-ref doc:name="Refer to sf-validate-reservation-request" name="sf-validate-reservation-request" />
+		<set-variable doc:name="SET vRequest" variableName="vRequest" value="#[output application/java --- payload]" />
+		<!-- Stored before the request is sent: the reply can arrive before the warehouse's 202 does. -->
+		<os:store doc:name="Store Pending Reply" key="#[vars.vRequest.orderId]" objectStore="eip-reservation-replies-store">
+			<os:value><![CDATA[#[output application/java --- { orderId: vars.vRequest.orderId, status: "PENDING" }]]]></os:value>
+		</os:store>
+		<http:request doc:name="POST Reservation Request To Warehouse" config-ref="eip-self-http-request-config" method="POST" path="/eip/warehouse/reservation-requests">
+			<http:body><![CDATA[#[output application/json --- vars.vRequest]]]></http:body>
+		</http:request>
+		<logger doc:name="INFO: Log async request sent" level="INFO" message="#['Async reservation requested for orderId=' ++ vars.vRequest.orderId ++ ', warehouse answered ' ++ attributes.statusCode ++ ', correlationId=' ++ correlationId]" />
+		<set-payload doc:name="Set Pending Response" value="#[output application/json --- { mode: 'ASYNC', orderId: vars.vRequest.orderId, status: 'PENDING', replyChannel: p('eip.requestReply.replyChannelPath') }]" />
+	</flow>
+
+	<flow name="stock-receive-reservation-reply" doc:description="Request-reply reply channel: receives the warehouse's asynchronous reservation reply and records it for the order that is waiting for it; 404 when no request was sent, 409 when a reply was already received.">
+		<http:listener doc:name="POST /eip/stock/reservation-replies" config-ref="http-listener-config" path="/eip/stock/reservation-replies" allowedMethods="POST">
+			<http:response statusCode="#[vars.httpStatus default 200]" />
+		</http:listener>
+		<choice doc:name="Check Reply">
+			<when expression="#[(not (payload is Object)) or isEmpty(payload.orderId)]">
+				<raise-error doc:name="Raise BAD_REQUEST Error - Missing orderId" type="APP:BAD_REQUEST" description="orderId is required" />
+			</when>
+		</choice>
+		<set-variable doc:name="SET vReply" variableName="vReply" value="#[output application/java --- payload]" />
+		<os:retrieve doc:name="Read Pending Request" key="#[vars.vReply.orderId]" objectStore="eip-reservation-replies-store" target="vPending">
+			<os:default-value><![CDATA[#[output application/java --- { status: null }]]]></os:default-value>
+		</os:retrieve>
+		<!-- One reply per request: a second reply for the same order is rejected (409) and does not overwrite the first. -->
+		<choice doc:name="Check Request Is Pending">
+			<when expression="#[vars.vPending.status == null]">
+				<raise-error doc:name="Raise NOT_FOUND Error - No request" type="APP:NOT_FOUND" description="No reservation request for this orderId" />
+			</when>
+			<when expression="#[vars.vPending.status != 'PENDING']">
+				<raise-error doc:name="Raise CONFLICT Error - Already replied" type="APP:CONFLICT" description="A reply for this orderId was already received" />
+			</when>
+		</choice>
+		<os:store doc:name="Store Reply" key="#[vars.vReply.orderId]" objectStore="eip-reservation-replies-store">
+			<os:value><![CDATA[#[output application/java --- vars.vReply ++ { receivedAt: now() as String }]]]></os:value>
+		</os:store>
+		<logger doc:name="INFO: Log reply received" level="INFO" message="#['Reservation reply ' ++ (vars.vReply.status default '') ++ ' for orderId=' ++ vars.vReply.orderId ++ ', correlationId=' ++ correlationId]" />
+		<set-payload doc:name="Set Received Response" value="#[output application/json --- { orderId: vars.vReply.orderId, result: 'RECEIVED' }]" />
+	</flow>
+
+	<flow name="stock-get-reservation-reply" doc:description="GET /eip/stock/reservation-replies/{orderId}: PENDING until the asynchronous reply arrives, then the reply; 404 when no request was sent.">
+		<http:listener doc:name="GET /eip/stock/reservation-replies/{orderId}" config-ref="http-listener-config" path="/eip/stock/reservation-replies/{orderId}" allowedMethods="GET">
+			<http:response statusCode="#[vars.httpStatus default 200]" />
+		</http:listener>
+		<os:contains doc:name="Check Known Order" key="#[attributes.uriParams.orderId]" objectStore="eip-reservation-replies-store" target="vKnown" />
+		<choice doc:name="Check Found">
+			<when expression="#[not vars.vKnown]">
+				<raise-error doc:name="Raise NOT_FOUND Error - No request" type="APP:NOT_FOUND" description="No reservation request for this orderId" />
+			</when>
+		</choice>
+		<os:retrieve doc:name="Read Reply" key="#[attributes.uriParams.orderId]" objectStore="eip-reservation-replies-store" />
+		<set-payload doc:name="Set Reply As JSON" value="#[output application/json --- payload]" />
+	</flow>
+
+	<sub-flow name="sf-validate-reservation-request" doc:description="Validates a reservation request: orderId, sku and a positive numeric quantity.">
+		<choice doc:name="Validate Reservation Request">
+			<when expression="#[(not (payload is Object)) or isEmpty(payload.orderId) or isEmpty(payload.sku) or (not (payload.quantity is Number)) or payload.quantity &lt;= 0]">
+				<raise-error doc:name="Raise BAD_REQUEST Error - Missing fields" type="APP:BAD_REQUEST" description="orderId, sku and a positive quantity are required" />
+			</when>
+		</choice>
+	</sub-flow>
+</mule>

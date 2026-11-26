@@ -1,0 +1,78 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<mule xmlns="http://www.mulesoft.org/schema/mule/core"
+	xmlns:http="http://www.mulesoft.org/schema/mule/http"
+	xmlns:os="http://www.mulesoft.org/schema/mule/os"
+	xmlns:ee="http://www.mulesoft.org/schema/mule/ee/core"
+	xmlns:doc="http://www.mulesoft.org/schema/mule/documentation"
+	xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+	xsi:schemaLocation="http://www.mulesoft.org/schema/mule/core http://www.mulesoft.org/schema/mule/core/current/mule.xsd
+		http://www.mulesoft.org/schema/mule/http http://www.mulesoft.org/schema/mule/http/current/mule-http.xsd
+		http://www.mulesoft.org/schema/mule/os http://www.mulesoft.org/schema/mule/os/current/mule-os.xsd
+		http://www.mulesoft.org/schema/mule/ee/core http://www.mulesoft.org/schema/mule/ee/core/current/mule-ee.xsd">
+
+	<!--
+		MESSAGE TRANSLATOR (Hohpe and Woolf): translates one data format into another, so that a system can take
+		messages from a sender that uses a different format. Here a partner sends its orders as CSV, one row per
+		order line, and this application works with its own JSON order.
+		POST /eip/orders/translate   Content-Type: application/csv
+		  partnerOrderRef,buyerCode,shipToCountry,productCode,qty,unitPriceCents
+		  P-77,B-100,BR,BOOK-01,2,3000
+		->
+		  { orderId: "ORD-P-77", customerId: "CUS-B-100", country: "BR", currency: "BRL",
+		    items: [ { sku: "SKU-BOOK", quantity: 2, unitPrice: 30 } ] }
+
+		The translation is more than renaming fields. It changes:
+		  - the structure: many CSV rows become one order with an items array;
+		  - the types: every CSV field is a string; quantity and price become numbers, and cents become units;
+		  - the codes: the partner's product codes become this app's SKUs (a lookup table), and its references
+		    become this app's identifiers (prefixes).
+		A row whose product code has no SKU makes the whole order 400: a translator that drops or guesses a value
+		hands the receiver a message that looks valid and is wrong. The code table is in
+		src/main/resources/dwl/translator/PartnerProducts.dwl, shared by the validation and the transform.
+
+		In Mule the Message Translator is the Transform Message component (DataWeave). DataWeave reads the CSV
+		because the request's Content-Type is application/csv; with header=true (the default) each row is an object
+		whose keys are the header's column names: https://docs.mulesoft.com/dataweave/latest/dataweave-formats-csv
+	-->
+	<flow name="order-translate-partner-csv" doc:description="Message translator: POST /eip/orders/translate takes a partner order as CSV lines and answers it translated into this app's JSON order.">
+		<http:listener doc:name="POST /eip/orders/translate" config-ref="http-listener-config" path="/eip/orders/translate" allowedMethods="POST" />
+		<logger doc:name="INFO: Log partner order received" level="INFO" message="#['Partner order received for translation, correlationId=' ++ correlationId]" />
+		<flow-ref doc:name="Refer to sf-validate-partner-order-csv" name="sf-validate-partner-order-csv" />
+		<ee:transform doc:name="Translate Partner CSV To Order">
+			<ee:message>
+				<ee:set-payload><![CDATA[%dw 2.0
+output application/json
+import skuFor from dwl::translator::PartnerProducts
+var first = payload[0]
+---
+{
+	orderId: "ORD-" ++ first.partnerOrderRef,
+	customerId: "CUS-" ++ first.buyerCode,
+	country: upper(first.shipToCountry),
+	// The partner contract is BRL-only: the CSV has no currency column and its prices are BRL cents.
+	currency: "BRL",
+	items: payload map ((row) -> {
+		sku: skuFor(row.productCode),
+		quantity: row.qty as Number,
+		unitPrice: (row.unitPriceCents as Number) / 100
+	})
+}]]></ee:set-payload>
+			</ee:message>
+		</ee:transform>
+		<logger doc:name="INFO: Log translated order" level="INFO" message="#['Partner order translated to orderId=' ++ payload.orderId ++ ', correlationId=' ++ correlationId]" />
+	</flow>
+
+	<sub-flow name="sf-validate-partner-order-csv" doc:description="Validates the partner CSV before translating it: at least one row, every column present, numeric quantity and price, a known product code and one partner order per request.">
+		<choice doc:name="Validate Partner Order CSV">
+			<when expression="#[(not (payload is Array)) or isEmpty(payload) or not isEmpty(payload filter ((row) -> isEmpty(row.partnerOrderRef) or isEmpty(row.buyerCode) or isEmpty(row.shipToCountry) or isEmpty(row.productCode) or not ((row.qty default '') matches /[1-9][0-9]*/) or not ((row.unitPriceCents default '') matches /[0-9]+/)))]">
+				<raise-error doc:name="Raise BAD_REQUEST Error - Invalid partner rows" type="APP:BAD_REQUEST" description="every row needs partnerOrderRef, buyerCode, shipToCountry, productCode, a whole qty above zero and unitPriceCents in whole cents" />
+			</when>
+			<when expression="#[sizeOf(payload distinctBy $.partnerOrderRef) > 1]">
+				<raise-error doc:name="Raise BAD_REQUEST Error - More than one order" type="APP:BAD_REQUEST" description="all rows of a request must belong to the same partnerOrderRef" />
+			</when>
+			<when expression="#[not isEmpty(payload filter (dwl::translator::PartnerProducts::skuFor($.productCode) == null))]">
+				<raise-error doc:name="Raise BAD_REQUEST Error - Unknown product code" type="APP:BAD_REQUEST" description="#['unknown product code: ' ++ ((payload filter (dwl::translator::PartnerProducts::skuFor($.productCode) == null)).productCode joinBy ', ')]" />
+			</when>
+		</choice>
+	</sub-flow>
+</mule>

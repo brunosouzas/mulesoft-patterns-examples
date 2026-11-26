@@ -1,0 +1,39 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<mule xmlns="http://www.mulesoft.org/schema/mule/core"
+	xmlns:http="http://www.mulesoft.org/schema/mule/http"
+	xmlns:os="http://www.mulesoft.org/schema/mule/os"
+	xmlns:ee="http://www.mulesoft.org/schema/mule/ee/core"
+	xmlns:doc="http://www.mulesoft.org/schema/mule/documentation"
+	xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+	xsi:schemaLocation="http://www.mulesoft.org/schema/mule/core http://www.mulesoft.org/schema/mule/core/current/mule.xsd
+		http://www.mulesoft.org/schema/mule/http http://www.mulesoft.org/schema/mule/http/current/mule-http.xsd
+		http://www.mulesoft.org/schema/mule/os http://www.mulesoft.org/schema/mule/os/current/mule-os.xsd
+		http://www.mulesoft.org/schema/mule/ee/core http://www.mulesoft.org/schema/mule/ee/core/current/mule-ee.xsd">
+
+	<!--
+		CHANNEL ADAPTER: the legacy ERP, simulated on this application. GET /eip/legacy/orders/{orderId} answers one
+		order as semicolon-separated CSV (application/csv) with a header row; amounts are in cents, the status is
+		a one-letter code (P paid, D declined, R refunded; ORD-LEGACY-1004 has the code X, which the adapter does
+		not know). An unknown order gets 404 as plain text, the way an old system might answer it.
+	-->
+	<flow name="legacy-erp-get-order" doc:description="Simulated legacy ERP: answers an order as semicolon-separated CSV, amounts in cents and one-letter status codes; 404 as plain text for an unknown order.">
+		<http:listener doc:name="GET /eip/legacy/orders/{orderId}" config-ref="http-listener-config" path="/eip/legacy/orders/{orderId}" allowedMethods="GET">
+			<http:response statusCode="#[vars.httpStatus default 200]" />
+		</http:listener>
+		<set-variable doc:name="SET vLegacyOrder" variableName="vLegacyOrder" value="#[output application/java --- {
+	'ORD-LEGACY-1001': { ORDER_ID: 'ORD-LEGACY-1001', TOTAL_CENTS: '4250', CURRENCY: 'BRL', STATUS_CODE: 'P' },
+	'ORD-LEGACY-1002': { ORDER_ID: 'ORD-LEGACY-1002', TOTAL_CENTS: '1999', CURRENCY: 'BRL', STATUS_CODE: 'D' },
+	'ORD-LEGACY-1003': { ORDER_ID: 'ORD-LEGACY-1003', TOTAL_CENTS: '12000', CURRENCY: 'USD', STATUS_CODE: 'R' },
+	'ORD-LEGACY-1004': { ORDER_ID: 'ORD-LEGACY-1004', TOTAL_CENTS: '500', CURRENCY: 'BRL', STATUS_CODE: 'X' }
+}[attributes.uriParams.orderId]]" />
+		<choice doc:name="Check Order Exists">
+			<when expression="#[vars.vLegacyOrder == null]">
+				<set-variable doc:name="SET httpStatus" variableName="httpStatus" value="404" />
+				<set-payload doc:name="Set Not Found Text" value="#[output text/plain --- 'ORDER NOT FOUND']" />
+			</when>
+			<otherwise>
+				<set-payload doc:name="Set Order As CSV" value="#[output application/csv separator=';' --- [vars.vLegacyOrder]]" />
+			</otherwise>
+		</choice>
+	</flow>
+</mule>
