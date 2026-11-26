@@ -39,8 +39,8 @@
 					<http:success-status-code-validator values="200,409" />
 				</http:response-validator>
 			</http:request>
-			<set-variable doc:name="Order" variableName="ledgerOrderId" value="ORD-IR-B-100" />
-			<flow-ref doc:name="Ledger summary" name="payment-ledger-summary" />
+			<set-variable doc:name="Order" variableName="vLedgerOrderId" value="ORD-IR-B-100" />
+			<flow-ref doc:name="Ledger summary" name="sf-summarise-payment-ledger" />
 		</munit:execution>
 		<munit:validation>
 			<munit-tools:assert-that doc:name="Response names the order" expression="#[vars.first.orderId]" is="#[MunitTools::equalTo(payload.orderId)]" />
@@ -68,8 +68,8 @@
 					<http:success-status-code-validator values="200,409" />
 				</http:response-validator>
 			</http:request>
-			<set-variable doc:name="Order" variableName="ledgerOrderId" value="ORD-IR-B-101" />
-			<flow-ref doc:name="Ledger summary" name="payment-ledger-summary" />
+			<set-variable doc:name="Order" variableName="vLedgerOrderId" value="ORD-IR-B-101" />
+			<flow-ref doc:name="Ledger summary" name="sf-summarise-payment-ledger" />
 		</munit:execution>
 		<munit:validation>
 			<munit-tools:assert-that doc:name="Response names the order" expression="#[vars.first.orderId]" is="#[MunitTools::equalTo(payload.orderId)]" />
@@ -88,10 +88,10 @@
 			<!-- The provider leg belongs to the correlation identifier suite; here it answers 202 and does nothing. -->
 			<munit-tools:mock-when doc:name="Provider accepts" processor="http:request">
 				<munit-tools:with-attributes>
-					<munit-tools:with-attribute attributeName="doc:name" whereValue="Send payment request to provider" />
+					<munit-tools:with-attribute attributeName="doc:name" whereValue="Send Payment Request To Provider" />
 				</munit-tools:with-attributes>
 				<munit-tools:then-return>
-					<munit-tools:payload value="#[output application/java --- { requestId: vars.paymentRequest.requestId, status: 'ACCEPTED' }]" />
+					<munit-tools:payload value="#[output application/java --- { requestId: vars.vPaymentRequest.requestId, status: 'ACCEPTED' }]" />
 				</munit-tools:then-return>
 			</munit-tools:mock-when>
 		</munit:behavior>
@@ -108,8 +108,8 @@
 					<http:success-status-code-validator values="200,409" />
 				</http:response-validator>
 			</http:request>
-			<set-variable doc:name="Order" variableName="ledgerOrderId" value="ORD-IR-A-100" />
-			<flow-ref doc:name="Ledger summary" name="payment-ledger-summary" />
+			<set-variable doc:name="Order" variableName="vLedgerOrderId" value="ORD-IR-A-100" />
+			<flow-ref doc:name="Ledger summary" name="sf-summarise-payment-ledger" />
 		</munit:execution>
 		<munit:validation>
 			<munit-tools:assert-that doc:name="Response names the order" expression="#[vars.first.orderId]" is="#[MunitTools::equalTo(payload.orderId)]" />
@@ -144,10 +144,10 @@
 			<!-- The provider leg belongs to the correlation identifier suite; here it answers 202 and does nothing. -->
 			<munit-tools:mock-when doc:name="Provider accepts" processor="http:request">
 				<munit-tools:with-attributes>
-					<munit-tools:with-attribute attributeName="doc:name" whereValue="Send payment request to provider" />
+					<munit-tools:with-attribute attributeName="doc:name" whereValue="Send Payment Request To Provider" />
 				</munit-tools:with-attributes>
 				<munit-tools:then-return>
-					<munit-tools:payload value="#[output application/java --- { requestId: vars.paymentRequest.requestId, status: 'ACCEPTED' }]" />
+					<munit-tools:payload value="#[output application/java --- { requestId: vars.vPaymentRequest.requestId, status: 'ACCEPTED' }]" />
 				</munit-tools:then-return>
 			</munit-tools:mock-when>
 		</munit:behavior>
@@ -174,7 +174,7 @@
 			<!-- The charge fails after the validator accepted the order: recording it raises an error. -->
 			<munit-tools:mock-when doc:name="Recording the charge fails" processor="os:store">
 				<munit-tools:with-attributes>
-					<munit-tools:with-attribute attributeName="doc:name" whereValue="Record charge" />
+					<munit-tools:with-attribute attributeName="doc:name" whereValue="Record Charge" />
 				</munit-tools:with-attributes>
 				<munit-tools:then-return>
 					<munit-tools:error typeId="OS:STORE_NOT_AVAILABLE" />
@@ -193,8 +193,8 @@
 			<flow-ref doc:name="Retry" name="payment-after-charge-endpoint" />
 			<set-variable doc:name="Retry status" variableName="retryStatus" value="#[vars.httpStatus]" />
 			<set-variable doc:name="Retry result" variableName="retryResult" value="#[payload.result]" />
-			<set-variable doc:name="Order" variableName="ledgerOrderId" value="ORD-IR-FAIL-100" />
-			<flow-ref doc:name="Ledger summary" name="payment-ledger-summary" />
+			<set-variable doc:name="Order" variableName="vLedgerOrderId" value="ORD-IR-FAIL-100" />
+			<flow-ref doc:name="Ledger summary" name="sf-summarise-payment-ledger" />
 		</munit:execution>
 		<munit:validation>
 			<munit-tools:assert-that doc:name="First attempt failed with 500" expression="#[vars.firstStatus as Number]" is="#[MunitTools::equalTo(500)]" />
@@ -249,10 +249,10 @@
 			<!-- The provider leg belongs to the correlation identifier suite; here it answers 202 and does nothing. -->
 			<munit-tools:mock-when doc:name="Provider accepts" processor="http:request">
 				<munit-tools:with-attributes>
-					<munit-tools:with-attribute attributeName="doc:name" whereValue="Send payment request to provider" />
+					<munit-tools:with-attribute attributeName="doc:name" whereValue="Send Payment Request To Provider" />
 				</munit-tools:with-attributes>
 				<munit-tools:then-return>
-					<munit-tools:payload value="#[output application/java --- { requestId: vars.paymentRequest.requestId, status: 'ACCEPTED' }]" />
+					<munit-tools:payload value="#[output application/java --- { requestId: vars.vPaymentRequest.requestId, status: 'ACCEPTED' }]" />
 				</munit-tools:then-return>
 			</munit-tools:mock-when>
 		</munit:behavior>

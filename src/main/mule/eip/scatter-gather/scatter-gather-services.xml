@@ -17,7 +17,9 @@
 		                                                                     CUS-NEW score 80 (HIGH_RISK)
 	-->
 	<flow name="service-price-order" doc:description="Simulated pricing service: POST /eip/services/pricing returns the order total (sum of quantity times unit price).">
-		<http:listener doc:name="POST /eip/services/pricing" config-ref="http-listener-config" path="/eip/services/pricing" allowedMethods="POST" />
+		<http:listener doc:name="POST /eip/services/pricing" config-ref="http-listener-config" path="/eip/services/pricing" allowedMethods="POST">
+			<http:response statusCode="#[vars.httpStatus default 200]" />
+		</http:listener>
 		<ee:transform doc:name="Price Order (simulated)">
 			<ee:message>
 				<ee:set-payload><![CDATA[%dw 2.0
@@ -29,7 +31,9 @@ output application/json
 	</flow>
 
 	<flow name="service-check-order-stock" doc:description="Simulated stock service: POST /eip/services/stock says whether every item of the order is in stock, from synthetic stock levels.">
-		<http:listener doc:name="POST /eip/services/stock" config-ref="http-listener-config" path="/eip/services/stock" allowedMethods="POST" />
+		<http:listener doc:name="POST /eip/services/stock" config-ref="http-listener-config" path="/eip/services/stock" allowedMethods="POST">
+			<http:response statusCode="#[vars.httpStatus default 200]" />
+		</http:listener>
 		<ee:transform doc:name="Check Order Stock (simulated)">
 			<ee:message>
 				<ee:set-payload><![CDATA[%dw 2.0
@@ -43,7 +47,9 @@ var unavailable = payload.items filter ((stockLevels[$.sku] default 0) < $.quant
 	</flow>
 
 	<flow name="service-score-order-fraud" doc:description="Simulated fraud service: POST /eip/services/fraud scores the order's customer; new customers (CUS-NEW...) are HIGH_RISK.">
-		<http:listener doc:name="POST /eip/services/fraud" config-ref="http-listener-config" path="/eip/services/fraud" allowedMethods="POST" />
+		<http:listener doc:name="POST /eip/services/fraud" config-ref="http-listener-config" path="/eip/services/fraud" allowedMethods="POST">
+			<http:response statusCode="#[vars.httpStatus default 200]" />
+		</http:listener>
 		<ee:transform doc:name="Score Order Fraud Risk (simulated)">
 			<ee:message>
 				<ee:set-payload><![CDATA[%dw 2.0
