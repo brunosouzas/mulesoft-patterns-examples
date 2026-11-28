@@ -21,7 +21,7 @@ A catalogue of runnable Mule 4 examples of design and integration patterns, one 
 
 HTTP endpoint paths are referenced by published articles; do not change them when moving files.
 
-EIP examples use the kit Mule naming rules; SOLID keeps the names its published articles quote.
+EIP examples use Bruno's MuleSoft naming rules (BRU-NAME-1 to BRU-NAME-3, `packs/mulesoft-naming/pack.yaml` of `brunosouzas/smithy`); SOLID keeps the names its published articles quote.
 
 ## Technology declarations
 
@@ -54,8 +54,8 @@ GitHub default branch inspected on 2026-10-06: `main`. Release bases are defined
 
 Before planning, reviewing or changing this project, read [the applicable project rules](rules/README.md).
 
-- Board area: `mulesoft` (Azure Boards, project `brunosouzas`).
+- Tracker: Linear brunosouzas, team SW, label `mulesoft`.
 - OpenSpec: no: every change takes the small path.
-- Merges stay with Bruno (`rules/README.md`), stricter than the playbook's level 1 on purpose.
+- Merges stay with Bruno (`rules/README.md`), stricter than level 1 of `delivery:merge-gates` on purpose.
 - Releases: none. When an article cites a version, Bruno creates an `article-<slug>` tag (not `v*`).
 - Articles cite this repository (`brunosouzas-content: writing/solid-in-mulesoft/`, `brunosouzas-content: writing/integration-patterns-in-mulesoft/`): keep the endpoints in `requests.http` and the paths they link answering after a merge.
